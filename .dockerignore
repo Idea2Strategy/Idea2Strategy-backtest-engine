@@ -1,0 +1,14 @@
+.git
+.harness
+.venv
+__pycache__
+.pytest_cache
+.mypy_cache
+.ruff_cache
+build
+dist
+htmlcov
+*.egg-info
+tests
+docs
+DEVELOPMENT.md

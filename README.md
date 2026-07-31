@@ -29,3 +29,16 @@ tests/
 
 자세한 경계는 [DEVELOPMENT.md](DEVELOPMENT.md)를 확인합니다.
 
+## 공통 골격 실행
+
+Python 3.12에서 저장소 전용 가상환경을 사용합니다.
+
+```text
+python -m venv .venv
+.venv\Scripts\python -m pip install -e ".[test]"
+.venv\Scripts\python -m pytest
+.venv\Scripts\backtest-api
+```
+
+`backtest-api`만 내부 API 포트를 사용하고 `backtest-worker`는 SQS 작업을 소비하는 비웹 프로세스입니다. 현재 골격에는 상태 확인과 프로세스 수명주기만 있으며 백테스트 도메인 계산은 포함하지 않습니다.
+
