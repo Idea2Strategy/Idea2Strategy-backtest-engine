@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "idea2strategy-backtest-engine"
+version = "0.1.0"
+description = "Reproducible server-side backtest API and worker for Idea2Strategy."
+requires-python = "==3.12.*"
+dependencies = [
+  "fastapi==0.139.2",
+  "uvicorn==0.52.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest==9.1.1",
+]
+
+[project.scripts]
+backtest-api = "backtest_engine.api:run"
+backtest-worker = "backtest_engine.worker:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/backtest_engine"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+pythonpath = ["src"]
+testpaths = ["tests"]
