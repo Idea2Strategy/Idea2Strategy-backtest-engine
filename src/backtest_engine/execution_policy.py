@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from types import MappingProxyType
+from zoneinfo import ZoneInfo
+
+
+ET = ZoneInfo("America/New_York")
+
+
+class ExecutionPolicyUnavailable(LookupError):
+    """Raised when no official policy was published for a release quarter."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +43,40 @@ class ExecutionPolicy:
             raise ValueError("execution policy period must be increasing")
         if self.fee_rate < 0 or self.slippage_rate < 0:
             raise ValueError("execution policy rates must not be negative")
+
+
+def _release_quarter(strategy_released_at: datetime) -> str:
+    if (
+        strategy_released_at.tzinfo is None
+        or strategy_released_at.utcoffset() is None
+    ):
+        raise ValueError("strategy_released_at must be timezone-aware")
+    released_at_et = strategy_released_at.astimezone(ET)
+    quarter = ((released_at_et.month - 1) // 3) + 1
+    return f"{released_at_et.year}-Q{quarter}"
+
+
+class ExecutionPolicyCatalog:
+    """Selects an immutable pre-published policy by the release's ET quarter."""
+
+    def __init__(self, policies: Iterable[ExecutionPolicy]) -> None:
+        by_quarter: dict[str, ExecutionPolicy] = {}
+        for policy in policies:
+            if policy.release_quarter in by_quarter:
+                raise ValueError(
+                    f"execution policy already published for {policy.release_quarter}"
+                )
+            by_quarter[policy.release_quarter] = policy
+        self._by_quarter = MappingProxyType(by_quarter)
+
+    def select(self, strategy_released_at: datetime) -> ExecutionPolicy:
+        quarter = _release_quarter(strategy_released_at)
+        try:
+            return self._by_quarter[quarter]
+        except KeyError as exc:
+            raise ExecutionPolicyUnavailable(
+                f"execution policy is not published for {quarter}"
+            ) from exc
 
 
 D17_EXECUTION_POLICY_FIXTURE = ExecutionPolicy(

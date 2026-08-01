@@ -1,6 +1,11 @@
 """Idea2Strategy backtest engine."""
 
-from .execution_policy import D17_EXECUTION_POLICY_FIXTURE, ExecutionPolicy
+from .execution_policy import (
+    D17_EXECUTION_POLICY_FIXTURE,
+    ExecutionPolicy,
+    ExecutionPolicyCatalog,
+    ExecutionPolicyUnavailable,
+)
 from .market_data import MarketDataValidationError, ParquetMarketDataReader
 from .lifecycle import (
     BacktestJobQueue,
@@ -18,6 +23,8 @@ from .lifecycle import (
 __all__ = [
     "D17_EXECUTION_POLICY_FIXTURE",
     "ExecutionPolicy",
+    "ExecutionPolicyCatalog",
+    "ExecutionPolicyUnavailable",
     "MarketDataValidationError",
     "ParquetMarketDataReader",
     "BacktestJobQueue",
