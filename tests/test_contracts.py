@@ -6,6 +6,7 @@ import pytest
 
 from backtest_engine.contracts import (
     ContractValidationError,
+    compute_input_bundle_fingerprint,
     validate_backtest_request,
     validate_backtest_result,
     validate_dataset_manifest,
@@ -64,3 +65,53 @@ def test_backtest_consumer_rejects_unknown_result_version(
 
     with pytest.raises(ContractValidationError, match="schema_version"):
         validate_backtest_result(queued)
+
+
+def test_input_bundle_fingerprint_is_deterministic_and_input_sensitive(
+    fixtures: dict[str, object],
+) -> None:
+    request = fixtures["backtest_request"]
+
+    fingerprint = compute_input_bundle_fingerprint(request)
+
+    assert fingerprint == compute_input_bundle_fingerprint(copy.deepcopy(request))
+
+    changed_manifest = copy.deepcopy(request)
+    changed_manifest["dataset_hash"] = "d" * 64
+    assert compute_input_bundle_fingerprint(changed_manifest) != fingerprint
+
+    changed_policy = copy.deepcopy(request)
+    changed_policy["execution_policy_version"] = "official-backtest-policy-v2"
+    assert compute_input_bundle_fingerprint(changed_policy) != fingerprint
+
+
+def test_backtest_request_accepts_unknown_fields_without_changing_v1_fingerprint(
+    fixtures: dict[str, object],
+) -> None:
+    request = copy.deepcopy(fixtures["backtest_request"])
+    expected_fingerprint = compute_input_bundle_fingerprint(request)
+    request["future_contract_field"] = {"version": 2}
+
+    validate_backtest_request(request)
+
+    assert compute_input_bundle_fingerprint(request) == expected_fingerprint
+
+
+def test_backtest_request_rejects_unknown_schema_version(
+    fixtures: dict[str, object],
+) -> None:
+    request = copy.deepcopy(fixtures["backtest_request"])
+    request["schema_version"] = 2
+
+    with pytest.raises(ContractValidationError, match="schema_version"):
+        validate_backtest_request(request)
+
+
+def test_backtest_request_rejects_mismatched_input_bundle_fingerprint(
+    fixtures: dict[str, object],
+) -> None:
+    request = copy.deepcopy(fixtures["backtest_request"])
+    request["input_bundle_fingerprint"] = "0" * 64
+
+    with pytest.raises(ContractValidationError, match="input_bundle_fingerprint"):
+        validate_backtest_request(request)

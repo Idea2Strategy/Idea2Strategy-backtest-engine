@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from backtest_engine.contracts import compute_input_bundle_fingerprint
 from backtest_engine.lifecycle import (
     BacktestLifecycleService,
     IdempotencyConflict,
@@ -55,6 +56,7 @@ def test_reused_request_idempotency_key_must_have_identical_payload(
     service.accept(request)
     changed = copy.deepcopy(request)
     changed["compiled_plan_hash"] = "d" * 64
+    changed["input_bundle_fingerprint"] = compute_input_bundle_fingerprint(changed)
 
     with pytest.raises(IdempotencyConflict, match="idempotency_key"):
         service.accept(changed)

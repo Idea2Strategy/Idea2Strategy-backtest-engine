@@ -27,6 +27,15 @@ RESULT_REQUIRED_FIELDS = {
     "FAILED": ("failed_at", "failure_code", "retryable"),
     "UNAVAILABLE": ("decided_at", "reason_code", "missing_requirements"),
 }
+INPUT_BUNDLE_FIELDS = (
+    "strategy_version_id",
+    "strategy_snapshot_hash",
+    "compiled_plan_hash",
+    "dataset_manifest_id",
+    "dataset_hash",
+    "feature_materialization_version",
+    "execution_policy_version",
+)
 
 
 class ContractValidationError(ValueError):
@@ -118,6 +127,19 @@ def _canonical_dataset_hash(objects: Sequence[Mapping[str, Any]]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def compute_input_bundle_fingerprint(document: Mapping[str, Any]) -> str:
+    """Fingerprint only the immutable inputs understood by contract version 1."""
+    _require_fields(document, INPUT_BUNDLE_FIELDS, "backtest_request")
+    payload = {
+        field: _require_string(document, field, "backtest_request")
+        for field in INPUT_BUNDLE_FIELDS
+    }
+    canonical = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def validate_dataset_manifest(document: Mapping[str, Any]) -> None:
     label = "dataset_manifest"
     _require_schema(document, "com06.dataset-manifest", label)
@@ -201,7 +223,9 @@ def validate_backtest_request(document: Mapping[str, Any]) -> None:
             "compiled_plan_hash",
             "dataset_manifest_id",
             "dataset_hash",
+            "feature_materialization_version",
             "execution_policy_version",
+            "input_bundle_fingerprint",
             "requested_at",
         ),
         label,
@@ -212,7 +236,14 @@ def validate_backtest_request(document: Mapping[str, Any]) -> None:
         _require_uuid(document, field, label)
     for field in ("strategy_snapshot_hash", "compiled_plan_hash", "dataset_hash"):
         _require_hash(document, field, label)
+    _require_string(document, "feature_materialization_version", label)
     _require_string(document, "execution_policy_version", label)
+    declared_fingerprint = _require_hash(document, "input_bundle_fingerprint", label)
+    actual_fingerprint = compute_input_bundle_fingerprint(document)
+    if declared_fingerprint != actual_fingerprint:
+        raise ContractValidationError(
+            f"{label}.input_bundle_fingerprint does not match canonical inputs"
+        )
     _require_timestamp(document, "requested_at", label)
 
 

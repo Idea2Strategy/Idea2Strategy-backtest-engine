@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from backtest_engine.api import create_app
+from backtest_engine.contracts import compute_input_bundle_fingerprint
 from backtest_engine.lifecycle import (
     BacktestLifecycleService,
     InMemoryBacktestJobQueue,
@@ -57,6 +58,7 @@ def test_post_rejects_reused_key_with_changed_payload() -> None:
     request = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))["backtest_request"]
     changed = copy.deepcopy(request)
     changed["compiled_plan_hash"] = "d" * 64
+    changed["input_bundle_fingerprint"] = compute_input_bundle_fingerprint(changed)
     client, _, _ = _client()
     client.post("/backtests", json=request)
 
