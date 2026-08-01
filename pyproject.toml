@@ -9,12 +9,13 @@ description = "Reproducible server-side backtest API and worker for Idea2Strateg
 requires-python = "==3.12.*"
 dependencies = [
   "fastapi==0.139.2",
+  "pyarrow==25.0.0",
+  "tzdata==2026.3",
   "uvicorn==0.52.0",
 ]
 
 [project.optional-dependencies]
 test = [
-  "pyarrow==25.0.0",
   "pytest==9.1.1",
 ]
 
