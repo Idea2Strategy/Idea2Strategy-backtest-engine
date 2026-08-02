@@ -1,0 +1,13 @@
+{
+  "metadata": {
+    "contractVersion": "strategy-bot.v1",
+    "messageType": "BOT_RUN_COMMAND",
+    "messageId": "00000000-0000-4000-8000-000000000211",
+    "occurredAt": "2026-07-31T12:00:00Z",
+    "correlationId": "00000000-0000-4000-8000-000000000202",
+    "idempotencyKey": "sha256:53edaf910b3986b8070257f4d171374bedc6553bfe61427d21d34532f2bf87fb"
+  },
+  "botId": "00000000-0000-4000-8000-000000000201",
+  "expectedSnapshotHash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "executionEligibleFrom": "2026-08-03T13:30:00Z"
+}
