@@ -1,7 +1,19 @@
-"""The `/api/v1` HTTP surface for the backtest engine (D28).
+"""The `/api/v1` HTTP surface for the backtest engine (D28, D29).
 
-Five owner-scoped query endpoints, one acceptance endpoint for B's
+Eight owner-scoped query endpoints, one acceptance endpoint for B's
 `OFFICIAL_BACKTEST_REQUESTED`, and one result-ingestion endpoint for the worker.
+
+Two read models sit behind those queries and they are not interchangeable:
+
+* `lifecycle.BacktestLifecycleService` is the **write** model - the `backtest.runs`
+  row, its attempts, and the summary rows a completed run wrote. It answers the run
+  list, the run itself, attempts, performance, monthly summaries and detail manifests.
+* `result_query.BacktestResultQueryService` is the **result** read model. It is the
+  only thing that can answer `monthly-trades`, because trade rows live in the ET
+  Monday week Parquet parts rather than in any `backtest.*` table, and the ET
+  week -> ET month join is its responsibility. It also answers `inputs`, which
+  reports the pinned reproducibility boundary and, for an `UNAVAILABLE` run, the
+  requirements that were missing.
 
 Authentication and authorisation are separate concerns here, and the difference is
 visible in the status codes:
@@ -14,9 +26,18 @@ Returning 404 for a foreign run would hide the distinction and is a defensible c
 in some products, but it also hides genuine authorisation bugs from the client and from
 this test suite, so the boundary is explicit.
 
+**The two result-read-model routes deliberately answer 404 instead.** They serve a
+run's evidence rather than its metadata, so confirming that a run id exists and that
+another account finished it is a disclosure in itself. `result_query` fails closed the
+same way - `QueryNotFound` covers "no such run" and "not yours" alike - and the route
+keeps that semantic rather than re-deriving ownership from the write model.
+
 There is no default authenticator and no default gateway: `create_app` requires both.
 A backtest API that silently falls back to an in-memory store, or to "any token works",
-is precisely the class of empty implementation this rebuild exists to remove.
+is precisely the class of empty implementation this rebuild exists to remove. The
+result read model is optional only because a deployment may serve acceptance and
+ingestion without it; when it is absent the routes answer **503** naming what is
+missing, never 404 and never an empty list.
 
 Result ingestion is written for at-least-once delivery:
 
@@ -30,8 +51,11 @@ Result ingestion is written for at-least-once delivery:
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
+import re
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
+from decimal import Decimal
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -49,6 +73,7 @@ from .lifecycle import (
     PreconditionFailed,
     RequestNotSatisfiable,
 )
+from .monthly_judgment import EtMonth
 from .persistence.rows import (
     DetailManifestRow,
     MonthlyJudgmentSummaryRow,
@@ -56,6 +81,17 @@ from .persistence.rows import (
     RunAttemptRow,
     RunRow,
 )
+from .result_query import (
+    BacktestOverview,
+    BacktestResultQueryService,
+    InputModelView,
+    QueryIntegrityError,
+    QueryNotFound,
+    QueryNotReady,
+    QueryValidationError,
+    TradeDetailView,
+)
+from .result_snapshot import PositionAfter
 
 
 __all__ = [
@@ -199,8 +235,101 @@ def _manifest_payload(row: DetailManifestRow) -> dict[str, Any]:
     }
 
 
+def _trade_payload(view: TradeDetailView) -> dict[str, Any]:
+    """One `TradeDetailView` row. Every amount is `numeric(24,8)` text, never a float.
+
+    JSON has one number type and it is binary floating point, so an amount serialised
+    as a number is a rounding decision taken by whichever runtime parses it. The
+    quantised eight-place string is the same form `_run_payload` uses for cash.
+    """
+    return {
+        "recordId": view.record_id,
+        "occurredAt": _iso(view.occurred_at),
+        "kind": view.kind,
+        "orderId": view.order_id,
+        "instrumentId": view.instrument_id,
+        "orderStatus": view.order_status,
+        "cashAfter": _amount(view.cash_after),
+        "positionsAfter": [_position_payload(item) for item in view.positions_after],
+        "reasonCode": view.reason_code,
+        "fillId": view.fill_id,
+        "quantity": _amount(view.quantity),
+        "basePrice": _amount(view.base_price),
+        "price": _amount(view.price),
+        "grossAmount": _amount(view.gross_amount),
+        "slippageAmount": _amount(view.slippage_amount),
+        "fee": _amount(view.fee),
+        "costBasis": _amount(view.cost_basis),
+        "realizedPnl": _amount(view.realized_pnl),
+    }
+
+
+def _position_payload(position: PositionAfter) -> dict[str, Any]:
+    return {
+        "instrumentId": position.instrument_id,
+        "quantity": _amount(position.quantity),
+        "costBasis": _amount(position.cost_basis),
+    }
+
+
+def _input_model_payload(view: InputModelView, overview: BacktestOverview) -> dict[str, Any]:
+    """Card D29's "입력 데이터·모델과 unavailable 이유", in one response.
+
+    The two halves are one answer: an `UNAVAILABLE` run has the pinned inputs but no
+    model versions, and the only thing worth reporting about it is what was missing.
+    The model versions stay `null` in that case rather than being filled with a
+    plausible-looking default.
+    """
+    return {
+        "backtestRunId": view.run_id,
+        "botId": view.bot_id,
+        "status": overview.status,
+        "strategySnapshotHash": view.strategy_snapshot_hash,
+        "compiledPlanChecksum": view.compiled_plan_checksum,
+        "datasetManifestId": view.dataset_manifest_id,
+        "datasetHash": view.dataset_hash,
+        "inputBundleFingerprint": view.input_bundle_fingerprint,
+        "featureMaterializationVersion": view.feature_materialization_version,
+        "executionPolicyVersion": view.execution_policy_version,
+        "precisionRulesVersion": view.precision_rules_version,
+        "calculationModelVersion": view.calculation_model_version,
+        "costModelVersion": view.cost_model_version,
+        "executionModelVersion": view.execution_model_version,
+        "reasonCode": overview.reason_code,
+        "missingRequirements": list(overview.missing_requirements),
+    }
+
+
+def _amount(value: Decimal | None) -> str | None:
+    return None if value is None else f"{value:.8f}"
+
+
 def _iso(value: Any) -> str | None:
     return None if value is None else value.isoformat().replace("+00:00", "Z")
+
+
+#: `et_month` accepts exactly the `backtest.monthly_judgment_summaries.et_year_month`
+#: form. Year 0000 is excluded because `EtMonth` requires a positive year and a
+#: rejected value must be rejected by the parameter contract, not by an exception
+#: raised deeper in the read model.
+_ET_MONTH_PATTERN = re.compile(r"(?!0000)[0-9]{4}-(?:0[1-9]|1[0-2])")
+
+
+def _parse_et_month(value: str) -> EtMonth:
+    if _ET_MONTH_PATTERN.fullmatch(value) is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": (
+                    "et_month must be a single ET calendar month written YYYY-MM, "
+                    f"got {value!r}"
+                ),
+                "reasonCode": "ET_MONTH_MALFORMED",
+                "parameter": "et_month",
+            },
+        )
+    year, _, month = value.partition("-")
+    return EtMonth(int(year), int(month))
 
 
 # ---------------------------------------------------------------------------
@@ -211,10 +340,13 @@ def _iso(value: Any) -> str | None:
 def create_app(
     lifecycle: BacktestLifecycleService,
     authenticator: Authenticator,
+    results: BacktestResultQueryService | None = None,
 ) -> FastAPI:
     """Build the `/api/v1` application.
 
-    Both arguments are required. See the module docstring for why there is no default.
+    `lifecycle` and `authenticator` are required. See the module docstring for why
+    there is no default for either, and why `results` may be omitted but is never
+    substituted.
     """
     if lifecycle is None:
         raise ValueError("a BacktestLifecycleService is required")
@@ -294,35 +426,35 @@ def create_app(
         offset: int = 0,
         principal: Principal = Auth,
     ) -> dict[str, Any]:
-        """Query 1/5: the authenticated owner's runs. Never another account's."""
+        """Query 1/8: the authenticated owner's runs. Never another account's."""
         if not 1 <= limit <= 200:
             raise HTTPException(status_code=422, detail="limit must be between 1 and 200")
         if offset < 0:
             raise HTTPException(status_code=422, detail="offset must not be negative")
         runs = lifecycle.list_runs(principal.account_id, limit=limit, offset=offset)
         return {
-            "items": [_run_payload(run) for run in runs],
+            "items": [_run_payload(run) for run in _with_attempt_counts(lifecycle, runs)],
             "limit": limit,
             "offset": offset,
         }
 
     @app.get(f"{API_PREFIX}/backtests/{{run_id}}", tags=["backtests"])
     def get_backtest(run_id: UUID, response: Response, principal: Principal = Auth) -> dict[str, Any]:
-        """Query 2/5: one run."""
+        """Query 2/8: one run."""
         run = _owned(lifecycle, run_id, principal)
         response.headers["ETag"] = run.etag
         return _run_payload(run)
 
     @app.get(f"{API_PREFIX}/backtests/{{run_id}}/attempts", tags=["backtests"])
     def get_attempts(run_id: UUID, principal: Principal = Auth) -> dict[str, Any]:
-        """Query 3/5: the durable attempt history behind a run."""
+        """Query 3/8: the durable attempt history behind a run."""
         _owned(lifecycle, run_id, principal)
         attempts = lifecycle.attempts_of(run_id, owner_account_id=principal.account_id)
         return {"items": [_attempt_payload(row) for row in attempts]}
 
     @app.get(f"{API_PREFIX}/backtests/{{run_id}}/performance", tags=["backtests"])
     def get_performance(run_id: UUID, principal: Principal = Auth) -> dict[str, Any]:
-        """Query 4/5: the immutable performance summary, once the run completed."""
+        """Query 4/8: the immutable performance summary, once the run completed."""
         _owned(lifecycle, run_id, principal)
         summary = lifecycle.performance_of(run_id, owner_account_id=principal.account_id)
         if summary is None:
@@ -334,17 +466,62 @@ def create_app(
 
     @app.get(f"{API_PREFIX}/backtests/{{run_id}}/monthly-summaries", tags=["backtests"])
     def get_monthly(run_id: UUID, principal: Principal = Auth) -> dict[str, Any]:
-        """Query 5/5: per-ET-month judgment summaries with all six canonical counters."""
+        """Query 5/8: per-ET-month judgment summaries with all six canonical counters."""
         _owned(lifecycle, run_id, principal)
         summaries = lifecycle.monthly_of(run_id, owner_account_id=principal.account_id)
         return {"items": [_monthly_payload(row) for row in summaries]}
 
     @app.get(f"{API_PREFIX}/backtests/{{run_id}}/detail-manifests", tags=["backtests"])
     def get_manifests(run_id: UUID, principal: Principal = Auth) -> dict[str, Any]:
-        """Detail object manifests: ET Monday week boundaries plus `partNumber`."""
+        """Query 6/8: detail object manifests - ET Monday weeks plus `partNumber`.
+
+        These are the evidence *objects*. The rows inside them are `monthly-trades`.
+        """
         _owned(lifecycle, run_id, principal)
         manifests = lifecycle.manifests_of(run_id, owner_account_id=principal.account_id)
         return {"items": [_manifest_payload(row) for row in manifests]}
+
+    @app.get(f"{API_PREFIX}/backtests/{{run_id}}/monthly-trades", tags=["backtests"])
+    def get_monthly_trades(
+        run_id: UUID, et_month: str, principal: Principal = Auth
+    ) -> dict[str, Any]:
+        """Query 7/8: one ET month of trade detail (D29 "월별 거래 상세").
+
+        `et_month` is required and is never defaulted: a month picked on the caller's
+        behalf would silently answer a question nobody asked. The read model reads
+        every ET Monday week part that *overlaps* the month and places each row by the
+        ET month of its own instant, then cross-checks the result against the month's
+        judgment summary, so a lost or tampered part fails closed rather than
+        returning a short list.
+        """
+        service = _result_query(results)
+        month = _parse_et_month(et_month)
+        with _query_errors():
+            trades = service.monthly_trades(
+                str(principal.account_id), str(run_id), month
+            )
+        return {
+            "backtestRunId": str(run_id),
+            "etMonth": month.key,
+            "items": [_trade_payload(view) for view in trades],
+        }
+
+    @app.get(f"{API_PREFIX}/backtests/{{run_id}}/inputs", tags=["backtests"])
+    def get_inputs(run_id: UUID, principal: Principal = Auth) -> dict[str, Any]:
+        """Query 8/8: pinned inputs, model versions and the unavailable reason (D29).
+
+        Available at every status. An `UNAVAILABLE` run reports null model versions
+        and the requirements it could not resolve; `GET /{run_id}` carries the
+        `failureCode` but not the requirement list, so this is the only place the UI
+        can say *what* was missing.
+        """
+        service = _result_query(results)
+        with _query_errors():
+            owner = str(principal.account_id)
+            return _input_model_payload(
+                service.inputs_and_models(owner, str(run_id)),
+                service.overview(owner, str(run_id)),
+            )
 
     # -- result ingestion --------------------------------------------------
 
@@ -407,6 +584,68 @@ def _owned(lifecycle: BacktestLifecycleService, run_id: UUID, principal: Princip
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
 
 
+def _with_attempt_counts(
+    lifecycle: BacktestLifecycleService, runs: tuple[BacktestRun, ...]
+) -> list[BacktestRun]:
+    """Fill in the attempt history `lifecycle.list_runs` does not load.
+
+    `list_runs` builds each aggregate as `BacktestRun(run=row)`, leaving `attempts` at
+    its default `()`, while `get` goes through `_load`. Serialising both with
+    `_run_payload` therefore reported `attemptCount: 0` for every listed run and the
+    true count for the same run fetched individually - one number, two answers.
+
+    The rows are already owner-scoped by `list_by_owner`, so the count is read here
+    from the same gateway rather than published wrong. This is one extra read per
+    listed run, bounded by `limit`; the fix that removes it is a one-line change in
+    `lifecycle.list_runs` (`self._load(row)`), which this card does not own.
+    """
+    return [
+        replace(run, attempts=lifecycle.gateway.attempts(run.backtest_run_id))
+        for run in runs
+    ]
+
+
+def _result_query(results: BacktestResultQueryService | None) -> BacktestResultQueryService:
+    if results is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "this deployment was built without a BacktestResultQueryService, so "
+                "result read models are not served; pass one to create_app"
+            ),
+        )
+    return results
+
+
+@contextmanager
+def _query_errors() -> Iterator[None]:
+    """Translate the result read model's failures into the surface's status codes.
+
+    * **404** for `QueryNotFound`, which covers "no such run" and "not yours" alike.
+    * **409** for `QueryNotReady`: the run exists and is yours, but it has not
+      completed, so there is no immutable evidence to serve. Distinct from 404 because
+      the caller should retry later rather than conclude the run does not exist.
+    * **422** for `QueryValidationError`, a malformed identity or projection input.
+    * **500** for `QueryIntegrityError`. The read model refuses to serve evidence whose
+      identities disagree; that is a data fault in published artifacts, not a bad
+      request, and it must not be reported as an empty month.
+    """
+    try:
+        yield
+    except QueryNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except QueryNotReady as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except QueryValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+    except QueryIntegrityError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
+        ) from exc
+
+
 def _unauthenticated(detail: str) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -445,5 +684,6 @@ def run() -> None:  # pragma: no cover - process entry point
     raise NotImplementedError(
         "backtest-api has no runnable default wiring yet: build the "
         "BacktestLifecycleService with PersistenceRunGateway plus a real "
-        "Authenticator and serve create_app(...) from your deployment entry point"
+        "Authenticator and a BacktestResultQueryService, and serve create_app(...) "
+        "from your deployment entry point"
     )

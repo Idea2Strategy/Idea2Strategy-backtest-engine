@@ -20,6 +20,7 @@ import os
 from collections.abc import Iterator
 from dataclasses import replace
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -29,6 +30,12 @@ from fastapi.testclient import TestClient
 
 from backtest_engine.api import RESULT_INGEST_SCOPE, Principal, StaticTokenAuthenticator, create_app
 from backtest_engine.contracts import build_backtest_result_event
+from backtest_engine.detail_object_manifest import (
+    DetailObjectBuilder,
+    DetailObjectBundle,
+    DetailObjectKind,
+)
+from backtest_engine.execution_model import OrderStatus
 from backtest_engine.execution_policy import (
     D17_EXECUTION_POLICY_FIXTURE,
     ExecutionPolicyCatalog,
@@ -44,7 +51,22 @@ from backtest_engine.lifecycle import (
     StaticOwnerDirectory,
     run_id_for,
 )
+from backtest_engine.monthly_judgment import MonthlyJudgmentBuilder, MonthlyJudgmentSummary
 from backtest_engine.persistence.rows import RunAttemptRow, WorkStatus
+from backtest_engine.result_query import (
+    BacktestResultQueryService,
+    InMemoryBacktestResultQueryStore,
+    RunInputs,
+    RunProjection,
+)
+from backtest_engine.result_snapshot import (
+    PositionAfter,
+    ResultRecord,
+    ResultRecordKind,
+    ResultSnapshot,
+    ResultSnapshotBuilder,
+    RunSnapshot,
+)
 
 
 FIXTURES = Path(__file__).parent / "fixtures/contracts/strategy-bot/v1"
@@ -67,6 +89,22 @@ EXPECTED_RUN_ID = "f876f259-4158-5a9a-8973-db21764024dc"
 SNAPSHOT_HASH = "sha256:" + "1" * 64
 RESULT_HASH = "sha256:" + "a" * 64
 DATASET_HASH = "d9f6310297b7eb858570086d7292a709261eecc7bf92fc9a03745c46f514161c"
+
+# -- the D29 result read model ---------------------------------------------
+#
+# `result_query` is a separate projection from the `backtest.runs` write model, so it
+# carries its own identities. The two ET months below are deliberately the two halves
+# of a single ET Monday week: 2026-07-31 is a Friday, so the week starting Monday
+# 2026-07-27 runs to Sunday 2026-08-02 and one Parquet part holds both months' rows.
+# Both months fall inside the accepted run's 2026-07-01..2026-10-01 evaluation window.
+QUERY_FINGERPRINT = "d" * 64
+INSTRUMENT_ID = "00000000-0000-4000-8000-000000002908"
+JULY_RECORD_ID = "00000000-0000-4000-8000-000000002910"
+JULY_ORDER_ID = "00000000-0000-4000-8000-000000002909"
+JULY_FILL_ID = "00000000-0000-4000-8000-000000002913"
+AUGUST_RECORD_ID = "00000000-0000-4000-8000-000000002920"
+AUGUST_ORDER_ID = "00000000-0000-4000-8000-000000002921"
+AUGUST_FILL_ID = "00000000-0000-4000-8000-000000002922"
 
 
 def _locate_backend_contracts() -> Path | None:
@@ -108,10 +146,133 @@ def manifest() -> dict[str, Any]:
     return {"dataset_hash": DATASET_HASH, "schema_id": "market-bars-v2"}
 
 
+def _instant(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _query_inputs() -> RunInputs:
+    return RunInputs(
+        compiled_plan_checksum="sha256:" + "b" * 64,
+        strategy_snapshot_hash=SNAPSHOT_HASH,
+        dataset_manifest_id=str(MANIFEST_ID),
+        dataset_hash=DATASET_HASH,
+        input_bundle_fingerprint=QUERY_FINGERPRINT,
+        feature_materialization_version="market-bars-v2",
+        execution_policy_version="official-backtest-policy-v2",
+        precision_rules_version="precision:1.0.0",
+    )
+
+
+def _run_snapshot() -> RunSnapshot:
+    return RunSnapshot(
+        backtest_run_id=EXPECTED_RUN_ID,
+        strategy_version_id=str(BOT_ID),
+        input_bundle_fingerprint=QUERY_FINGERPRINT,
+        calculation_model_version="calculation-v9",
+        cost_model_version="cost-v3",
+        execution_model_version="execution-v5",
+        initial_cash=Decimal("100000"),
+    )
+
+
+def _projection(status: str, *, result_manifest_id: str | None = None) -> RunProjection:
+    extra: dict[str, Any] = {"started_at": _instant("2026-07-31T12:05:00Z")}
+    if status == "COMPLETED":
+        extra["finished_at"] = _instant("2026-08-02T04:10:00Z")
+        extra["result_manifest_id"] = result_manifest_id
+    return RunProjection(
+        run_id=EXPECTED_RUN_ID,
+        bot_id=str(BOT_ID),
+        owner_account_id=str(OWNER_ID),
+        status=status,
+        queued_at=_instant("2026-07-31T12:00:00Z"),
+        inputs=_query_inputs(),
+        version=2 if status != "COMPLETED" else 3,
+        **extra,
+    )
+
+
+def _fill(
+    *,
+    record_id: str,
+    order_id: str,
+    fill_id: str,
+    occurred_at: str,
+    cash_after: str,
+    quantity_after: str,
+    cost_basis_after: str,
+) -> ResultRecord:
+    return ResultRecord(
+        run_snapshot_id=_run_snapshot().snapshot_id,
+        record_id=record_id,
+        kind=ResultRecordKind.FILL,
+        occurred_at=_instant(occurred_at),
+        order_id=order_id,
+        instrument_id=INSTRUMENT_ID,
+        order_status=OrderStatus.FILLED,
+        cash_after=Decimal(cash_after),
+        positions_after=(
+            PositionAfter(INSTRUMENT_ID, Decimal(quantity_after), Decimal(cost_basis_after)),
+        ),
+        fill_id=fill_id,
+        quantity=Decimal("1"),
+        base_price=Decimal("100"),
+        price=Decimal("100.05"),
+        gross_amount=Decimal("100.05"),
+        slippage_amount=Decimal("0.05"),
+        fee=Decimal("2.20"),
+        cost_basis=Decimal("100.05"),
+        realized_pnl=Decimal("0"),
+    )
+
+
+def _completed_projection() -> tuple[
+    RunProjection, ResultSnapshot, DetailObjectBundle, tuple[MonthlyJudgmentSummary, ...]
+]:
+    """One COMPLETED run whose single ET-week detail part spans two ET months."""
+    snapshot = _run_snapshot()
+    built_at = _instant("2026-08-02T04:10:00Z")
+    records = [
+        # ET Friday 2026-07-31 23:30 — July.
+        _fill(
+            record_id=JULY_RECORD_ID,
+            order_id=JULY_ORDER_ID,
+            fill_id=JULY_FILL_ID,
+            occurred_at="2026-08-01T03:30:00Z",
+            cash_after="9897.80",
+            quantity_after="1",
+            cost_basis_after="100.05",
+        ),
+        # ET Saturday 2026-08-01 10:30 — August, same ET week.
+        _fill(
+            record_id=AUGUST_RECORD_ID,
+            order_id=AUGUST_ORDER_ID,
+            fill_id=AUGUST_FILL_ID,
+            occurred_at="2026-08-01T14:30:00Z",
+            cash_after="9795.55",
+            quantity_after="2",
+            cost_basis_after="200.15",
+        ),
+    ]
+    result = ResultSnapshotBuilder().build(snapshot, records, built_at)
+    details = DetailObjectBuilder().build(result, [], [], built_at)
+    monthly = MonthlyJudgmentBuilder().build(
+        snapshot.snapshot_id, result.manifest.result_manifest_id, [], result.records
+    )
+    run = _projection("COMPLETED", result_manifest_id=result.manifest.result_manifest_id)
+    return run, result, details, monthly
+
+
 class Harness:
-    def __init__(self, service: BacktestLifecycleService, client: TestClient) -> None:
+    def __init__(
+        self,
+        service: BacktestLifecycleService,
+        client: TestClient,
+        results: InMemoryBacktestResultQueryStore,
+    ) -> None:
         self.service = service
         self.client = client
+        self.results = results
         self.gateway: InMemoryRunGateway = service.gateway  # type: ignore[assignment]
         self.queue: InMemoryBacktestJobQueue = service.queue  # type: ignore[assignment]
         self.dlq: InMemoryDeadLetterQueue = service.dead_letters  # type: ignore[assignment]
@@ -124,6 +285,13 @@ class Harness:
 
     def worker(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {WORKER_TOKEN}"}
+
+    def publish_completed(self) -> None:
+        """Arrange the read model as a finished worker leaves it."""
+        self.results.publish_completed(*_completed_projection())
+
+    def project(self, status: str) -> None:
+        self.results.upsert_run(_projection(status))
 
 
 #: B's published request is dated 2026-07-31, so the policy the catalog must select is
@@ -158,8 +326,10 @@ def harness(compiled_plan: dict[str, Any], manifest: dict[str, Any]) -> Iterator
             WORKER_TOKEN: Principal(account_id=OWNER_ID, scopes=frozenset({RESULT_INGEST_SCOPE})),
         }
     )
-    with TestClient(create_app(service, authenticator)) as client:
-        yield Harness(service, client)
+    results = InMemoryBacktestResultQueryStore()
+    app = create_app(service, authenticator, BacktestResultQueryService(results))
+    with TestClient(app) as client:
+        yield Harness(service, client, results)
 
 
 def _accept(harness: Harness, request: dict[str, Any]) -> Any:
@@ -198,6 +368,11 @@ def _result(status: str, run_id: str = EXPECTED_RUN_ID, **detail: Any) -> dict[s
         ("GET", f"/api/v1/backtests/{EXPECTED_RUN_ID}/performance"),
         ("GET", f"/api/v1/backtests/{EXPECTED_RUN_ID}/monthly-summaries"),
         ("GET", f"/api/v1/backtests/{EXPECTED_RUN_ID}/detail-manifests"),
+        ("GET", f"/api/v1/backtests/{EXPECTED_RUN_ID}/monthly-trades?et_month=2026-07"),
+        # No `et_month` at all: the credential is checked before the query string, so
+        # an anonymous caller cannot probe the parameter contract.
+        ("GET", f"/api/v1/backtests/{EXPECTED_RUN_ID}/monthly-trades"),
+        ("GET", f"/api/v1/backtests/{EXPECTED_RUN_ID}/inputs"),
         ("POST", "/api/v1/backtests"),
         ("POST", f"/api/v1/backtests/{EXPECTED_RUN_ID}/results"),
     ],
@@ -721,7 +896,15 @@ def test_performance_is_404_until_the_run_produces_one(
 def test_unknown_run_is_404_for_every_query(harness: Harness) -> None:
     unknown = "11111111-1111-4111-8111-111111111111"
 
-    for suffix in ("", "/attempts", "/performance", "/monthly-summaries", "/detail-manifests"):
+    for suffix in (
+        "",
+        "/attempts",
+        "/performance",
+        "/monthly-summaries",
+        "/detail-manifests",
+        "/monthly-trades?et_month=2026-07",
+        "/inputs",
+    ):
         response = harness.client.get(
             f"/api/v1/backtests/{unknown}{suffix}", headers=harness.owner()
         )
@@ -735,6 +918,338 @@ def test_pagination_bounds_are_enforced(harness: Harness, limit: int, offset: in
     )
 
     assert response.status_code == 422
+
+
+def test_the_listing_reports_the_same_attempt_count_as_the_run_detail(
+    harness: Harness, official_request: dict[str, Any]
+) -> None:
+    """`attemptCount` is one number and both query shapes must report it.
+
+    `lifecycle.list_runs` builds each aggregate without its attempts, so the listing
+    used to answer 0 for every run while `GET /{run_id}` answered the truth.
+    """
+    _accept(harness, official_request)
+    harness.gateway.record_attempt(
+        RunAttemptRow(
+            id=UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            run_id=UUID(EXPECTED_RUN_ID),
+            attempt_number=1,
+            worker_execution_key="worker-execution-1",
+            status=WorkStatus.RUNNING,
+            started_at=datetime(2026, 7, 31, 12, 5, tzinfo=timezone.utc),
+        )
+    )
+
+    listed = harness.client.get("/api/v1/backtests", headers=harness.owner()).json()
+    detail = harness.client.get(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}", headers=harness.owner()
+    ).json()
+
+    assert listed["items"][0]["attemptCount"] == 1
+    assert detail["attemptCount"] == 1
+
+
+# ===========================================================================
+# Monthly trade detail (D29 "월별 거래 상세")
+# ===========================================================================
+
+
+def test_monthly_trade_detail_is_served_for_the_owning_account(harness: Harness) -> None:
+    """The whole row, pinned. This is the payload D31 binds the 거래 상세 screen to."""
+    harness.publish_completed()
+
+    response = harness.client.get(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}/monthly-trades?et_month=2026-07",
+        headers=harness.owner(),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "backtestRunId": EXPECTED_RUN_ID,
+        "etMonth": "2026-07",
+        "items": [
+            {
+                "recordId": JULY_RECORD_ID,
+                "occurredAt": "2026-08-01T03:30:00Z",
+                "kind": "FILL",
+                "orderId": JULY_ORDER_ID,
+                "instrumentId": INSTRUMENT_ID,
+                "orderStatus": "FILLED",
+                "cashAfter": "9897.80000000",
+                "positionsAfter": [
+                    {
+                        "instrumentId": INSTRUMENT_ID,
+                        "quantity": "1.00000000",
+                        "costBasis": "100.05000000",
+                    }
+                ],
+                "reasonCode": None,
+                "fillId": JULY_FILL_ID,
+                "quantity": "1.00000000",
+                "basePrice": "100.00000000",
+                "price": "100.05000000",
+                "grossAmount": "100.05000000",
+                "slippageAmount": "0.05000000",
+                "fee": "2.20000000",
+                "costBasis": "100.05000000",
+                "realizedPnl": "0.00000000",
+            }
+        ],
+    }
+
+
+def test_one_et_week_part_is_split_across_the_two_et_months_it_spans(
+    harness: Harness,
+) -> None:
+    """Detail Parquet is partitioned by ET Monday week; the API answer is ET month.
+
+    Both fills live in the single week part starting 2026-07-27. A route that handed
+    the week partition back as the month would answer both records for both months.
+    """
+    harness.publish_completed()
+
+    july = harness.client.get(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}/monthly-trades?et_month=2026-07",
+        headers=harness.owner(),
+    ).json()
+    august = harness.client.get(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}/monthly-trades?et_month=2026-08",
+        headers=harness.owner(),
+    ).json()
+
+    assert [item["recordId"] for item in july["items"]] == [JULY_RECORD_ID]
+    assert [item["recordId"] for item in august["items"]] == [AUGUST_RECORD_ID]
+    assert august["items"][0]["cashAfter"] == "9795.55000000"
+    assert august["items"][0]["positionsAfter"] == [
+        {
+            "instrumentId": INSTRUMENT_ID,
+            "quantity": "2.00000000",
+            "costBasis": "200.15000000",
+        }
+    ]
+
+
+def test_an_et_month_the_run_never_traded_in_is_an_empty_result_not_an_error(
+    harness: Harness,
+) -> None:
+    harness.publish_completed()
+
+    response = harness.client.get(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}/monthly-trades?et_month=2026-09",
+        headers=harness.owner(),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "backtestRunId": EXPECTED_RUN_ID,
+        "etMonth": "2026-09",
+        "items": [],
+    }
+
+
+def test_a_month_whose_evidence_went_missing_is_500_not_an_empty_month(
+    harness: Harness,
+) -> None:
+    """Fail closed. "The objects are gone" and "you traded nothing" are not the same.
+
+    Reporting the first as an empty list would let a lost Parquet part look like a
+    quiet month on the 거래 상세 screen.
+    """
+    harness.publish_completed()
+    entry = harness.results.get_owned(str(OWNER_ID), EXPECTED_RUN_ID)
+    object.__setattr__(
+        entry,
+        "details",
+        replace(
+            entry.details,
+            objects=tuple(
+                item
+                for item in entry.details.objects
+                if item.descriptor.record_type is not DetailObjectKind.TRADE_DETAIL
+            ),
+        ),
+    )
+
+    response = harness.client.get(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}/monthly-trades?et_month=2026-07",
+        headers=harness.owner(),
+    )
+
+    assert response.status_code == 500
+    assert "do not match" in response.json()["detail"]
+
+
+def test_monthly_trade_detail_for_a_foreign_owner_is_404_not_403(harness: Harness) -> None:
+    """The read model answers not-found for a foreign run, and the route keeps that.
+
+    Trade detail is the run's evidence, not its metadata: a 403 here would confirm
+    that this run id exists and that somebody else finished it.
+    """
+    harness.publish_completed()
+
+    response = harness.client.get(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}/monthly-trades?et_month=2026-07",
+        headers=harness.other(),
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "backtest not found"
+
+
+@pytest.mark.parametrize("status", ["QUEUED", "RUNNING"])
+def test_monthly_trade_detail_of_an_unfinished_run_is_409_not_a_partial_answer(
+    harness: Harness, status: str
+) -> None:
+    harness.project(status)
+
+    response = harness.client.get(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}/monthly-trades?et_month=2026-07",
+        headers=harness.owner(),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        f"backtest result is not available for status {status}"
+    )
+
+
+@pytest.mark.parametrize(
+    "et_month",
+    ["2026-7", "2026-13", "2026-00", "0000-01", "202607", "2026-07-01", "July", ""],
+)
+def test_a_malformed_et_month_is_422_with_a_typed_reason(
+    harness: Harness, et_month: str
+) -> None:
+    harness.publish_completed()
+
+    response = harness.client.get(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}/monthly-trades?et_month={et_month}",
+        headers=harness.owner(),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["reasonCode"] == "ET_MONTH_MALFORMED"
+    assert response.json()["detail"]["parameter"] == "et_month"
+
+
+def test_et_month_is_required_rather_than_defaulted_to_a_month(harness: Harness) -> None:
+    """No hidden default: the route never picks a month on the caller's behalf."""
+    harness.publish_completed()
+
+    response = harness.client.get(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}/monthly-trades", headers=harness.owner()
+    )
+
+    assert response.status_code == 422
+
+
+def test_the_result_read_model_endpoints_are_503_when_no_read_model_is_configured(
+    compiled_plan: dict[str, Any], manifest: dict[str, Any]
+) -> None:
+    """A deployment that supplied no read model says so, rather than answering 404.
+
+    404 would be indistinguishable from "that run does not exist" and would leave the
+    UI unable to tell a misconfigured deployment from an empty account.
+    """
+    service = BacktestLifecycleService(
+        gateway=InMemoryRunGateway(),
+        queue=InMemoryBacktestJobQueue(),
+        owners=StaticOwnerDirectory({BOT_ID: OWNER_ID}),
+        plans=StaticCompiledPlanSource({compiled_plan["planChecksum"]: compiled_plan}),
+        manifests=StaticDatasetManifestSource({MANIFEST_ID: manifest}),
+        policies=ExecutionPolicyCatalog([D17_EXECUTION_POLICY_FIXTURE, POLICY_2026Q3]),
+    )
+    authenticator = StaticTokenAuthenticator({OWNER_TOKEN: Principal(account_id=OWNER_ID)})
+    headers = {"Authorization": f"Bearer {OWNER_TOKEN}"}
+
+    with TestClient(create_app(service, authenticator)) as client:
+        trades = client.get(
+            f"/api/v1/backtests/{EXPECTED_RUN_ID}/monthly-trades?et_month=2026-07",
+            headers=headers,
+        )
+        inputs = client.get(f"/api/v1/backtests/{EXPECTED_RUN_ID}/inputs", headers=headers)
+
+    assert trades.status_code == 503
+    assert inputs.status_code == 503
+    assert "BacktestResultQueryService" in trades.json()["detail"]
+
+
+# ===========================================================================
+# Inputs, models and the unavailable reason (D29 "입력 데이터·모델과 unavailable 이유")
+# ===========================================================================
+
+
+def test_inputs_and_models_expose_the_locked_reproducibility_identity(
+    harness: Harness,
+) -> None:
+    harness.publish_completed()
+
+    response = harness.client.get(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}/inputs", headers=harness.owner()
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "backtestRunId": EXPECTED_RUN_ID,
+        "botId": str(BOT_ID),
+        "status": "COMPLETED",
+        "strategySnapshotHash": SNAPSHOT_HASH,
+        "compiledPlanChecksum": "sha256:" + "b" * 64,
+        "datasetManifestId": str(MANIFEST_ID),
+        "datasetHash": DATASET_HASH,
+        "inputBundleFingerprint": QUERY_FINGERPRINT,
+        "featureMaterializationVersion": "market-bars-v2",
+        "executionPolicyVersion": "official-backtest-policy-v2",
+        "precisionRulesVersion": "precision:1.0.0",
+        "calculationModelVersion": "calculation-v9",
+        "costModelVersion": "cost-v3",
+        "executionModelVersion": "execution-v5",
+        "reasonCode": None,
+        "missingRequirements": [],
+    }
+
+
+def test_an_unavailable_run_names_what_was_missing(harness: Harness) -> None:
+    """`UNAVAILABLE` is the one status whose whole content is the reason it has none.
+
+    The model versions are null because no model ever ran, and that is reported as
+    null rather than as a plausible-looking version string.
+    """
+    harness.results.upsert_run(
+        RunProjection(
+            run_id=EXPECTED_RUN_ID,
+            bot_id=str(BOT_ID),
+            owner_account_id=str(OWNER_ID),
+            status="UNAVAILABLE",
+            queued_at=_instant("2026-07-31T12:00:00Z"),
+            inputs=_query_inputs(),
+            finished_at=_instant("2026-07-31T12:01:00Z"),
+            reason_code="REQUIRED_DATA_MISSING",
+            missing_requirements=("resolution:1m", "symbol:XYZ"),
+        )
+    )
+
+    body = harness.client.get(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}/inputs", headers=harness.owner()
+    ).json()
+
+    assert body["status"] == "UNAVAILABLE"
+    assert body["reasonCode"] == "REQUIRED_DATA_MISSING"
+    assert body["missingRequirements"] == ["resolution:1m", "symbol:XYZ"]
+    assert body["calculationModelVersion"] is None
+    assert body["costModelVersion"] is None
+    assert body["executionModelVersion"] is None
+    assert body["inputBundleFingerprint"] == QUERY_FINGERPRINT
+
+
+def test_inputs_for_a_foreign_owner_are_404_not_403(harness: Harness) -> None:
+    harness.publish_completed()
+
+    response = harness.client.get(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}/inputs", headers=harness.other()
+    )
+
+    assert response.status_code == 404
 
 
 def test_create_app_refuses_to_build_without_its_collaborators() -> None:
