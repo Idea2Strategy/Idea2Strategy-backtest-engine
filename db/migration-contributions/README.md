@@ -23,11 +23,26 @@ at runtime**.
 
 ## Current contents
 
-`migrations/` is intentionally **empty of SQL**. All nine `backtest.*` tables already
-exist in the applied central baseline `V1__initial_schema.sql`
-(`CREATE TABLE "backtest"."runs"` and following). Applied migrations are immutable, so
-there is nothing for this repository to author yet; the mechanism exists so that the
-first genuine `backtest` schema change has a legal home.
+All nine `backtest.*` tables already exist in the applied central baseline
+`V1__initial_schema.sql` (`CREATE TABLE "backtest"."runs"` and following). Applied
+migrations are immutable, so this repository never restates them; it contributes only
+later changes.
+
+`migrations/` contains one file:
+
+- `V20260802143000__backtest_run_outcome_detail.sql` — adds three nullable columns to
+  `backtest.runs`: `result_manifest_id` (the COMPLETED event's `resultManifestId`),
+  `retryable` (the FAILED event's `retryable`) and `missing_requirements` (the
+  UNAVAILABLE event's `missingRequirements`). All three are fields the
+  `backtest.v1` result contract already declares **required** in their branch and
+  that the server previously validated and then discarded, because the baseline had
+  nowhere to put them.
+
+**Canonical model.** The root superproject's `db/schema.dbml` is authoritative and is
+not part of this repository, so it cannot be edited from here. The matching DBML
+change — three columns on `Table backtest.runs` — is stated verbatim in
+`docs/dbml-change-request-run-outcome-detail.md` and must land in the same reviewed
+change as this migration.
 
 `fixtures/` holds the vendored copy of the central migration bundle that the
 Testcontainers integration tests apply, plus its recorded SHA-256 digests. It contains

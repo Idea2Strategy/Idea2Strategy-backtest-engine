@@ -146,11 +146,33 @@ class RunRow:
     completed_at: datetime | None = None
     failure_code: str | None = None
     result_hash: str | None = None
+    #: `backtest.v1` COMPLETED -> `resultManifestId`. The only link from a completed
+    #: run to the manifest that holds its result.
+    result_manifest_id: UUID | None = None
+    #: `backtest.v1` FAILED -> `retryable`. `None` means the run has not failed, which
+    #: is a different fact from `False` ("it failed and re-queuing cannot help").
+    retryable: bool | None = None
+    #: `backtest.v1` UNAVAILABLE -> `missingRequirements`, in the order the worker
+    #: sent them. The contract requires at least one entry alongside `reasonCode`, so
+    #: an empty list is refused here rather than stored as "nothing was missing".
+    missing_requirements: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         validate_money(self.initial_cash_amount, "initial_cash_amount")
         if self.evaluation_end < self.evaluation_start:
             raise ValueError("evaluation_end must not precede evaluation_start")
+        if self.missing_requirements is not None:
+            # A JSONB round trip returns a list; the row is frozen, so normalise once.
+            requirements = tuple(self.missing_requirements)
+            if not requirements:
+                raise ValueError(
+                    "missing_requirements must name at least one requirement; the "
+                    "backtest.v1 UNAVAILABLE branch declares minItems 1, and an empty "
+                    "list would read as 'nothing was missing'"
+                )
+            if any(not isinstance(item, str) or not item for item in requirements):
+                raise ValueError("missing_requirements entries must be non-empty strings")
+            object.__setattr__(self, "missing_requirements", requirements)
 
 
 @dataclass(frozen=True, slots=True)
@@ -333,5 +355,9 @@ def row_to_params(row: object) -> dict[str, Any]:
             value = value.value
         elif isinstance(value, Mapping):
             value = dict(value)
+        elif isinstance(value, tuple):
+            # A tuple field always backs a `jsonb` column here; psycopg's JSON
+            # adapter serialises a list, not a tuple.
+            value = list(value)
         params[field.name] = value
     return params

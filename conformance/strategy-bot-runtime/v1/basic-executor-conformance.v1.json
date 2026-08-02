@@ -1,0 +1,769 @@
+{
+  "conformanceVersion": "basic-executor-conformance.v1",
+  "runtimeSchemaVersion": "strategy-bot-runtime.v1",
+  "planSchemaVersion": "basic-compiled-plan.v1",
+  "elementCatalogVersion": "basic-elements:2026-07-31",
+  "featureCatalogVersion": "features:1.0.0",
+  "purpose": "Card D92. One set of bytes both the Python backtest runtime (backtest-engine, BasicPlanRuntime) and the Java trading runtime (trading-engine, BasicStrategyExecutor) are checked against, so 'semantically equivalent' is a test result and not a claim. Every expected value below is a literal; no section may be derived by running either implementation.",
+  "conventions": {
+    "timestamps": "RFC 3339, always UTC, always with a trailing Z.",
+    "decimals": "Decimal strings. Never parse them as binary floating point: the 8-decimal contract values do not round-trip through IEEE 754 double.",
+    "barWindow": "A bar declared with startsAt S at resolution R spans [S, S+R). It is 'completed at' an instant T when S+R <= T. A bar containing T is never read; that is the look-ahead rule.",
+    "implementationDefinedValues": "Where an expected evidence value is the string \"$IMPLEMENTATION_DEFINED\", the key MUST be present with a non-empty value and the value itself is not compared. It is used only where the two languages cannot agree (an exception class name).",
+    "additionalEvidenceKeys": "Unless a case says otherwise, an implementation MUST produce every evidence key listed and MAY produce no others. The single exception is recorded in knownDivergences[error-trace-evidence]."
+  },
+
+  "reasonCodes": {
+    "conditionError": "CONDITION_EVALUATION_ERROR",
+    "inputMissing": "INSTRUMENT_INPUT_MISSING",
+    "featureLoaded": "FEATURE_LOADED",
+    "compareTrue": "COMPARE_TRUE",
+    "compareFalse": "COMPARE_FALSE",
+    "missingInputStepId": "$input"
+  },
+
+  "ordering": {
+    "flows": "Flows are evaluated in the order the compiled plan declares them. Decisions from flow N all precede decisions from flow N+1.",
+    "instrumentsWithinFlow": "Ascending by instrument id under UNSIGNED_128BIT_BIG_ENDIAN.",
+    "instrumentComparisonRule": "UNSIGNED_128BIT_BIG_ENDIAN",
+    "instrumentComparisonDefinition": "Compare the two UUIDs as 16-byte big-endian UNSIGNED integers, i.e. byte-by-byte from the most significant byte, treating each byte as 0..255. This is equivalent to sorting the canonical lower-case hyphenated text form lexicographically, and it is what PostgreSQL's uuid type does (uuid_cmp is a memcmp).",
+    "instrumentComparisonWarning": "java.util.UUID.compareTo does NOT implement this rule. It compares mostSigBits and leastSigBits as SIGNED 64-bit longs, so any id whose first byte is >= 0x80 sorts before every id whose first byte is < 0x80. A Java implementation must supply an explicit comparator; Comparator.naturalOrder() is not conformant. See knownDivergences[instrument-iteration-order].",
+    "stepsWithinInstrument": "Condition steps run in declared order. The first step that does not pass ends the instrument immediately: no later step is evaluated and no later trace entry is produced.",
+    "traceContent": "The trace contains exactly one entry per step that was evaluated, in evaluation order, including the failing one."
+  },
+
+  "features": [
+    {
+      "featureId": "RSI_14",
+      "definitionVersion": "rsi:1.0.0",
+      "method": "SIMPLE_AVERAGE_BOUNDED_WINDOW",
+      "methodNote": "Cutler's simple-average RSI, NOT Wilder's exponentially smoothed RSI. Wilder's recursion has unbounded memory: its value depends on where the series was first seeded, so a backtest seeded at the start of a quarter and a live runtime seeded at process start would disagree forever. A bounded window makes the value a pure function of the last periods+1 bars.",
+      "dataKind": "ADJUSTED_BAR",
+      "dataKindNote": "Corporate-action-adjusted bars. Raw bars are not substitutable.",
+      "periods": 14,
+      "requiredBars": 15,
+      "warmupNote": "14 price CHANGES require 15 closes. Fewer than 15 completed bars is not a value of 0, 50 or 100: it is the input-missing outcome with inputReason FEATURE_WARMUP_INCOMPLETE.",
+      "periodicity": "The bar duration named by the LOAD_FEATURE step's resolution argument. The value is defined identically at every supported resolution; the resolution selects which series is read and nothing else.",
+      "supportedResolutions": ["1m", "5m", "15m", "1h"],
+      "resolutionPeriods": {"1m": "PT1M", "5m": "PT5M", "15m": "PT15M", "1h": "PT1H"},
+      "resolutionNote": "Daily and coarser resolutions are deliberately absent: their period depends on the session calendar rather than on a fixed duration, so a bar-count window would not be a pure function of the series.",
+      "requiredObservationsNote": "B's requiredFeatures[].requiredObservations is a FLOOR (14 in B's published plan), not the window size. The window this definition needs is 15. A conformant runtime warms up on max(requiredObservations, requiredBars) = 15.",
+      "window": "Take the bars of the instrument's (ADJUSTED_BAR, resolution) series whose ends_at <= asOf, in ascending startsAt order, and keep the LAST 15.",
+      "formula": [
+        "Let C[0..14] be the closes of the 15 window bars, oldest first.",
+        "D[i] = C[i] - C[i-1] for i = 1..14",
+        "U = (sum over i of max(D[i], 0)) / 14",
+        "V = (sum over i of max(-D[i], 0)) / 14",
+        "if V == 0 and U == 0:  RSI = 50",
+        "elif V == 0:           RSI = 100",
+        "else:                  RSI = 100 - 100 / (1 + U / V)"
+      ],
+      "flatWindowNote": "The V == 0 and U == 0 branch is a pinned convention, not a mathematical result: U/V is undefined there. 50 is chosen because a flat window is neither overbought nor oversold. It must be reproduced verbatim.",
+      "arithmetic": {
+        "workingPrecision": 34,
+        "workingRounding": "HALF_EVEN",
+        "workingNote": "IEEE 754 decimal128. Java: new MathContext(34, RoundingMode.HALF_EVEN).",
+        "resultScale": 8,
+        "resultRounding": "HALF_EVEN",
+        "resultNote": "One single final quantization of the result. Java: rsi.setScale(8, RoundingMode.HALF_EVEN). Binary floating point is not permitted.",
+        "negativeZero": "A result that quantizes to zero is rendered as 0.00000000, never -0.00000000."
+      },
+      "range": {"minimum": "0.00000000", "maximum": "100.00000000"}
+    }
+  ],
+
+  "featureVectors": [
+    {
+      "vectorId": "rsi14-all-gains",
+      "featureId": "RSI_14",
+      "closes": ["100", "101", "102", "103", "104", "105", "106", "107", "108", "109", "110", "111", "112", "113", "114"],
+      "expectedValue": "100.00000000",
+      "derivation": "14 changes of +1. U = 14/14 = 1, V = 0. V == 0 and U != 0, so RSI = 100."
+    },
+    {
+      "vectorId": "rsi14-all-losses",
+      "featureId": "RSI_14",
+      "closes": ["114", "113", "112", "111", "110", "109", "108", "107", "106", "105", "104", "103", "102", "101", "100"],
+      "expectedValue": "0.00000000",
+      "derivation": "14 changes of -1. U = 0, V = 1. RSI = 100 - 100/(1 + 0) = 0."
+    },
+    {
+      "vectorId": "rsi14-flat-window",
+      "featureId": "RSI_14",
+      "closes": ["100", "100", "100", "100", "100", "100", "100", "100", "100", "100", "100", "100", "100", "100", "100"],
+      "expectedValue": "50.00000000",
+      "derivation": "U = 0 and V = 0. The pinned convention applies: RSI = 50, not 0 and not 100."
+    },
+    {
+      "vectorId": "rsi14-two-to-one",
+      "featureId": "RSI_14",
+      "closes": ["100", "102", "104", "106", "108", "110", "112", "114", "113", "112", "111", "110", "109", "108", "107"],
+      "expectedValue": "66.66666667",
+      "derivation": "7 changes of +2 then 7 of -1. U = 14/14 = 1, V = 7/14 = 0.5, U/V = 2, RSI = 100 - 100/3 = 66.6666... which rounds HALF_EVEN at 8 decimals to 66.66666667."
+    },
+    {
+      "vectorId": "rsi14-one-to-two",
+      "featureId": "RSI_14",
+      "closes": ["100", "101", "99", "99", "99", "99", "99", "99", "99", "99", "99", "99", "99", "99", "99"],
+      "expectedValue": "33.33333333",
+      "derivation": "+1, -2, then 12 zero changes. U = 1/14, V = 2/14, U/V = 0.5, RSI = 100 - 100/1.5 = 33.3333... which rounds HALF_EVEN at 8 decimals to 33.33333333."
+    },
+    {
+      "vectorId": "rsi14-five-to-nine-rounding",
+      "featureId": "RSI_14",
+      "closes": ["100", "105", "96", "96", "96", "96", "96", "96", "96", "96", "96", "96", "96", "96", "96"],
+      "expectedValue": "35.71428571",
+      "derivation": "+5, -9, then 12 zero changes. U = 5/14, V = 9/14, U/V = 5/9, RSI = 100 - 100*9/14 = 100 - 64.285714285714... = 35.7142857142857... The 9th decimal is 4, so HALF_EVEN at 8 decimals rounds down to 35.71428571. This vector exists so an implementation that truncates, or that rounds HALF_UP on a 5, is still distinguished from one that does not."
+    }
+  ],
+
+  "elementCases": [
+    {
+      "caseId": "load-feature-passes-and-records-the-value",
+      "operation": "LOAD_FEATURE",
+      "arguments": {"feature": "RSI_14", "resolution": "1m"},
+      "series": {
+        "dataKind": "ADJUSTED_BAR",
+        "resolution": "1m",
+        "firstBarStartsAt": "2024-01-02T14:30:00Z",
+        "closes": ["100", "102", "104", "106", "108", "110", "112", "114", "113", "112", "111", "110", "109", "108", "107"]
+      },
+      "asOf": "2024-01-02T14:45:00Z",
+      "expected": {
+        "outcome": "PASSED",
+        "reasonCode": "FEATURE_LOADED",
+        "evidence": {
+          "feature": "RSI_14",
+          "featureVersion": "rsi:1.0.0",
+          "resolution": "1m",
+          "value": "66.66666667",
+          "asOf": "2024-01-02T14:45:00+00:00",
+          "windowFrom": "2024-01-02T14:30:00+00:00",
+          "windowThrough": "2024-01-02T14:45:00+00:00"
+        }
+      },
+      "note": "15 one-minute bars start at 14:30 and the last one ends at 14:45, so all 15 are completed at asOf = 14:45 and the window is the whole series."
+    },
+    {
+      "caseId": "load-feature-ignores-the-bar-that-contains-the-instant",
+      "operation": "LOAD_FEATURE",
+      "arguments": {"feature": "RSI_14", "resolution": "1m"},
+      "series": {
+        "dataKind": "ADJUSTED_BAR",
+        "resolution": "1m",
+        "firstBarStartsAt": "2024-01-02T14:30:00Z",
+        "closes": ["100", "102", "104", "106", "108", "110", "112", "114", "113", "112", "111", "110", "109", "108", "107", "999"]
+      },
+      "asOf": "2024-01-02T14:45:30Z",
+      "expected": {
+        "outcome": "PASSED",
+        "reasonCode": "FEATURE_LOADED",
+        "evidence": {
+          "feature": "RSI_14",
+          "featureVersion": "rsi:1.0.0",
+          "resolution": "1m",
+          "value": "66.66666667",
+          "asOf": "2024-01-02T14:45:30+00:00",
+          "windowFrom": "2024-01-02T14:30:00+00:00",
+          "windowThrough": "2024-01-02T14:45:00+00:00"
+        }
+      },
+      "note": "The 16th bar spans [14:45, 14:46) and is still open at 14:45:30, so its close of 999 must not move the value. An implementation that read it would report a very different number."
+    },
+    {
+      "caseId": "load-feature-warmup-incomplete",
+      "operation": "LOAD_FEATURE",
+      "arguments": {"feature": "RSI_14", "resolution": "1m"},
+      "series": {
+        "dataKind": "ADJUSTED_BAR",
+        "resolution": "1m",
+        "firstBarStartsAt": "2024-01-02T14:30:00Z",
+        "closes": ["100", "102", "104", "106", "108", "110", "112", "114", "113", "112", "111", "110", "109", "108"]
+      },
+      "asOf": "2024-01-02T14:44:00Z",
+      "expected": {
+        "outcome": "INPUT_MISSING",
+        "reasonCode": "INSTRUMENT_INPUT_MISSING",
+        "inputReason": "FEATURE_WARMUP_INCOMPLETE",
+        "evidence": {
+          "feature": "RSI_14",
+          "resolution": "1m",
+          "requiredBars": "15",
+          "availableBars": "14",
+          "asOf": "2024-01-02T14:44:00+00:00"
+        }
+      },
+      "note": "14 completed bars is one short. It must not yield a substituted value and must not report 'condition false': a strategy whose data never arrived did not decline to trade."
+    },
+    {
+      "caseId": "load-feature-series-missing",
+      "operation": "LOAD_FEATURE",
+      "arguments": {"feature": "RSI_14", "resolution": "1m"},
+      "series": null,
+      "asOf": "2024-01-02T14:45:00Z",
+      "expected": {
+        "outcome": "INPUT_MISSING",
+        "reasonCode": "INSTRUMENT_INPUT_MISSING",
+        "inputReason": "FEATURE_SERIES_MISSING",
+        "evidence": {
+          "feature": "RSI_14",
+          "dataKind": "ADJUSTED_BAR",
+          "resolution": "1m"
+        }
+      },
+      "note": "The instrument has an input but no ADJUSTED_BAR/1m series at all. Distinct from warm-up: nothing was ever delivered."
+    },
+    {
+      "caseId": "compare-gt-true",
+      "operation": "COMPARE",
+      "arguments": {"operator": "GT", "threshold": "60"},
+      "operand": "66.66666667",
+      "operandSource": "RSI_14",
+      "expected": {
+        "outcome": "PASSED",
+        "reasonCode": "COMPARE_TRUE",
+        "evidence": {"operator": "GT", "operand": "66.66666667", "threshold": "60", "source": "RSI_14"}
+      }
+    },
+    {
+      "caseId": "compare-gt-false",
+      "operation": "COMPARE",
+      "arguments": {"operator": "GT", "threshold": "70"},
+      "operand": "66.66666667",
+      "operandSource": "RSI_14",
+      "expected": {
+        "outcome": "FAILED",
+        "reasonCode": "COMPARE_FALSE",
+        "evidence": {"operator": "GT", "operand": "66.66666667", "threshold": "70", "source": "RSI_14"}
+      }
+    },
+    {
+      "caseId": "compare-eq-is-numeric-not-textual",
+      "operation": "COMPARE",
+      "arguments": {"operator": "EQ", "threshold": "20.00000000"},
+      "operand": "20",
+      "operandSource": "RSI_14",
+      "expected": {
+        "outcome": "PASSED",
+        "reasonCode": "COMPARE_TRUE",
+        "evidence": {"operator": "EQ", "operand": "20", "threshold": "20.00000000", "source": "RSI_14"}
+      },
+      "note": "The threshold is compared as an exact decimal number, never as text. '20' and '20.00000000' are the same number and both hold. Note that the evidence echoes the threshold as the plan wrote it, not as normalised, so the trace shows what the plan actually said."
+    },
+    {
+      "caseId": "compare-with-no-operand-is-an-evaluation-error",
+      "operation": "COMPARE",
+      "arguments": {"operator": "GT", "threshold": "60"},
+      "operand": null,
+      "operandSource": null,
+      "expected": {
+        "outcome": "EVALUATION_ERROR",
+        "reasonCode": "CONDITION_EVALUATION_ERROR"
+      },
+      "note": "A comparison with no preceding LOAD_FEATURE is a plan-structure defect. It surfaces as an evaluation error, not as 'condition false'."
+    }
+  ],
+
+  "executorCases": [
+    {
+      "caseId": "candidate-emitted",
+      "description": "One instrument, every step passes, so the decision is CANDIDATE with the whole budget.",
+      "flows": [
+        {
+          "flowId": "flow-a",
+          "side": "BUY",
+          "instrumentIds": ["00000000-0000-4000-8000-000000000301"],
+          "conditionSteps": ["step-1:LOAD_FEATURE", "step-2:COMPARE"]
+        }
+      ],
+      "stepOutcomes": {
+        "00000000-0000-4000-8000-000000000301": [
+          {"outcome": "PASSED", "reasonCode": "FEATURE_LOADED", "evidence": {"feature": "RSI_14"}},
+          {"outcome": "PASSED", "reasonCode": "COMPARE_TRUE", "evidence": {"operator": "GT"}}
+        ]
+      },
+      "expectedDecisions": [
+        {
+          "flowId": "flow-a",
+          "instrumentId": "00000000-0000-4000-8000-000000000301",
+          "side": "BUY",
+          "status": "CANDIDATE",
+          "firstFailureStepId": null,
+          "firstFailureReason": null,
+          "buyAllocation": {"numerator": 1, "denominator": 1},
+          "trace": [
+            {"stepId": "step-1:LOAD_FEATURE", "passed": true, "reasonCode": "FEATURE_LOADED", "evidence": {"feature": "RSI_14"}},
+            {"stepId": "step-2:COMPARE", "passed": true, "reasonCode": "COMPARE_TRUE", "evidence": {"operator": "GT"}}
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "condition-not-met-short-circuits",
+      "description": "The first failing step ends the instrument. The third step must never run.",
+      "flows": [
+        {
+          "flowId": "flow-a",
+          "side": "BUY",
+          "instrumentIds": ["00000000-0000-4000-8000-000000000301"],
+          "conditionSteps": ["step-1:LOAD_FEATURE", "step-2:COMPARE", "step-3:COMPARE"]
+        }
+      ],
+      "stepOutcomes": {
+        "00000000-0000-4000-8000-000000000301": [
+          {"outcome": "PASSED", "reasonCode": "FEATURE_LOADED", "evidence": {}},
+          {"outcome": "FAILED", "reasonCode": "COMPARE_FALSE", "evidence": {"operator": "GT"}},
+          {"outcome": "MUST_NOT_BE_EVALUATED"}
+        ]
+      },
+      "expectedDecisions": [
+        {
+          "flowId": "flow-a",
+          "instrumentId": "00000000-0000-4000-8000-000000000301",
+          "side": "BUY",
+          "status": "CONDITION_NOT_MET",
+          "firstFailureStepId": "step-2:COMPARE",
+          "firstFailureReason": "COMPARE_FALSE",
+          "buyAllocation": null,
+          "trace": [
+            {"stepId": "step-1:LOAD_FEATURE", "passed": true, "reasonCode": "FEATURE_LOADED", "evidence": {}},
+            {"stepId": "step-2:COMPARE", "passed": false, "reasonCode": "COMPARE_FALSE", "evidence": {"operator": "GT"}}
+          ]
+        }
+      ],
+      "note": "An outcome of MUST_NOT_BE_EVALUATED means the harness MUST fail if the runtime asks for that step at all. Asserting only on the trace length would let an implementation evaluate the step and then discard it, which for an evaluator with side effects is a different program."
+    },
+    {
+      "caseId": "condition-error-short-circuits",
+      "description": "A step that raises ends the instrument as CONDITION_ERROR, and the trace records the failing step.",
+      "flows": [
+        {
+          "flowId": "flow-a",
+          "side": "BUY",
+          "instrumentIds": ["00000000-0000-4000-8000-000000000301"],
+          "conditionSteps": ["step-1:LOAD_FEATURE", "step-2:COMPARE"]
+        }
+      ],
+      "stepOutcomes": {
+        "00000000-0000-4000-8000-000000000301": [
+          {"outcome": "RAISES_EVALUATION_ERROR"},
+          {"outcome": "MUST_NOT_BE_EVALUATED"}
+        ]
+      },
+      "expectedDecisions": [
+        {
+          "flowId": "flow-a",
+          "instrumentId": "00000000-0000-4000-8000-000000000301",
+          "side": "BUY",
+          "status": "CONDITION_ERROR",
+          "firstFailureStepId": "step-1:LOAD_FEATURE",
+          "firstFailureReason": "CONDITION_EVALUATION_ERROR",
+          "buyAllocation": null,
+          "trace": [
+            {
+              "stepId": "step-1:LOAD_FEATURE",
+              "passed": false,
+              "reasonCode": "CONDITION_EVALUATION_ERROR",
+              "evidence": {"errorType": "$IMPLEMENTATION_DEFINED"},
+              "additionalEvidenceKeysPermitted": true
+            }
+          ]
+        }
+      ],
+      "note": "errorType is implementation-defined because the two runtimes name exception classes from different languages. additionalEvidenceKeysPermitted records the divergence in knownDivergences[error-trace-evidence] rather than hiding it."
+    },
+    {
+      "caseId": "input-missing-for-an-instrument-with-no-input-at-all",
+      "description": "An instrument the flow names but for which no input was supplied.",
+      "flows": [
+        {
+          "flowId": "flow-a",
+          "side": "BUY",
+          "instrumentIds": ["00000000-0000-4000-8000-000000000301", "00000000-0000-4000-8000-000000000302"],
+          "conditionSteps": ["step-1:LOAD_FEATURE"]
+        }
+      ],
+      "instrumentsWithoutInput": ["00000000-0000-4000-8000-000000000302"],
+      "stepOutcomes": {
+        "00000000-0000-4000-8000-000000000301": [
+          {"outcome": "PASSED", "reasonCode": "FEATURE_LOADED", "evidence": {}}
+        ],
+        "00000000-0000-4000-8000-000000000302": [
+          {"outcome": "MUST_NOT_BE_EVALUATED"}
+        ]
+      },
+      "expectedDecisions": [
+        {
+          "flowId": "flow-a",
+          "instrumentId": "00000000-0000-4000-8000-000000000301",
+          "side": "BUY",
+          "status": "CANDIDATE",
+          "firstFailureStepId": null,
+          "firstFailureReason": null,
+          "buyAllocation": {"numerator": 1, "denominator": 1},
+          "trace": [
+            {"stepId": "step-1:LOAD_FEATURE", "passed": true, "reasonCode": "FEATURE_LOADED", "evidence": {}}
+          ]
+        },
+        {
+          "flowId": "flow-a",
+          "instrumentId": "00000000-0000-4000-8000-000000000302",
+          "side": "BUY",
+          "status": "INPUT_MISSING",
+          "firstFailureStepId": "$input",
+          "firstFailureReason": "INSTRUMENT_INPUT_MISSING",
+          "buyAllocation": null,
+          "trace": []
+        }
+      ],
+      "note": "The trace is EMPTY and the failing step id is the sentinel $input, because no step ran. The instrument without an input is still counted out of the allocation: the surviving instrument gets 1/1, not 1/2."
+    },
+    {
+      "caseId": "equal-allocation-non-divisible-three-candidates",
+      "description": "Three surviving BUY candidates each get the exact fraction 1/3.",
+      "flows": [
+        {
+          "flowId": "flow-a",
+          "side": "BUY",
+          "instrumentIds": [
+            "00000000-0000-4000-8000-000000000301",
+            "00000000-0000-4000-8000-000000000302",
+            "00000000-0000-4000-8000-000000000303"
+          ],
+          "conditionSteps": ["step-1:COMPARE"]
+        }
+      ],
+      "stepOutcomes": {
+        "00000000-0000-4000-8000-000000000301": [{"outcome": "PASSED", "reasonCode": "COMPARE_TRUE", "evidence": {}}],
+        "00000000-0000-4000-8000-000000000302": [{"outcome": "PASSED", "reasonCode": "COMPARE_TRUE", "evidence": {}}],
+        "00000000-0000-4000-8000-000000000303": [{"outcome": "PASSED", "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+      },
+      "expectedDecisions": [
+        {
+          "flowId": "flow-a", "instrumentId": "00000000-0000-4000-8000-000000000301", "side": "BUY",
+          "status": "CANDIDATE", "firstFailureStepId": null, "firstFailureReason": null,
+          "buyAllocation": {"numerator": 1, "denominator": 3},
+          "trace": [{"stepId": "step-1:COMPARE", "passed": true, "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+        },
+        {
+          "flowId": "flow-a", "instrumentId": "00000000-0000-4000-8000-000000000302", "side": "BUY",
+          "status": "CANDIDATE", "firstFailureStepId": null, "firstFailureReason": null,
+          "buyAllocation": {"numerator": 1, "denominator": 3},
+          "trace": [{"stepId": "step-1:COMPARE", "passed": true, "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+        },
+        {
+          "flowId": "flow-a", "instrumentId": "00000000-0000-4000-8000-000000000303", "side": "BUY",
+          "status": "CANDIDATE", "firstFailureStepId": null, "firstFailureReason": null,
+          "buyAllocation": {"numerator": 1, "denominator": 3},
+          "trace": [{"stepId": "step-1:COMPARE", "passed": true, "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+        }
+      ],
+      "allocationRule": "The share is the EXACT rational 1/N, never a decimal. 1/3 has no finite decimal form, and three candidates must together claim exactly the whole budget: 0.33333333 * 3 leaves 0.00000001 of the budget permanently unspendable, and 0.33333334 * 3 overspends it. Java models this as EqualAllocationShare(1, N), whose constructor rejects any numerator other than 1. Python models it as fractions.Fraction(1, N). Neither may be converted to a floating point or fixed-scale decimal at any point before the execution layer applies it to a budget."
+    },
+    {
+      "caseId": "equal-allocation-counts-only-survivors",
+      "description": "Three instruments, one rejected. The denominator is 2, not 3.",
+      "flows": [
+        {
+          "flowId": "flow-a",
+          "side": "BUY",
+          "instrumentIds": [
+            "00000000-0000-4000-8000-000000000301",
+            "00000000-0000-4000-8000-000000000302",
+            "00000000-0000-4000-8000-000000000303"
+          ],
+          "conditionSteps": ["step-1:COMPARE"]
+        }
+      ],
+      "stepOutcomes": {
+        "00000000-0000-4000-8000-000000000301": [{"outcome": "PASSED", "reasonCode": "COMPARE_TRUE", "evidence": {}}],
+        "00000000-0000-4000-8000-000000000302": [{"outcome": "FAILED", "reasonCode": "COMPARE_FALSE", "evidence": {}}],
+        "00000000-0000-4000-8000-000000000303": [{"outcome": "PASSED", "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+      },
+      "expectedDecisions": [
+        {
+          "flowId": "flow-a", "instrumentId": "00000000-0000-4000-8000-000000000301", "side": "BUY",
+          "status": "CANDIDATE", "firstFailureStepId": null, "firstFailureReason": null,
+          "buyAllocation": {"numerator": 1, "denominator": 2},
+          "trace": [{"stepId": "step-1:COMPARE", "passed": true, "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+        },
+        {
+          "flowId": "flow-a", "instrumentId": "00000000-0000-4000-8000-000000000302", "side": "BUY",
+          "status": "CONDITION_NOT_MET", "firstFailureStepId": "step-1:COMPARE",
+          "firstFailureReason": "COMPARE_FALSE", "buyAllocation": null,
+          "trace": [{"stepId": "step-1:COMPARE", "passed": false, "reasonCode": "COMPARE_FALSE", "evidence": {}}]
+        },
+        {
+          "flowId": "flow-a", "instrumentId": "00000000-0000-4000-8000-000000000303", "side": "BUY",
+          "status": "CANDIDATE", "firstFailureStepId": null, "firstFailureReason": null,
+          "buyAllocation": {"numerator": 1, "denominator": 2},
+          "trace": [{"stepId": "step-1:COMPARE", "passed": true, "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+        }
+      ]
+    },
+    {
+      "caseId": "equal-allocation-with-no-survivors",
+      "description": "Every instrument is rejected. No allocation is assigned to anything, and no division by zero occurs.",
+      "flows": [
+        {
+          "flowId": "flow-a",
+          "side": "BUY",
+          "instrumentIds": ["00000000-0000-4000-8000-000000000301", "00000000-0000-4000-8000-000000000302"],
+          "conditionSteps": ["step-1:COMPARE"]
+        }
+      ],
+      "stepOutcomes": {
+        "00000000-0000-4000-8000-000000000301": [{"outcome": "FAILED", "reasonCode": "COMPARE_FALSE", "evidence": {}}],
+        "00000000-0000-4000-8000-000000000302": [{"outcome": "FAILED", "reasonCode": "COMPARE_FALSE", "evidence": {}}]
+      },
+      "expectedDecisions": [
+        {
+          "flowId": "flow-a", "instrumentId": "00000000-0000-4000-8000-000000000301", "side": "BUY",
+          "status": "CONDITION_NOT_MET", "firstFailureStepId": "step-1:COMPARE",
+          "firstFailureReason": "COMPARE_FALSE", "buyAllocation": null,
+          "trace": [{"stepId": "step-1:COMPARE", "passed": false, "reasonCode": "COMPARE_FALSE", "evidence": {}}]
+        },
+        {
+          "flowId": "flow-a", "instrumentId": "00000000-0000-4000-8000-000000000302", "side": "BUY",
+          "status": "CONDITION_NOT_MET", "firstFailureStepId": "step-1:COMPARE",
+          "firstFailureReason": "COMPARE_FALSE", "buyAllocation": null,
+          "trace": [{"stepId": "step-1:COMPARE", "passed": false, "reasonCode": "COMPARE_FALSE", "evidence": {}}]
+        }
+      ]
+    },
+    {
+      "caseId": "sell-flow-is-never-allocated",
+      "description": "A SELL candidate is sized from the held position, so it carries no allocation share.",
+      "flows": [
+        {
+          "flowId": "flow-s",
+          "side": "SELL",
+          "instrumentIds": ["00000000-0000-4000-8000-000000000301", "00000000-0000-4000-8000-000000000302"],
+          "conditionSteps": ["step-1:COMPARE"]
+        }
+      ],
+      "stepOutcomes": {
+        "00000000-0000-4000-8000-000000000301": [{"outcome": "PASSED", "reasonCode": "COMPARE_TRUE", "evidence": {}}],
+        "00000000-0000-4000-8000-000000000302": [{"outcome": "PASSED", "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+      },
+      "expectedDecisions": [
+        {
+          "flowId": "flow-s", "instrumentId": "00000000-0000-4000-8000-000000000301", "side": "SELL",
+          "status": "CANDIDATE", "firstFailureStepId": null, "firstFailureReason": null,
+          "buyAllocation": null,
+          "trace": [{"stepId": "step-1:COMPARE", "passed": true, "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+        },
+        {
+          "flowId": "flow-s", "instrumentId": "00000000-0000-4000-8000-000000000302", "side": "SELL",
+          "status": "CANDIDATE", "firstFailureStepId": null, "firstFailureReason": null,
+          "buyAllocation": null,
+          "trace": [{"stepId": "step-1:COMPARE", "passed": true, "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+        }
+      ]
+    },
+    {
+      "caseId": "instrument-iteration-order-within-a-flow",
+      "description": "Instruments are declared out of order and must be evaluated in ascending id order.",
+      "flows": [
+        {
+          "flowId": "flow-a",
+          "side": "BUY",
+          "instrumentIds": [
+            "00000000-0000-4000-8000-000000000303",
+            "00000000-0000-4000-8000-000000000301",
+            "00000000-0000-4000-8000-000000000302"
+          ],
+          "conditionSteps": ["step-1:COMPARE"]
+        }
+      ],
+      "stepOutcomes": {
+        "00000000-0000-4000-8000-000000000301": [{"outcome": "PASSED", "reasonCode": "COMPARE_TRUE", "evidence": {}}],
+        "00000000-0000-4000-8000-000000000302": [{"outcome": "PASSED", "reasonCode": "COMPARE_TRUE", "evidence": {}}],
+        "00000000-0000-4000-8000-000000000303": [{"outcome": "PASSED", "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+      },
+      "expectedEvaluationOrder": [
+        "00000000-0000-4000-8000-000000000301",
+        "00000000-0000-4000-8000-000000000302",
+        "00000000-0000-4000-8000-000000000303"
+      ],
+      "expectedDecisions": [
+        {
+          "flowId": "flow-a", "instrumentId": "00000000-0000-4000-8000-000000000301", "side": "BUY",
+          "status": "CANDIDATE", "firstFailureStepId": null, "firstFailureReason": null,
+          "buyAllocation": {"numerator": 1, "denominator": 3},
+          "trace": [{"stepId": "step-1:COMPARE", "passed": true, "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+        },
+        {
+          "flowId": "flow-a", "instrumentId": "00000000-0000-4000-8000-000000000302", "side": "BUY",
+          "status": "CANDIDATE", "firstFailureStepId": null, "firstFailureReason": null,
+          "buyAllocation": {"numerator": 1, "denominator": 3},
+          "trace": [{"stepId": "step-1:COMPARE", "passed": true, "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+        },
+        {
+          "flowId": "flow-a", "instrumentId": "00000000-0000-4000-8000-000000000303", "side": "BUY",
+          "status": "CANDIDATE", "firstFailureStepId": null, "firstFailureReason": null,
+          "buyAllocation": {"numerator": 1, "denominator": 3},
+          "trace": [{"stepId": "step-1:COMPARE", "passed": true, "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+        }
+      ],
+      "note": "Every id here has a first byte below 0x80, so java.util.UUID.compareTo happens to give the same answer. This case therefore does NOT discriminate the two comparison rules; the next one does."
+    },
+    {
+      "caseId": "instrument-iteration-order-discriminates-signed-from-unsigned",
+      "description": "Ids that straddle 0x80 in the first byte. Signed and unsigned comparison disagree here.",
+      "discriminatesKnownDivergence": "instrument-iteration-order",
+      "flows": [
+        {
+          "flowId": "flow-a",
+          "side": "BUY",
+          "instrumentIds": [
+            "f0000000-0000-4000-8000-000000000001",
+            "00000000-0000-4000-8000-000000000002",
+            "80000000-0000-4000-8000-000000000003",
+            "7fffffff-ffff-4fff-8fff-000000000004"
+          ],
+          "conditionSteps": ["step-1:COMPARE"]
+        }
+      ],
+      "stepOutcomes": {
+        "f0000000-0000-4000-8000-000000000001": [{"outcome": "PASSED", "reasonCode": "COMPARE_TRUE", "evidence": {}}],
+        "00000000-0000-4000-8000-000000000002": [{"outcome": "PASSED", "reasonCode": "COMPARE_TRUE", "evidence": {}}],
+        "80000000-0000-4000-8000-000000000003": [{"outcome": "PASSED", "reasonCode": "COMPARE_TRUE", "evidence": {}}],
+        "7fffffff-ffff-4fff-8fff-000000000004": [{"outcome": "PASSED", "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+      },
+      "expectedEvaluationOrder": [
+        "00000000-0000-4000-8000-000000000002",
+        "7fffffff-ffff-4fff-8fff-000000000004",
+        "80000000-0000-4000-8000-000000000003",
+        "f0000000-0000-4000-8000-000000000001"
+      ],
+      "orderUnderSignedComparison": [
+        "80000000-0000-4000-8000-000000000003",
+        "f0000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+        "7fffffff-ffff-4fff-8fff-000000000004"
+      ],
+      "expectedDecisions": [
+        {
+          "flowId": "flow-a", "instrumentId": "00000000-0000-4000-8000-000000000002", "side": "BUY",
+          "status": "CANDIDATE", "firstFailureStepId": null, "firstFailureReason": null,
+          "buyAllocation": {"numerator": 1, "denominator": 4},
+          "trace": [{"stepId": "step-1:COMPARE", "passed": true, "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+        },
+        {
+          "flowId": "flow-a", "instrumentId": "7fffffff-ffff-4fff-8fff-000000000004", "side": "BUY",
+          "status": "CANDIDATE", "firstFailureStepId": null, "firstFailureReason": null,
+          "buyAllocation": {"numerator": 1, "denominator": 4},
+          "trace": [{"stepId": "step-1:COMPARE", "passed": true, "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+        },
+        {
+          "flowId": "flow-a", "instrumentId": "80000000-0000-4000-8000-000000000003", "side": "BUY",
+          "status": "CANDIDATE", "firstFailureStepId": null, "firstFailureReason": null,
+          "buyAllocation": {"numerator": 1, "denominator": 4},
+          "trace": [{"stepId": "step-1:COMPARE", "passed": true, "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+        },
+        {
+          "flowId": "flow-a", "instrumentId": "f0000000-0000-4000-8000-000000000001", "side": "BUY",
+          "status": "CANDIDATE", "firstFailureStepId": null, "firstFailureReason": null,
+          "buyAllocation": {"numerator": 1, "denominator": 4},
+          "trace": [{"stepId": "step-1:COMPARE", "passed": true, "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+        }
+      ],
+      "note": "A Java implementation using Comparator.naturalOrder() produces orderUnderSignedComparison and MUST fail this case. That failure is the point: it is the divergence made visible, not a defect in the fixture."
+    },
+    {
+      "caseId": "flows-are-evaluated-in-declaration-order-and-allocated-independently",
+      "description": "Two flows over overlapping instruments. Each flow allocates within itself only.",
+      "flows": [
+        {
+          "flowId": "flow-a",
+          "side": "BUY",
+          "instrumentIds": ["00000000-0000-4000-8000-000000000302", "00000000-0000-4000-8000-000000000301"],
+          "conditionSteps": ["step-1:COMPARE"]
+        },
+        {
+          "flowId": "flow-b",
+          "side": "BUY",
+          "instrumentIds": ["00000000-0000-4000-8000-000000000301"],
+          "conditionSteps": ["step-1:COMPARE"]
+        }
+      ],
+      "stepOutcomes": {
+        "00000000-0000-4000-8000-000000000301": [{"outcome": "PASSED", "reasonCode": "COMPARE_TRUE", "evidence": {}}],
+        "00000000-0000-4000-8000-000000000302": [{"outcome": "PASSED", "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+      },
+      "expectedDecisions": [
+        {
+          "flowId": "flow-a", "instrumentId": "00000000-0000-4000-8000-000000000301", "side": "BUY",
+          "status": "CANDIDATE", "firstFailureStepId": null, "firstFailureReason": null,
+          "buyAllocation": {"numerator": 1, "denominator": 2},
+          "trace": [{"stepId": "step-1:COMPARE", "passed": true, "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+        },
+        {
+          "flowId": "flow-a", "instrumentId": "00000000-0000-4000-8000-000000000302", "side": "BUY",
+          "status": "CANDIDATE", "firstFailureStepId": null, "firstFailureReason": null,
+          "buyAllocation": {"numerator": 1, "denominator": 2},
+          "trace": [{"stepId": "step-1:COMPARE", "passed": true, "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+        },
+        {
+          "flowId": "flow-b", "instrumentId": "00000000-0000-4000-8000-000000000301", "side": "BUY",
+          "status": "CANDIDATE", "firstFailureStepId": null, "firstFailureReason": null,
+          "buyAllocation": {"numerator": 1, "denominator": 1},
+          "trace": [{"stepId": "step-1:COMPARE", "passed": true, "reasonCode": "COMPARE_TRUE", "evidence": {}}]
+        }
+      ],
+      "note": "flow-a's decisions all precede flow-b's, and the same instrument appears in both with different shares. An implementation that allocated across the whole result rather than per flow would give every candidate 1/3."
+    }
+  ],
+
+  "knownDivergences": [
+    {
+      "id": "instrument-iteration-order",
+      "severity": "MATERIAL",
+      "python": "backtest_engine.basic_runtime.BasicPlanRuntime.execute sorts with key=uuid.UUID; Python's UUID ordering compares the unsigned 128-bit integer, i.e. big-endian byte order.",
+      "java": "BasicStrategyExecutor.execute sorts with Comparator.naturalOrder(); java.util.UUID.compareTo compares mostSigBits then leastSigBits as SIGNED 64-bit longs.",
+      "trigger": "Any flow containing both an instrument id whose first byte is >= 0x80 and one whose first byte is < 0x80. Roughly half of all randomly generated v4 ids have a high first byte, so a real universe hits this almost always.",
+      "impact": "The order of BasicExecutionResult.decisions differs, therefore so does the order in which order candidates are emitted and in which the execution layer consumes the flow budget. The 1/N share itself is unaffected because it does not depend on order.",
+      "notTriggeredBy": "B's currently published plan, whose instrument ids all begin 0x00. The divergence is latent, not currently observable in production data.",
+      "proposedResolution": "Adopt UNSIGNED_128BIT_BIG_ENDIAN on both sides and give the Java executor an explicit comparator. It is the order that matches the canonical text form of a UUID and the order PostgreSQL's uuid type already uses, so it is the one every other layer of this system already agrees with. This is a proposal: D cannot change C's runtime and has not.",
+      "status": "OPEN - needs C's agreement"
+    },
+    {
+      "id": "mid-step-input-missing",
+      "severity": "MATERIAL",
+      "python": "A condition step that raises ElementInputMissing (for example FEATURE_WARMUP_INCOMPLETE or FEATURE_SERIES_MISSING) produces status INPUT_MISSING with a NON-empty trace and the real failing step id.",
+      "java": "BasicStrategyExecutor reaches INPUT_MISSING only when the whole BasicInstrumentInput is null, before any step runs, and always with an empty trace and the sentinel step id $input. A step that throws is caught as RuntimeException and mapped to CONDITION_ERROR.",
+      "trigger": "An instrument that has an input but whose feature series is absent or too short to warm up.",
+      "impact": "The same underlying situation is reported as INPUT_MISSING by D and CONDITION_ERROR by C. Anything that counts failures by status - the monthly judgment counters, for one - counts it in a different bucket depending on which runtime produced it.",
+      "mitigatingFactor": "C's BasicConditionStep evaluator is a host-supplied Function and C's runtime implements no feature loading of its own, so today no C code path can produce this situation. It becomes reachable the moment C's host gains a LOAD_FEATURE evaluator.",
+      "proposedResolution": "Give the Java executor a typed input-missing signal alongside RuntimeException, so a step can report a missing input without being reclassified as an error. This is a proposal; D has not changed either side.",
+      "status": "OPEN - needs C's agreement"
+    },
+    {
+      "id": "error-trace-evidence",
+      "severity": "COSMETIC",
+      "python": "The CONDITION_ERROR trace entry carries evidence {errorType, errorDetail}.",
+      "java": "It carries evidence {errorType} only, where errorType is failure.getClass().getSimpleName().",
+      "impact": "Step traces are not byte-comparable across the two runtimes, and the errorType vocabularies name classes from different languages in any case. No decision, status or allocation depends on it.",
+      "handling": "The conformance fixture requires errorType to be present and non-empty, does not compare its value, and permits additional keys. Recorded rather than normalised so nobody later mistakes the looseness for an oversight.",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "mis-keyed-instrument-input",
+      "severity": "LOW",
+      "python": "If the input map's key does not equal the input's own instrumentId, the runtime raises PLAN_STRUCTURE_INVALID.",
+      "java": "evaluateInstrument takes the decision's instrumentId from input.instrumentId() when the input is non-null, and from the loop variable when it is null, so a mis-keyed map silently produces a decision addressed to a different instrument.",
+      "impact": "Only reachable through a host bug rather than through plan or market data. D fails closed; C produces a wrong-but-plausible decision.",
+      "proposedResolution": "Have the Java executor reject a mis-keyed input rather than trusting the value over the key.",
+      "status": "OPEN - reported, not fixed"
+    },
+    {
+      "id": "buy-side-detection",
+      "severity": "OBSERVATION",
+      "python": "_allocate_equally decides whether to allocate from plan.side, the side argument of the terminal EMIT_ORDER_CANDIDATE step.",
+      "java": "assignEqualBuyShares decides from decisions.get(0).side(), the side of the first decision in the flow.",
+      "impact": "None today. BasicFlow forbids an empty instrument list and every decision in a flow carries the flow's own side, so the two sources always agree. Recorded because they are different sources, and a future mixed-side flow would make them disagree.",
+      "status": "ACCEPTED"
+    }
+  ]
+}

@@ -142,6 +142,20 @@ runs = Table(
     Column("completed_at", TIMESTAMP(timezone=True)),
     Column("failure_code", VARCHAR(80)),
     Column("result_hash", VARCHAR(128)),
+    # Contributed by `db/migration-contributions/migrations/
+    # V20260802143000__backtest_run_outcome_detail.sql`. Each belongs to exactly one
+    # terminal status and is NULL in every other, so absence stays distinguishable
+    # from a decision: `retryable IS NULL` means "this run has not failed", which is
+    # not the same fact as `retryable = false`.
+    Column("result_manifest_id", UUID(as_uuid=True)),
+    Column("retryable", Boolean),
+    # `none_as_null=True` is required, not stylistic. SQLAlchemy's JSON types default
+    # to `none_as_null=False`, which stores Python `None` as the *JSON scalar* `null`
+    # rather than as SQL NULL. That value is not NULL, so `missing_requirements IS
+    # NULL` would be false for every run that has none, the CHECK contributed with
+    # this column would reject every ordinary insert, and a reader would see the
+    # string "null" where it expected absence.
+    Column("missing_requirements", JSONB(none_as_null=True)),
     Index("ix_runs_bot_id_queued_at", "bot_id", "queued_at"),
     Index("ix_runs_status_queued_at", "status", "queued_at"),
     Index("ix_runs_owner_account_id_queued_at", "owner_account_id", "queued_at"),
