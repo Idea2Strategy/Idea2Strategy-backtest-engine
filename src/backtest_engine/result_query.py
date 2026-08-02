@@ -1,27 +1,50 @@
-"""Owner-scoped read models for official automatic backtest results."""
+"""Owner-scoped read models for official automatic backtest results.
+
+## The month/week join (card D27, spec 2.2)
+
+Detail evidence is stored in **ET Monday week** parts, while the judgment API is
+monthly. A week straddles a month boundary roughly once a month, so a month is never a
+partition here: `monthly_trades` reads every week part that overlaps the requested ET
+month and then places each row by the ET month of that row's own instant. The result is
+cross-checked against the month's `MonthlyJudgmentSummary` before anything is returned,
+so a week part that lost rows, or a summary that claims rows the objects do not carry,
+fails closed instead of quietly returning a short list.
+
+## Why this module defines its own run input
+
+The read model consumes `RunProjection`, a value object declared here, rather than the
+`lifecycle.BacktestRun` aggregate. Two reasons:
+
+* the aggregate is the *write* model (a `backtest.runs` row plus its attempts); a
+  read model that reaches into it inherits every change to the write path, and
+* projection is where B's wire envelope stops mattering. The contract is validated once
+  at intake by `lifecycle`; re-validating it here would duplicate that responsibility.
+
+The API layer builds a `RunProjection` from the run aggregate. Identity follows spec
+2.2: a run is identified by `bot_id` + `owner_account_id`, not by a strategy version,
+and the terminal success status is `COMPLETED`.
+"""
 
 from __future__ import annotations
 
-import copy
 import threading
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Protocol
+from typing import Any, Protocol
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .contracts import ContractValidationError, validate_backtest_request
 from .detail_object_manifest import (
     DetailIntegrityError,
     DetailObjectBuilder,
     DetailObjectBundle,
     DetailObjectKind,
+    EtWeek,
 )
-from .lifecycle import BacktestRun
 from .monthly_judgment import EtMonth, MonthlyJudgmentSummary
 from .result_snapshot import (
     PerformanceSummary,
@@ -32,7 +55,43 @@ from .result_snapshot import (
 )
 
 
-_STATUSES = frozenset({"QUEUED", "RUNNING", "COMPLETE", "FAILED", "UNAVAILABLE"})
+__all__ = [
+    "BacktestListItem",
+    "BacktestOverview",
+    "BacktestResultQueryService",
+    "BacktestResultQueryStore",
+    "InMemoryBacktestResultQueryStore",
+    "InputModelView",
+    "QueryIntegrityError",
+    "QueryNotFound",
+    "QueryNotReady",
+    "QueryValidationError",
+    "RunInputs",
+    "RunProjection",
+    "TradeDetailView",
+]
+
+
+#: Canonical `backtest.run_status` tokens (`db/schema.dbml`). The terminal success token
+#: is `COMPLETED`; the `COMPLETE` this module used before was not in the enum.
+QUEUED = "QUEUED"
+RUNNING = "RUNNING"
+COMPLETED = "COMPLETED"
+FAILED = "FAILED"
+UNAVAILABLE = "UNAVAILABLE"
+
+_STATUSES = frozenset({QUEUED, RUNNING, COMPLETED, FAILED, UNAVAILABLE})
+_TERMINAL = frozenset({COMPLETED, FAILED, UNAVAILABLE})
+
+#: Mirrors `lifecycle.InMemoryBacktestRunStore._TRANSITIONS`, plus the no-op self
+#: transition every projection needs to be re-applied idempotently.
+_ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
+    QUEUED: frozenset({QUEUED, RUNNING, FAILED, UNAVAILABLE}),
+    RUNNING: frozenset({RUNNING, COMPLETED, FAILED, UNAVAILABLE}),
+    COMPLETED: frozenset({COMPLETED}),
+    FAILED: frozenset({FAILED}),
+    UNAVAILABLE: frozenset({UNAVAILABLE}),
+}
 
 
 class QueryValidationError(ValueError):
@@ -51,10 +110,101 @@ class QueryIntegrityError(RuntimeError):
     """Raised when immutable run, result, or detail identities disagree."""
 
 
+# --------------------------------------------------------------------------------
+# projection input
+# --------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class RunInputs:
+    """The immutable reproducibility boundary of one run, as the API reports it."""
+
+    compiled_plan_checksum: str
+    strategy_snapshot_hash: str
+    dataset_manifest_id: str
+    dataset_hash: str
+    input_bundle_fingerprint: str
+    feature_materialization_version: str
+    execution_policy_version: str
+    precision_rules_version: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "compiled_plan_checksum",
+            "strategy_snapshot_hash",
+            "dataset_manifest_id",
+            "dataset_hash",
+            "input_bundle_fingerprint",
+            "feature_materialization_version",
+            "execution_policy_version",
+            "precision_rules_version",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise QueryValidationError(f"inputs.{name} must be a non-empty string")
+
+
+@dataclass(frozen=True, slots=True)
+class RunProjection:
+    """One run as the read model needs it. Built by the API from the run aggregate."""
+
+    run_id: str
+    bot_id: str
+    owner_account_id: str
+    status: str
+    queued_at: datetime
+    inputs: RunInputs
+    version: int = 1
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    failure_code: str | None = None
+    reason_code: str | None = None
+    missing_requirements: tuple[str, ...] = ()
+    result_manifest_id: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("run_id", "bot_id", "owner_account_id"):
+            object.__setattr__(self, name, _uuid(getattr(self, name), name))
+        if self.status not in _STATUSES:
+            raise QueryValidationError(f"run status is unsupported: {self.status!r}")
+        object.__setattr__(self, "queued_at", _aware(self.queued_at, "queued_at"))
+        for name in ("started_at", "finished_at"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _aware(value, name))
+        if not isinstance(self.inputs, RunInputs):
+            raise QueryValidationError("inputs must be a RunInputs")
+        if not isinstance(self.version, int) or isinstance(self.version, bool) or self.version < 1:
+            raise QueryValidationError("version must be a positive integer")
+        missing = tuple(self.missing_requirements)
+        if any(not isinstance(item, str) or not item.strip() for item in missing):
+            raise QueryValidationError("missing_requirements must contain non-empty strings")
+        object.__setattr__(self, "missing_requirements", missing)
+        if self.status == UNAVAILABLE and not self.reason_code:
+            raise QueryValidationError("an UNAVAILABLE run must carry a reason_code")
+        if self.status == FAILED and not self.failure_code:
+            raise QueryValidationError("a FAILED run must carry a failure_code")
+        if self.status == COMPLETED:
+            object.__setattr__(
+                self, "result_manifest_id", _uuid(self.result_manifest_id, "result_manifest_id")
+            )
+        elif self.result_manifest_id is not None:
+            raise QueryValidationError(
+                f"only a {COMPLETED} run has a result_manifest_id, this one is {self.status}"
+            )
+        if self.status in _TERMINAL and self.finished_at is None:
+            raise QueryValidationError(f"a {self.status} run must carry finished_at")
+
+
+# --------------------------------------------------------------------------------
+# views
+# --------------------------------------------------------------------------------
+
+
 @dataclass(frozen=True, slots=True)
 class BacktestListItem:
     run_id: str
-    strategy_version_id: str
+    bot_id: str
     status: str
     requested_at: datetime
 
@@ -62,7 +212,7 @@ class BacktestListItem:
 @dataclass(frozen=True, slots=True)
 class BacktestOverview:
     run_id: str
-    strategy_version_id: str
+    bot_id: str
     status: str
     requested_at: datetime
     started_at: datetime | None
@@ -75,14 +225,15 @@ class BacktestOverview:
 @dataclass(frozen=True, slots=True)
 class InputModelView:
     run_id: str
-    strategy_version_id: str
+    bot_id: str
     strategy_snapshot_hash: str
-    compiled_plan_hash: str
+    compiled_plan_checksum: str
     dataset_manifest_id: str
     dataset_hash: str
     input_bundle_fingerprint: str
     feature_materialization_version: str
     execution_policy_version: str
+    precision_rules_version: str
     calculation_model_version: str | None
     cost_model_version: str | None
     execution_model_version: str | None
@@ -112,11 +263,19 @@ class TradeDetailView:
 
 @dataclass(frozen=True, slots=True)
 class _QueryEntry:
-    owner_account_id: str
-    run: BacktestRun
+    run: RunProjection
     result: ResultSnapshot | None = None
     details: DetailObjectBundle | None = None
-    monthly: tuple[MonthlyJudgmentSummary, ...] = ()
+    monthly: tuple[MonthlyJudgmentSummary, ...] = field(default=())
+
+    @property
+    def owner_account_id(self) -> str:
+        return self.run.owner_account_id
+
+
+# --------------------------------------------------------------------------------
+# store
+# --------------------------------------------------------------------------------
 
 
 class BacktestResultQueryStore(Protocol):
@@ -132,19 +291,17 @@ class InMemoryBacktestResultQueryStore:
         self._entries: dict[str, _QueryEntry] = {}
         self._lock = threading.RLock()
 
-    def upsert_run(self, owner_account_id: str, run: BacktestRun) -> None:
-        owner_account_id = _uuid(owner_account_id, "owner_account_id")
+    def upsert_run(self, run: RunProjection) -> None:
         _validate_run(run)
-        if run.status == "COMPLETE":
+        if run.status == COMPLETED:
             raise QueryIntegrityError(
-                "COMPLETE projections must use publish_completed atomically"
+                f"{COMPLETED} projections must use publish_completed atomically"
             )
         with self._lock:
-            existing = self._entries.get(run.backtest_run_id)
-            self._validate_update(existing, owner_account_id, run)
-            self._entries[run.backtest_run_id] = _QueryEntry(
-                owner_account_id=owner_account_id,
-                run=copy.deepcopy(run),
+            existing = self._entries.get(run.run_id)
+            self._validate_update(existing, run)
+            self._entries[run.run_id] = _QueryEntry(
+                run=run,
                 result=existing.result if existing is not None else None,
                 details=existing.details if existing is not None else None,
                 monthly=existing.monthly if existing is not None else (),
@@ -152,37 +309,24 @@ class InMemoryBacktestResultQueryStore:
 
     def publish_completed(
         self,
-        owner_account_id: str,
-        run: BacktestRun,
+        run: RunProjection,
         result: ResultSnapshot,
         details: DetailObjectBundle,
         monthly: tuple[MonthlyJudgmentSummary, ...],
     ) -> None:
-        owner_account_id = _uuid(owner_account_id, "owner_account_id")
         monthly = tuple(monthly)
         _validate_completed(run, result, details, monthly)
         with self._lock:
-            existing = self._entries.get(run.backtest_run_id)
-            self._validate_update(
-                existing,
-                owner_account_id,
-                run,
-                publishing_completed=True,
-            )
-            candidate = _QueryEntry(
-                owner_account_id=owner_account_id,
-                run=copy.deepcopy(run),
-                result=result,
-                details=details,
-                monthly=monthly,
-            )
+            existing = self._entries.get(run.run_id)
+            self._validate_update(existing, run, publishing_completed=True)
+            candidate = _QueryEntry(run=run, result=result, details=details, monthly=monthly)
             if existing is not None and existing.result is not None:
                 if existing == candidate:
                     return
                 raise QueryIntegrityError(
                     "completed run already has a different immutable query result"
                 )
-            self._entries[run.backtest_run_id] = candidate
+            self._entries[run.run_id] = candidate
 
     def list_owned(self, owner_account_id: str) -> tuple[_QueryEntry, ...]:
         owner_account_id = _uuid(owner_account_id, "owner_account_id")
@@ -205,38 +349,36 @@ class InMemoryBacktestResultQueryStore:
     @staticmethod
     def _validate_update(
         existing: _QueryEntry | None,
-        owner_account_id: str,
-        run: BacktestRun,
+        run: RunProjection,
         *,
         publishing_completed: bool = False,
     ) -> None:
         if existing is None:
             return
-        if existing.owner_account_id != owner_account_id:
+        if existing.run.owner_account_id != run.owner_account_id:
             raise QueryIntegrityError("backtest owner cannot change")
-        if existing.run.request != run.request:
-            raise QueryIntegrityError("immutable backtest request cannot change")
+        if existing.run.bot_id != run.bot_id:
+            raise QueryIntegrityError("backtest bot cannot change")
+        if existing.run.inputs != run.inputs:
+            raise QueryIntegrityError("immutable backtest inputs cannot change")
         if run.version < existing.run.version:
             raise QueryIntegrityError("older query projection cannot replace a newer one")
         previous_status = existing.run.status
-        if previous_status in {"COMPLETE", "FAILED", "UNAVAILABLE"}:
-            if run.status != previous_status:
-                raise QueryIntegrityError("terminal backtest status cannot change")
-        allowed = {
-            "QUEUED": {"QUEUED", "RUNNING", "FAILED", "UNAVAILABLE", "COMPLETE"},
-            "RUNNING": {"RUNNING", "FAILED", "UNAVAILABLE", "COMPLETE"},
-            "COMPLETE": {"COMPLETE"},
-            "FAILED": {"FAILED"},
-            "UNAVAILABLE": {"UNAVAILABLE"},
-        }
-        if run.status not in allowed[previous_status]:
+        if previous_status in _TERMINAL and run.status != previous_status:
+            raise QueryIntegrityError("terminal backtest status cannot change")
+        if run.status not in _ALLOWED_TRANSITIONS[previous_status]:
             raise QueryIntegrityError(
                 f"invalid query status transition: {previous_status} to {run.status}"
             )
-        if run.status == "COMPLETE" and not publishing_completed:
+        if run.status == COMPLETED and not publishing_completed:
             raise QueryIntegrityError(
-                "COMPLETE projections must use publish_completed atomically"
+                f"{COMPLETED} projections must use publish_completed atomically"
             )
+
+
+# --------------------------------------------------------------------------------
+# service
+# --------------------------------------------------------------------------------
 
 
 class BacktestResultQueryService:
@@ -247,83 +389,61 @@ class BacktestResultQueryService:
         self,
         owner_account_id: str,
         *,
-        strategy_version_id: str | None = None,
+        bot_id: str | None = None,
     ) -> tuple[BacktestListItem, ...]:
-        if strategy_version_id is not None:
-            strategy_version_id = _uuid(
-                strategy_version_id, "strategy_version_id"
-            )
+        if bot_id is not None:
+            bot_id = _uuid(bot_id, "bot_id")
         items = [
-            _list_item(entry.run)
-            for entry in self._store.list_owned(owner_account_id)
-            if strategy_version_id is None
-            or entry.run.request["strategy_version_id"] == strategy_version_id
-        ]
-        return tuple(
-            sorted(
-                items,
-                key=lambda item: (item.requested_at, item.run_id),
-                reverse=True,
+            BacktestListItem(
+                run_id=entry.run.run_id,
+                bot_id=entry.run.bot_id,
+                status=entry.run.status,
+                requested_at=entry.run.queued_at,
             )
-        )
+            for entry in self._store.list_owned(owner_account_id)
+            if bot_id is None or entry.run.bot_id == bot_id
+        ]
+        return tuple(sorted(items, key=lambda item: (item.requested_at, item.run_id), reverse=True))
 
     def overview(self, owner_account_id: str, run_id: str) -> BacktestOverview:
-        entry = self._store.get_owned(owner_account_id, run_id)
-        run = entry.run
-        result = run.status_result or {}
+        run = self._store.get_owned(owner_account_id, run_id).run
         return BacktestOverview(
-            run_id=run.backtest_run_id,
-            strategy_version_id=str(run.request["strategy_version_id"]),
+            run_id=run.run_id,
+            bot_id=run.bot_id,
             status=run.status,
-            requested_at=_timestamp(run.request["requested_at"], "requested_at"),
-            started_at=_optional_timestamp(result.get("started_at"), "started_at"),
-            finished_at=_optional_timestamp(
-                result.get("completed_at")
-                or result.get("failed_at")
-                or result.get("decided_at"),
-                "finished_at",
-            ),
-            reason_code=_reason_code(run),
-            missing_requirements=_missing_requirements(run),
-            result_manifest_id=(
-                str(result["result_manifest_id"])
-                if run.status == "COMPLETE"
-                else None
-            ),
+            requested_at=run.queued_at,
+            started_at=run.started_at,
+            finished_at=run.finished_at,
+            reason_code=run.reason_code if run.status == UNAVAILABLE else run.failure_code,
+            missing_requirements=run.missing_requirements,
+            result_manifest_id=run.result_manifest_id,
         )
 
-    def inputs_and_models(
-        self, owner_account_id: str, run_id: str
-    ) -> InputModelView:
+    def inputs_and_models(self, owner_account_id: str, run_id: str) -> InputModelView:
         entry = self._store.get_owned(owner_account_id, run_id)
-        request = entry.run.request
+        inputs = entry.run.inputs
         snapshot = entry.result.run_snapshot if entry.result is not None else None
         return InputModelView(
-            run_id=entry.run.backtest_run_id,
-            strategy_version_id=str(request["strategy_version_id"]),
-            strategy_snapshot_hash=str(request["strategy_snapshot_hash"]),
-            compiled_plan_hash=str(request["compiled_plan_hash"]),
-            dataset_manifest_id=str(request["dataset_manifest_id"]),
-            dataset_hash=str(request["dataset_hash"]),
-            input_bundle_fingerprint=str(request["input_bundle_fingerprint"]),
-            feature_materialization_version=str(
-                request["feature_materialization_version"]
-            ),
-            execution_policy_version=str(request["execution_policy_version"]),
+            run_id=entry.run.run_id,
+            bot_id=entry.run.bot_id,
+            strategy_snapshot_hash=inputs.strategy_snapshot_hash,
+            compiled_plan_checksum=inputs.compiled_plan_checksum,
+            dataset_manifest_id=inputs.dataset_manifest_id,
+            dataset_hash=inputs.dataset_hash,
+            input_bundle_fingerprint=inputs.input_bundle_fingerprint,
+            feature_materialization_version=inputs.feature_materialization_version,
+            execution_policy_version=inputs.execution_policy_version,
+            precision_rules_version=inputs.precision_rules_version,
             calculation_model_version=(
                 snapshot.calculation_model_version if snapshot is not None else None
             ),
-            cost_model_version=(
-                snapshot.cost_model_version if snapshot is not None else None
-            ),
+            cost_model_version=(snapshot.cost_model_version if snapshot is not None else None),
             execution_model_version=(
                 snapshot.execution_model_version if snapshot is not None else None
             ),
         )
 
-    def performance(
-        self, owner_account_id: str, run_id: str
-    ) -> PerformanceSummary:
+    def performance(self, owner_account_id: str, run_id: str) -> PerformanceSummary:
         entry = self._completed(owner_account_id, run_id)
         assert entry.result is not None
         return entry.result.summary
@@ -347,37 +467,34 @@ class BacktestResultQueryService:
 
     def _completed(self, owner_account_id: str, run_id: str) -> _QueryEntry:
         entry = self._store.get_owned(owner_account_id, run_id)
-        if entry.run.status != "COMPLETE":
+        if entry.run.status != COMPLETED:
             raise QueryNotReady(
                 f"backtest result is not available for status {entry.run.status}"
             )
         if entry.result is None or entry.details is None:
-            raise QueryIntegrityError("complete run is missing immutable result artifacts")
+            raise QueryIntegrityError("completed run is missing immutable result artifacts")
         return entry
 
 
-def _validate_run(run: BacktestRun) -> None:
-    if not isinstance(run, BacktestRun):
-        raise QueryValidationError("run must be a BacktestRun")
-    if run.status not in _STATUSES:
-        raise QueryValidationError("run status is unsupported")
-    try:
-        validate_backtest_request(run.request)
-    except ContractValidationError as exc:
-        raise QueryValidationError(str(exc)) from exc
-    if run.backtest_run_id != run.request["backtest_run_id"]:
-        raise QueryIntegrityError("run identity does not match immutable request")
+# --------------------------------------------------------------------------------
+# validation
+# --------------------------------------------------------------------------------
+
+
+def _validate_run(run: RunProjection) -> None:
+    if not isinstance(run, RunProjection):
+        raise QueryValidationError("run must be a RunProjection")
 
 
 def _validate_completed(
-    run: BacktestRun,
+    run: RunProjection,
     result: ResultSnapshot,
     details: DetailObjectBundle,
     monthly: tuple[MonthlyJudgmentSummary, ...],
 ) -> None:
     _validate_run(run)
-    if run.status != "COMPLETE":
-        raise QueryIntegrityError("only COMPLETE runs can publish result queries")
+    if run.status != COMPLETED:
+        raise QueryIntegrityError(f"only {COMPLETED} runs can publish result queries")
     try:
         ResultSnapshotBuilder.verify(result)
     except ResultIntegrityError as exc:
@@ -387,43 +504,23 @@ def _validate_completed(
     except DetailIntegrityError as exc:
         raise QueryIntegrityError(f"detail integrity failed: {exc}") from exc
 
-    request = run.request
     snapshot = result.run_snapshot
     manifest = result.manifest
     detail_manifest = details.manifest
-    status_result = run.status_result or {}
     expected = {
-        "run identity": (run.backtest_run_id, snapshot.backtest_run_id),
-        "strategy version": (
-            str(request["strategy_version_id"]),
-            snapshot.strategy_version_id,
-        ),
+        "run identity": (run.run_id, snapshot.backtest_run_id),
         "input fingerprint": (
-            str(request["input_bundle_fingerprint"]),
+            run.inputs.input_bundle_fingerprint,
             snapshot.input_bundle_fingerprint,
         ),
-        "result manifest status": (
-            str(status_result.get("result_manifest_id")),
-            manifest.result_manifest_id,
-        ),
-        "result manifest run": (manifest.backtest_run_id, run.backtest_run_id),
-        "result manifest strategy": (
-            manifest.strategy_version_id,
-            snapshot.strategy_version_id,
-        ),
+        "result manifest": (run.result_manifest_id, manifest.result_manifest_id),
+        "result manifest run": (manifest.backtest_run_id, run.run_id),
         "detail result manifest": (
             detail_manifest.result_manifest_id,
             manifest.result_manifest_id,
         ),
-        "detail run snapshot": (
-            detail_manifest.run_snapshot_id,
-            snapshot.snapshot_id,
-        ),
-        "detail run": (detail_manifest.backtest_run_id, run.backtest_run_id),
-        "detail strategy": (
-            detail_manifest.strategy_version_id,
-            snapshot.strategy_version_id,
-        ),
+        "detail run snapshot": (detail_manifest.run_snapshot_id, snapshot.snapshot_id),
+        "detail run": (detail_manifest.backtest_run_id, run.run_id),
     }
     for label, values in expected.items():
         if values[0] != values[1]:
@@ -442,9 +539,7 @@ def _validate_completed(
 
     record_ids_by_month: dict[EtMonth, set[str]] = defaultdict(set)
     for record in result.records:
-        record_ids_by_month[EtMonth.from_instant(record.occurred_at)].add(
-            record.record_id
-        )
+        record_ids_by_month[EtMonth.from_instant(record.occurred_at)].add(record.record_id)
     summary_by_month = {item.et_month: item for item in monthly}
     for month, record_ids in record_ids_by_month.items():
         summary = summary_by_month.get(month)
@@ -454,68 +549,57 @@ def _validate_completed(
             )
 
 
-def _list_item(run: BacktestRun) -> BacktestListItem:
-    return BacktestListItem(
-        run_id=run.backtest_run_id,
-        strategy_version_id=str(run.request["strategy_version_id"]),
-        status=run.status,
-        requested_at=_timestamp(run.request["requested_at"], "requested_at"),
-    )
+# --------------------------------------------------------------------------------
+# the ET week -> ET month join
+# --------------------------------------------------------------------------------
 
 
-def _reason_code(run: BacktestRun) -> str | None:
-    result = run.status_result or {}
-    if run.status == "FAILED":
-        value = result.get("failure_code")
-    elif run.status == "UNAVAILABLE":
-        value = result.get("reason_code")
-    else:
-        return None
-    return str(value) if value is not None else None
+def _week_overlaps_month(week: EtWeek, month: EtMonth) -> bool:
+    """An ET Monday week covers seven ET dates, so it touches at most two ET months."""
+
+    first = EtMonth(week.start_date.year, week.start_date.month)
+    last_date = week.start_date + timedelta(days=6)
+    return month in (first, EtMonth(last_date.year, last_date.month))
 
 
-def _missing_requirements(run: BacktestRun) -> tuple[str, ...]:
-    if run.status != "UNAVAILABLE":
-        return ()
-    values = (run.status_result or {}).get("missing_requirements", ())
-    if not isinstance(values, list) or any(
-        not isinstance(item, str) or not item for item in values
-    ):
-        raise QueryIntegrityError("unavailable missing requirements are invalid")
-    return tuple(values)
+def _month_rows(
+    details: DetailObjectBundle, record_type: DetailObjectKind, month: EtMonth
+) -> list[dict[str, Any]]:
+    """Rows of one record type whose own ET month is `month`, across week parts.
+
+    Every part that overlaps the month is read — a single week part legitimately holds
+    both October and November rows — and each row is then placed by its own instant.
+    """
+
+    rows: list[dict[str, Any]] = []
+    for item in details.objects:
+        descriptor = item.descriptor
+        if descriptor.record_type is not record_type:
+            continue
+        if not _week_overlaps_month(descriptor.week, month):
+            continue
+        try:
+            part = pq.read_table(pa.BufferReader(item.parquet_bytes)).to_pylist()
+        except Exception as exc:
+            raise QueryIntegrityError("monthly detail Parquet cannot be read") from exc
+        rows.extend(row for row in part if EtMonth.from_instant(row["occurred_at"]) == month)
+    return sorted(rows, key=lambda row: (row["occurred_at"], str(row["record_id"])))
 
 
 def _read_month(entry: _QueryEntry, month: EtMonth) -> tuple[TradeDetailView, ...]:
     assert entry.details is not None
     summary = next((item for item in entry.monthly if item.et_month == month), None)
-    objects = {
-        item.descriptor.kind: item
-        for item in entry.details.objects
-        if item.descriptor.et_month == month
-    }
-    trade_object = objects.get(DetailObjectKind.TRADE_DETAIL)
-    if summary is None and trade_object is None:
-        return ()
-    if summary is None or trade_object is None:
-        raise QueryIntegrityError("monthly trade summary and detail object disagree")
+    trade_rows = _month_rows(entry.details, DetailObjectKind.TRADE_DETAIL, month)
+    expected_ids = set(summary.trade_record_ids) if summary is not None else set()
 
-    try:
-        trade_rows = pq.read_table(
-            pa.BufferReader(trade_object.parquet_bytes)
-        ).to_pylist()
-        position_object = objects.get(DetailObjectKind.POSITION_SNAPSHOT)
-        position_rows = (
-            pq.read_table(pa.BufferReader(position_object.parquet_bytes)).to_pylist()
-            if position_object is not None
-            else []
+    if {str(row["record_id"]) for row in trade_rows} != expected_ids:
+        raise QueryIntegrityError(
+            "monthly Parquet record identities do not match the monthly judgment summary"
         )
-    except Exception as exc:
-        raise QueryIntegrityError("monthly detail Parquet cannot be read") from exc
+    if not trade_rows:
+        return ()
 
-    if {str(row["record_id"]) for row in trade_rows} != set(
-        summary.trade_record_ids
-    ):
-        raise QueryIntegrityError("monthly Parquet record identities do not match")
+    position_rows = _month_rows(entry.details, DetailObjectKind.POSITION_SNAPSHOT, month)
     positions: dict[str, list[PositionAfter]] = defaultdict(list)
     for row in position_rows:
         positions[str(row["record_id"])].append(
@@ -536,10 +620,7 @@ def _read_month(entry: _QueryEntry, month: EtMonth) -> tuple[TradeDetailView, ..
             order_status=str(row["order_status"]),
             cash_after=Decimal(str(row["cash_after"])),
             positions_after=tuple(
-                sorted(
-                    positions[str(row["record_id"])],
-                    key=lambda item: item.instrument_id,
-                )
+                sorted(positions[str(row["record_id"])], key=lambda item: item.instrument_id)
             ),
             reason_code=_optional_text(row.get("reason_code")),
             fill_id=_optional_text(row.get("fill_id")),
@@ -556,7 +637,12 @@ def _read_month(entry: _QueryEntry, month: EtMonth) -> tuple[TradeDetailView, ..
     )
 
 
-def _uuid(value: str, label: str) -> str:
+# --------------------------------------------------------------------------------
+# small helpers
+# --------------------------------------------------------------------------------
+
+
+def _uuid(value: object, label: str) -> str:
     if not isinstance(value, str):
         raise QueryValidationError(f"{label} must be a UUID")
     try:
@@ -565,18 +651,10 @@ def _uuid(value: str, label: str) -> str:
         raise QueryValidationError(f"{label} must be a UUID") from exc
 
 
-def _timestamp(value: object, label: str) -> datetime:
-    if not isinstance(value, str) or not value.endswith("Z"):
-        raise QueryIntegrityError(f"{label} must be a UTC timestamp")
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise QueryIntegrityError(f"{label} must be a UTC timestamp") from exc
-    return parsed
-
-
-def _optional_timestamp(value: object, label: str) -> datetime | None:
-    return None if value is None else _timestamp(value, label)
+def _aware(value: object, label: str) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise QueryValidationError(f"{label} must be a timezone-aware datetime")
+    return value.astimezone(timezone.utc)
 
 
 def _optional_text(value: object) -> str | None:
