@@ -1,0 +1,5 @@
+{
+  "contractVersion": "strategy-bot.v999",
+  "schemaVersion": "basic-compiled-plan.v1",
+  "rejectionReason": "UNSUPPORTED_CONTRACT_VERSION"
+}

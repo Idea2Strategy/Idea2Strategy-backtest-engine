@@ -1,0 +1,58 @@
+{
+  "contractVersion": "strategy-bot.v1",
+  "schemaVersion": "basic-compiled-plan.v1",
+  "elementCatalogVersion": "basic-elements:2026-07-31",
+  "instrumentCatalogVersion": "us-supported-universe:2026-07-31",
+  "compilerVersion": "basic-compiler:1.0.0",
+  "requiredFeatureSetHash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+  "requiredFeatures": [
+    {
+      "requirementId": "rsi-14-pt1m",
+      "featureId": "00000000-0000-4000-8000-000000000401",
+      "featureVersion": "1.0.0",
+      "instruments": ["00000000-0000-4000-8000-000000000301"],
+      "resolution": "PT1M",
+      "requiredObservations": 14
+    }
+  ],
+  "executionSnapshot": {
+    "immutableStrategyVersion": {
+      "snapshotSchemaVersion": "basic-launch-snapshot.v1",
+      "semanticHash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "snapshotHash": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "mode": "BASIC",
+    "initialCashAmount": "100000.00000000",
+    "currency": "USD",
+    "partitions": [
+      {
+        "key": "partition-1",
+        "budgetCapBps": 10000,
+        "flows": [
+          {
+            "key": "flow-1",
+            "officialInstrumentIds": ["00000000-0000-4000-8000-000000000301"]
+          }
+        ]
+      }
+    ]
+  },
+  "steps": [
+    {
+      "sequence": 1,
+      "operation": "LOAD_FEATURE",
+      "arguments": {"feature": "RSI_14", "resolution": "1m"}
+    },
+    {
+      "sequence": 2,
+      "operation": "COMPARE",
+      "arguments": {"operator": "LT", "threshold": "30"}
+    },
+    {
+      "sequence": 3,
+      "operation": "EMIT_ORDER_CANDIDATE",
+      "arguments": {"allocation": "EQUAL", "orderType": "MARKET", "side": "BUY"}
+    }
+  ],
+  "planChecksum": "sha256:88d61198d46dce161c2a929702a7fd1cee5c9b044c470d2590b96f3825fcacb3"
+}
