@@ -1,0 +1,16 @@
+{
+  "metadata": {
+    "contractVersion": "strategy-bot.v1",
+    "messageType": "OFFICIAL_BACKTEST_REQUESTED",
+    "messageId": "00000000-0000-4000-8000-000000000213",
+    "occurredAt": "2026-07-31T12:00:00Z",
+    "correlationId": "00000000-0000-4000-8000-000000000202",
+    "idempotencyKey": "sha256:c6dd5229151352a530ff8312f050258107370cf26ea943c68473bf81936f6c1e"
+  },
+  "botId": "00000000-0000-4000-8000-000000000201",
+  "expectedSnapshotHash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "compiledPlanChecksum": "sha256:88d61198d46dce161c2a929702a7fd1cee5c9b044c470d2590b96f3825fcacb3",
+  "datasetManifestId": "00000000-0000-4000-8000-000000000203",
+  "assumptionsVersion": "accounting:1.0.0",
+  "requestReason": "STRATEGY_RELEASE"
+}

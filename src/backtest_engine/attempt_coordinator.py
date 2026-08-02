@@ -1,12 +1,38 @@
-"""Thread-safe attempt, lease, retry, and resource-limit coordination."""
+"""Thread-safe attempt, lease, retry, cancellation and resource coordination.
+
+D29 has three parts and they are deliberately separate here:
+
+* the **aggregate** (:class:`AttemptCoordinator`) owns lease fencing, retry
+  budget, cancellation and the terminal state machine;
+* the **measurement** (:class:`ProcessResourceMonitor`) reads the real
+  operating-system CPU and RSS counters of this process -- it is not a
+  simulated counter -- and on POSIX also installs hard ``rlimit`` ceilings;
+* the **durable** compare-and-swap on ``backtest.run_attempts``
+  ``.worker_execution_key`` lives in :mod:`backtest_engine.worker`, because
+  it is the message boundary that needs it.
+"""
 
 from __future__ import annotations
 
+import importlib
+import math
+import sys
 import threading
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from enum import StrEnum
+from typing import Any, Protocol
 from uuid import uuid4
+
+
+#: The POSIX ``resource`` module, or ``None`` on Windows. Typed loosely on
+#: purpose: its attributes are platform-conditional, and mypy on Windows has no
+#: stub for ``RLIMIT_AS`` at all.
+_posix_resource: Any
+try:  # pragma: no cover - platform dependent
+    _posix_resource = importlib.import_module("resource")
+except ImportError:  # pragma: no cover - Windows has no POSIX rlimit
+    _posix_resource = None
 
 
 class InvalidAttemptInput(ValueError):
@@ -33,6 +59,7 @@ class FailureKind(StrEnum):
     RETRYABLE = "RETRYABLE"
     PERMANENT = "PERMANENT"
     SYSTEM_CANCELLED = "SYSTEM_CANCELLED"
+    CANCELLED = "CANCELLED"
 
 
 class AttemptFailure(RuntimeError):
@@ -44,10 +71,22 @@ class AttemptFailure(RuntimeError):
 
 
 class RunState(StrEnum):
+    """Canonical tokens from ``db/schema.dbml`` ``Enum backtest.run_status``.
+
+    ``WAITING`` is the in-aggregate name for ``QUEUED``: the run is admitted
+    but no worker holds a lease.
+    """
+
     WAITING = "WAITING"
     RUNNING = "RUNNING"
-    COMPLETE = "COMPLETE"
+    COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    #: Deprecated alias. Spec 2.2 replaced the non-canonical ``COMPLETE``
+    #: token with ``COMPLETED``; ``RunState.COMPLETE is RunState.COMPLETED``.
+    #: Kept only so the pre-canonical `tests/d_reproducibility_testkit.py`
+    #: keeps importing while BT7 retires it.
+    COMPLETE = "COMPLETED"
 
 
 class AttemptState(StrEnum):
@@ -60,6 +99,7 @@ class AttemptState(StrEnum):
     MEMORY_LIMIT_EXCEEDED = "MEMORY_LIMIT_EXCEEDED"
     LEASE_EXPIRED = "LEASE_EXPIRED"
     SYSTEM_CANCELLED = "SYSTEM_CANCELLED"
+    CANCELLED = "CANCELLED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +136,15 @@ class AttemptLease:
 
 
 @dataclass(frozen=True, slots=True)
+class CancellationRequest:
+    """A cancellation that the active attempt has not yet observed."""
+
+    requested_at: datetime
+    reason_code: str
+    requested_by: str
+
+
+@dataclass(frozen=True, slots=True)
 class AttemptRecord:
     run_id: str
     attempt_id: str
@@ -121,6 +170,7 @@ _FAILURE_STATES = {
     FailureKind.RETRYABLE: AttemptState.RETRYABLE_FAILED,
     FailureKind.PERMANENT: AttemptState.PERMANENT_FAILED,
     FailureKind.SYSTEM_CANCELLED: AttemptState.SYSTEM_CANCELLED,
+    FailureKind.CANCELLED: AttemptState.CANCELLED,
 }
 
 
@@ -147,6 +197,7 @@ class AttemptCoordinator:
         self._attempts: list[AttemptRecord] = []
         self._result_manifest_id: str | None = None
         self._detail_manifest_id: str | None = None
+        self._cancellation: CancellationRequest | None = None
         self._lock = threading.RLock()
 
     @property
@@ -172,6 +223,12 @@ class AttemptCoordinator:
     def detail_manifest_id(self) -> str | None:
         with self._lock:
             return self._detail_manifest_id
+
+    @property
+    def cancellation(self) -> CancellationRequest | None:
+        """The pending cancellation the active attempt has yet to observe."""
+        with self._lock:
+            return self._cancellation
 
     def acquire(self, worker_id: str, now: datetime) -> AttemptLease:
         _require_text(worker_id, "worker_id")
@@ -231,6 +288,22 @@ class AttemptCoordinator:
             if sample.cpu_time < active.cpu_time:
                 raise InvalidAttemptInput("cpu_time must be monotonic")
 
+            # Cancellation outranks every limit: a run the owner has already
+            # abandoned must not be recorded as a CPU or memory failure.
+            cancellation = self._cancellation
+            if cancellation is not None:
+                self._stop_active(
+                    now,
+                    FailureKind.CANCELLED,
+                    cancellation.reason_code,
+                    retryable=False,
+                    sample=sample,
+                    terminal_state=RunState.CANCELLED,
+                )
+                raise AttemptFailure(
+                    FailureKind.CANCELLED, "attempt cancelled on request"
+                )
+
             elapsed = now - active.started_at
             failure: tuple[FailureKind, str] | None = None
             if elapsed >= self._policy.attempt_timeout:
@@ -289,10 +362,46 @@ class AttemptCoordinator:
             )
             self._result_manifest_id = result_manifest_id
             self._detail_manifest_id = detail_manifest_id
-            self._state = RunState.COMPLETE
+            self._state = RunState.COMPLETED
+
+    def request_cancellation(
+        self,
+        now: datetime,
+        *,
+        reason_code: str,
+        requested_by: str,
+    ) -> None:
+        """Ask the run to stop cooperatively (D29).
+
+        A queued run is cancelled outright. A running run is *marked*: the
+        worker's next :meth:`heartbeat` raises
+        :class:`AttemptFailure` with :attr:`FailureKind.CANCELLED`, so the
+        replay unwinds through its normal path instead of the process being
+        killed mid-write. Cancellation is terminal and is never retried.
+        """
+
+        _require_aware(now)
+        _require_text(reason_code, "reason_code")
+        _require_text(requested_by, "requested_by")
+        with self._lock:
+            self._require_nonterminal()
+            request = CancellationRequest(now, reason_code, requested_by)
+            active = self._active_attempt()
+            if active is None:
+                self._require_not_before(now, self._queued_at)
+                self._cancellation = request
+                self._state = RunState.CANCELLED
+                return
+            self._require_not_before(now, active.last_heartbeat_at)
+            self._cancellation = request
 
     def cancel_by_system(self, now: datetime, *, reason_code: str) -> None:
-        """Fail closed for an operator/runtime stop; user cancellation is absent."""
+        """Fail closed for an operator/runtime stop, e.g. a deployment drain.
+
+        Distinct from :meth:`request_cancellation`: this is not cooperative and
+        it lands the run in ``FAILED``, not ``CANCELLED``, because the run was
+        stopped by the platform rather than abandoned by its owner.
+        """
 
         _require_aware(now)
         _require_text(reason_code, "reason_code")
@@ -316,8 +425,10 @@ class AttemptCoordinator:
             return self._attempts[-1]
         return None
 
+    _TERMINAL = (RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED)
+
     def _require_nonterminal(self) -> None:
-        if self._state in (RunState.COMPLETE, RunState.FAILED):
+        if self._state in self._TERMINAL:
             raise RunTerminal(f"backtest run is terminal: {self._state.value}")
 
     def _require_lease(self, lease: AttemptLease) -> AttemptRecord:
@@ -357,6 +468,7 @@ class AttemptCoordinator:
         *,
         retryable: bool,
         sample: ResourceSample | None = None,
+        terminal_state: RunState = RunState.FAILED,
     ) -> None:
         active = self._active_attempt()
         if active is None:
@@ -374,7 +486,7 @@ class AttemptCoordinator:
         )
         self._attempts[-1] = updated
         can_retry = retryable and len(self._attempts) < self._policy.max_attempts
-        self._state = RunState.WAITING if can_retry else RunState.FAILED
+        self._state = RunState.WAITING if can_retry else terminal_state
 
     @staticmethod
     def _require_not_before(now: datetime, lower_bound: datetime) -> None:
@@ -401,6 +513,87 @@ def _require_text(value: str, field: str) -> None:
 def _require_aware(value: datetime) -> None:
     if value.tzinfo is None or value.utcoffset() is None:
         raise InvalidAttemptInput("event time must be timezone-aware")
+
+
+class ResourceMonitor(Protocol):
+    """What the replay loop needs in order to police an attempt's footprint."""
+
+    def sample(self) -> ResourceSample: ...
+
+
+class ProcessResourceMonitor:
+    """Real CPU and RSS readings for this process, plus POSIX hard ceilings.
+
+    CPU is measured **relative to construction**, so the budget is the
+    attempt's own consumption rather than the worker process's lifetime.
+    Memory is absolute RSS, because that is what the operating system will
+    actually kill the process for.
+
+    On Linux, :meth:`apply_hard_limits` additionally installs ``RLIMIT_CPU``
+    and ``RLIMIT_AS`` so a runaway that never reaches a checkpoint is still
+    stopped by the kernel. Windows has no POSIX rlimit; there the sampler is
+    the only enforcement, and :meth:`apply_hard_limits` says so rather than
+    pretending otherwise.
+    """
+
+    def __init__(self, pid: int | None = None) -> None:
+        self._process: Any = self._psutil().Process(pid)
+        times = self._process.cpu_times()
+        self._cpu_origin = float(times.user) + float(times.system)
+
+    @staticmethod
+    def _psutil() -> Any:
+        try:
+            return importlib.import_module("psutil")
+        except ImportError as exc:  # pragma: no cover - packaging defect
+            raise RuntimeError(
+                "psutil is required to enforce backtest resource limits; it is "
+                "currently declared only in the `test` extra of pyproject.toml"
+            ) from exc
+
+    def sample(self) -> ResourceSample:
+        times = self._process.cpu_times()
+        consumed = (float(times.user) + float(times.system)) - self._cpu_origin
+        return ResourceSample(
+            cpu_time=timedelta(seconds=max(0.0, consumed)),
+            memory_bytes=int(self._process.memory_info().rss),
+        )
+
+    def apply_hard_limits(self, policy: AttemptPolicy) -> tuple[str, ...]:
+        """Install every ceiling this platform supports; report which are live.
+
+        .. warning::
+
+           On POSIX this caps the **entire calling process**, and because soft
+           and hard are set to the same value an unprivileged process can never
+           raise them again. Call it only from a dedicated child process that
+           runs exactly one attempt and then exits.
+
+           Calling it in a long-lived worker is a defect twice over: the first
+           attempt's policy would cap every later attempt, and ``RLIMIT_AS``
+           would kill the worker rather than fail the attempt. It is also why a
+           test that called this inline capped the whole pytest session at
+           512 MiB of address space and every later allocation raised
+           ``MemoryError``.
+        """
+        _validate_policy(policy)
+        applied = ["psutil-sampling"]
+        if _posix_resource is not None:  # pragma: no cover - POSIX only
+            seconds = max(1, math.ceil(policy.max_cpu_time.total_seconds()))
+            _posix_resource.setrlimit(
+                _posix_resource.RLIMIT_CPU, (seconds, seconds)
+            )
+            applied.append("rlimit-cpu")
+            _posix_resource.setrlimit(
+                _posix_resource.RLIMIT_AS,
+                (policy.max_memory_bytes, policy.max_memory_bytes),
+            )
+            applied.append("rlimit-as")
+        elif sys.platform != "win32":  # pragma: no cover - defensive
+            raise RuntimeError(
+                f"no resource-limit mechanism is available on {sys.platform}"
+            )
+        return tuple(applied)
 
 
 def _validate_policy(policy: AttemptPolicy) -> None:

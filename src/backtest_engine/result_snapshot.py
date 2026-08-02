@@ -1,4 +1,29 @@
-"""Immutable D25 trade-detail and compact performance result snapshots."""
+"""Immutable D25 trade-detail and compact performance result snapshots.
+
+The detail object (``records``) is the evidence; :class:`PerformanceSummary` is
+the derived, re-computable view of it that becomes one
+``backtest.performance_summaries`` row. Nothing in the summary is copied out of
+a record: cash is re-walked from the fill ledger, positions come from the last
+fill, and every metric is produced by :mod:`backtest_engine.performance` under
+the versions it declares.
+
+Four canonical hashes identify a summary and are all computed over
+**post-quantization** values (spec 2.3, ``precision:1.0.0``):
+
+``run_snapshot_id``
+    The pinned run inputs (``RunSnapshot.snapshot_id``).
+``source_set_hash``
+    The run snapshot plus the exact detail record set. Independent of how the
+    run is valued, so two valuations of the same execution share it.
+``input_hash``
+    ``source_set_hash`` plus the valuation grid, the metric catalog and
+    calculation rules versions, the precision rules version and the calculation
+    instant. Everything a re-computation needs.
+``result_hash``
+    ``input_hash`` plus the equity curve and the exact decimal text of every
+    metric. Two runs with the same ``input_hash`` and different ``result_hash``
+    are a reproducibility failure.
+"""
 
 from __future__ import annotations
 
@@ -6,16 +31,40 @@ import hashlib
 import json
 import re
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
+from types import MappingProxyType
+from typing import Any
 
 from backtest_engine.execution_model import (
     BacktestOrder,
     Fill,
     OrderStatus,
+)
+from backtest_engine.money import (
+    PRECISION_RULES_VERSION,
+    format_money,
+    quantize_money,
+    quantize_quantity,
+)
+from backtest_engine.performance import (
+    CALCULATION_RULES_VERSION,
+    METRIC_CATALOG_VERSION,
+    EquityCurve,
+    LedgerEvent,
+    MetricSet,
+    PositionState,
+    TradeStatistics,
+    ValuationSeries,
+    build_equity_curve,
+    build_metrics,
+    metrics_hash_material,
+)
+from backtest_engine.performance import (
+    metrics_document as _render_metrics_document,
 )
 
 
@@ -23,6 +72,10 @@ ZERO = Decimal("0")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 SCHEMA_VERSION = 1
 MEDIA_TYPE = "application/vnd.idea2strategy.backtest-results+json"
+
+SOURCE_SET_HASH_DOMAIN = "backtest.performance.source_set:1.0.0"
+INPUT_HASH_DOMAIN = "backtest.performance.input:1.0.0"
+RESULT_HASH_DOMAIN = "backtest.performance.result:1.0.0"
 
 
 class ResultSnapshotValidationError(ValueError):
@@ -167,6 +220,24 @@ class PositionAfter:
         )
         _non_negative(self.quantity, "position.quantity")
         _non_negative(self.cost_basis, "position.cost_basis")
+        # Stored evidence is quantized evidence: a position that cannot survive
+        # `numeric(24,8)` must not be representable here at all. Quantity keeps
+        # 8 places because a fractional-eligible instrument may hold them; a
+        # whole-share instrument is enforced upstream by the execution model.
+        object.__setattr__(
+            self,
+            "quantity",
+            quantize_quantity(
+                self.quantity,
+                fractional_eligible=True,
+                label="position.quantity",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "cost_basis",
+            quantize_money(self.cost_basis, "position.cost_basis"),
+        )
         if self.quantity == ZERO and self.cost_basis != ZERO:
             raise ResultSnapshotValidationError(
                 "zero position quantity requires zero cost_basis"
@@ -216,6 +287,9 @@ class ResultRecord:
         if not isinstance(self.order_status, OrderStatus):
             raise ResultSnapshotValidationError("order_status is unsupported")
         _non_negative(self.cash_after, "cash_after")
+        object.__setattr__(
+            self, "cash_after", quantize_money(self.cash_after, "cash_after")
+        )
 
         positions = tuple(self.positions_after)
         if any(not isinstance(item, PositionAfter) for item in positions):
@@ -271,11 +345,37 @@ class ResultRecord:
         _non_negative(self.fee, "fee")
         _non_negative(self.cost_basis, "cost_basis")
         _decimal(self.realized_pnl, "realized_pnl")
-        if self.gross_amount != self.price * self.quantity:
+        # Every stored fill amount passes through `precision:1.0.0` exactly
+        # once, here, so the detail object and every hash taken over it are
+        # already at the canonical `numeric(24,8)` scale.
+        object.__setattr__(
+            self,
+            "quantity",
+            quantize_quantity(
+                self.quantity, fractional_eligible=True, label="quantity"
+            ),
+        )
+        for name in (
+            "base_price",
+            "price",
+            "gross_amount",
+            "slippage_amount",
+            "fee",
+            "cost_basis",
+            "realized_pnl",
+        ):
+            object.__setattr__(
+                self, name, quantize_money(getattr(self, name), name)
+            )
+        if self.gross_amount != quantize_money(
+            self.price * self.quantity, "gross_amount"
+        ):
             raise ResultSnapshotValidationError(
                 "gross_amount must equal price times quantity"
             )
-        expected_slippage = abs(self.price - self.base_price) * self.quantity
+        expected_slippage = quantize_money(
+            abs(self.price - self.base_price) * self.quantity, "slippage_amount"
+        )
         if self.slippage_amount != expected_slippage:
             raise ResultSnapshotValidationError(
                 "slippage_amount must match base and final prices"
@@ -331,6 +431,15 @@ class ResultRecord:
 
 @dataclass(frozen=True, slots=True)
 class PerformanceSummary:
+    """One ``backtest.performance_summaries`` row in domain form.
+
+    Every monetary field is quantized here, so the object can only ever hold
+    values that round-trip through ``numeric(24,8)``. ``metrics`` is the full
+    :data:`~backtest_engine.performance.METRIC_RULES` catalog, not a subset:
+    a metric that cannot be computed for this run carries ``value is None``,
+    which is distinct from zero.
+    """
+
     run_snapshot_id: str
     order_count: int
     fill_count: int
@@ -342,6 +451,14 @@ class PerformanceSummary:
     initial_cash: Decimal
     ending_cash: Decimal
     ending_positions: tuple[PositionAfter, ...]
+    equity_curve: EquityCurve
+    metrics: MetricSet
+    calculated_at: datetime
+    source_set_hash: str
+    input_hash: str
+    result_hash: str
+    metric_catalog_version: str = METRIC_CATALOG_VERSION
+    calculation_rules_version: str = CALCULATION_RULES_VERSION
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -360,11 +477,21 @@ class PerformanceSummary:
                 raise ResultSnapshotValidationError(
                     f"summary.{field} must be a non-negative integer"
                 )
-        _non_negative(self.total_fees, "summary.total_fees")
-        _non_negative(self.total_slippage, "summary.total_slippage")
-        _decimal(self.realized_pnl, "summary.realized_pnl")
-        _non_negative(self.initial_cash, "summary.initial_cash")
-        _non_negative(self.ending_cash, "summary.ending_cash")
+        for field in (
+            "total_fees",
+            "total_slippage",
+            "realized_pnl",
+            "initial_cash",
+            "ending_cash",
+        ):
+            value = getattr(self, field)
+            if field == "realized_pnl":
+                _decimal(value, f"summary.{field}")
+            else:
+                _non_negative(value, f"summary.{field}")
+            object.__setattr__(
+                self, field, quantize_money(value, f"summary.{field}")
+            )
         positions = tuple(self.ending_positions)
         if any(not isinstance(item, PositionAfter) for item in positions):
             raise ResultSnapshotValidationError(
@@ -379,6 +506,42 @@ class PerformanceSummary:
             "ending_positions",
             tuple(sorted(positions, key=lambda item: item.instrument_id)),
         )
+
+        if not isinstance(self.equity_curve, EquityCurve):
+            raise ResultSnapshotValidationError(
+                "summary.equity_curve must be an EquityCurve"
+            )
+        if not isinstance(self.metrics, MetricSet):
+            raise ResultSnapshotValidationError("summary.metrics must be a MetricSet")
+        if (
+            self.metrics.basis is not self.equity_curve.basis
+            or self.metrics.periodicity is not self.equity_curve.periodicity
+        ):
+            raise ResultSnapshotValidationError(
+                "summary.metrics must be qualified by the same valuation basis as "
+                "summary.equity_curve"
+            )
+        object.__setattr__(
+            self, "calculated_at", _utc(self.calculated_at, "summary.calculated_at")
+        )
+        # A stored summary states which catalog produced it, and this build
+        # refuses to relabel numbers it did not compute under that catalog.
+        if self.metric_catalog_version != METRIC_CATALOG_VERSION:
+            raise ResultSnapshotValidationError(
+                f"this build computes only {METRIC_CATALOG_VERSION}, not "
+                f"{self.metric_catalog_version}"
+            )
+        if self.calculation_rules_version != CALCULATION_RULES_VERSION:
+            raise ResultSnapshotValidationError(
+                f"this build computes only {CALCULATION_RULES_VERSION}, not "
+                f"{self.calculation_rules_version}"
+            )
+        for field in ("source_set_hash", "input_hash", "result_hash"):
+            _hash(getattr(self, field), f"summary.{field}")
+
+    def metrics_document(self) -> Mapping[str, Any]:
+        """The ``performance_summaries.metrics_document`` jsonb payload."""
+        return MappingProxyType(_render_metrics_document(self.metrics))
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,6 +605,28 @@ class ResultObjectManifest:
 
 
 @dataclass(frozen=True, slots=True)
+class PerformanceRow:
+    """The exact column set of ``backtest.performance_summaries``.
+
+    Kept here, in the domain layer, rather than imported from
+    ``backtest_engine.persistence``: the persistence package pulls in
+    SQLAlchemy, and the result snapshot must stay usable without a database.
+    The field names and types are identical to
+    ``persistence.rows.PerformanceSummaryRow`` so a repository can insert this
+    directly.
+    """
+
+    run_id: uuid.UUID
+    metric_catalog_version: str
+    metrics_document: Mapping[str, Any]
+    calculation_rules_version: str
+    source_set_hash: str
+    input_hash: str
+    result_hash: str
+    calculated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class ResultSnapshot:
     run_snapshot: RunSnapshot
     records: tuple[ResultRecord, ...]
@@ -450,7 +635,32 @@ class ResultSnapshot:
     object_bytes: bytes
 
     def completion_fields(self) -> dict[str, str]:
-        return {"result_manifest_id": self.manifest.result_manifest_id}
+        """The ``backtest.v1`` COMPLETED detail fields.
+
+        camelCase with ``sha256:``-prefixed digests, matching the envelope
+        convention B publishes on ``strategy-bot.v1`` (spec 2.1).
+        ``resultHash`` is the summary's, which transitively covers the detail
+        record set, the valuation grid and every metric, so a redelivery of a
+        genuinely different outcome cannot reuse the idempotency key.
+        """
+        return {
+            "resultManifestId": self.manifest.result_manifest_id,
+            "resultHash": f"sha256:{self.summary.result_hash}",
+        }
+
+    def performance_row(self) -> PerformanceRow:
+        """Project the summary onto ``backtest.performance_summaries``."""
+        summary = self.summary
+        return PerformanceRow(
+            run_id=uuid.UUID(self.run_snapshot.backtest_run_id),
+            metric_catalog_version=summary.metric_catalog_version,
+            metrics_document=summary.metrics_document(),
+            calculation_rules_version=summary.calculation_rules_version,
+            source_set_hash=summary.source_set_hash,
+            input_hash=summary.input_hash,
+            result_hash=summary.result_hash,
+            calculated_at=summary.calculated_at,
+        )
 
 
 def order_result_record(
@@ -563,7 +773,16 @@ class ResultSnapshotBuilder:
         run_snapshot: RunSnapshot,
         records: Iterable[ResultRecord],
         completed_at: datetime,
+        valuation_series: ValuationSeries | None = None,
     ) -> ResultSnapshot:
+        """Assemble the immutable detail object, summary and manifest.
+
+        ``valuation_series`` is the mark grid the equity curve is sampled on.
+        Omitting it is not a hidden default: it selects the explicit
+        ``COST_BASIS`` / ``EVENT`` curve built by
+        :meth:`ValuationSeries.event_driven`, whose limitations (no Sharpe, no
+        unrealised P&L) are recorded on the curve and in the metrics document.
+        """
         if not isinstance(run_snapshot, RunSnapshot):
             raise ResultSnapshotValidationError(
                 "run_snapshot must be a RunSnapshot"
@@ -593,7 +812,9 @@ class ResultSnapshotBuilder:
                 "completed_at must not precede a result record"
             )
 
-        summary = _performance_summary(run_snapshot, ordered)
+        summary = _performance_summary(
+            run_snapshot, ordered, valuation_series, completed_at
+        )
         payload = {
             "schema_version": SCHEMA_VERSION,
             "run_snapshot": _run_payload(run_snapshot),
@@ -686,8 +907,20 @@ class ResultSnapshotBuilder:
             raise ResultIntegrityError("manifest backtest run does not match")
         if manifest.strategy_version_id != result.run_snapshot.strategy_version_id:
             raise ResultIntegrityError("manifest strategy version does not match")
+        if not isinstance(result.summary, PerformanceSummary):
+            raise ResultIntegrityError("result summary type is invalid")
+        if result.summary.calculated_at != manifest.completed_at:
+            raise ResultIntegrityError(
+                "result summary was not calculated at the completion instant"
+            )
+        # `to_series` recovers the exact valuation grid the stored curve was
+        # sampled on, so the whole summary is re-derived from evidence rather
+        # than trusted.
         expected_summary = _performance_summary(
-            result.run_snapshot, result.records
+            result.run_snapshot,
+            result.records,
+            result.summary.equity_curve.to_series(),
+            manifest.completed_at,
         )
         if expected_summary != result.summary:
             raise ResultIntegrityError("result summary does not match detail records")
@@ -777,32 +1010,223 @@ def _event_id(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _FillLedger:
+    """What a canonical walk of the FILL records establishes."""
+
+    events: tuple[LedgerEvent, ...]
+    trades: TradeStatistics
+    ending_cash: Decimal
+    ending_positions: tuple[PositionAfter, ...]
+
+
+def _fill_ledger(
+    run_snapshot: RunSnapshot,
+    ordered: tuple[ResultRecord, ...],
+) -> _FillLedger:
+    """Re-walk cash and positions from the fills alone.
+
+    ``cash_after`` on a detail record is the engine's own report and is never
+    read here: a rejection or cancellation carries the cash it *saw*, which is
+    not the run's ending cash, and the pre-rebuild summary copied exactly that
+    number out of the last record.
+
+    A fill's direction is not stored on the record; it is *established* by the
+    position book. A fill whose position delta is neither ``+quantity`` nor
+    ``-quantity`` describes an execution that cannot have happened, and is
+    rejected rather than guessed at.
+    """
+
+    cash = quantize_money(run_snapshot.initial_cash, "initial_cash")
+    book: dict[str, PositionAfter] = {}
+    by_instant: dict[datetime, tuple[Decimal, dict[str, PositionAfter]]] = {}
+    fill_count = closing_count = winning_count = losing_count = 0
+    realized_pnl = total_fees = total_slippage = ZERO
+
+    for record in ordered:
+        if record.kind is not ResultRecordKind.FILL:
+            continue
+        quantity = record.quantity
+        gross_amount = record.gross_amount
+        fee = record.fee
+        realized = record.realized_pnl
+        slippage = record.slippage_amount
+        if (
+            quantity is None
+            or gross_amount is None
+            or fee is None
+            or realized is None
+            or slippage is None
+        ):  # pragma: no cover - ResultRecord already rejects a partial fill
+            raise ResultSnapshotValidationError("fill fields must all be supplied")
+
+        after = {
+            item.instrument_id: item
+            for item in record.positions_after
+            if item.quantity > ZERO
+        }
+        held_before = book.get(record.instrument_id)
+        held_after = after.get(record.instrument_id)
+        before_quantity = held_before.quantity if held_before is not None else ZERO
+        after_quantity = held_after.quantity if held_after is not None else ZERO
+        delta = after_quantity - before_quantity
+        if delta == quantity:
+            opening = True
+        elif delta == -quantity:
+            opening = False
+        else:
+            raise ResultSnapshotValidationError(
+                f"fill {record.fill_id} moved the position quantity of "
+                f"{record.instrument_id} by {delta}, which is neither "
+                f"+{quantity} nor -{quantity}"
+            )
+        for instrument_id in sorted(
+            (set(book) | set(after)) - {record.instrument_id}
+        ):
+            if book.get(instrument_id) != after.get(instrument_id):
+                raise ResultSnapshotValidationError(
+                    f"fill {record.fill_id} changed the position of "
+                    f"{instrument_id}, which it does not trade"
+                )
+
+        # Long-only: buying pays the gross and the fee, selling receives the
+        # gross less the fee. Both are quantized once, here.
+        cash_delta = quantize_money(
+            -(gross_amount + fee) if opening else gross_amount - fee,
+            "fill cash flow",
+        )
+        cash = quantize_money(cash + cash_delta, "ending_cash")
+
+        fill_count += 1
+        if not opening:
+            closing_count += 1
+            if realized > ZERO:
+                winning_count += 1
+            elif realized < ZERO:
+                losing_count += 1
+        realized_pnl += realized
+        total_fees += fee
+        total_slippage += slippage
+        book = after
+
+        # Two fills on the same instant are one ledger movement; the equity
+        # curve samples instants, not records.
+        previous = by_instant.get(record.occurred_at)
+        merged = cash_delta if previous is None else previous[0] + cash_delta
+        by_instant[record.occurred_at] = (
+            quantize_money(merged, "ledger cash_delta"),
+            after,
+        )
+
+    events = tuple(
+        LedgerEvent(
+            as_of=instant,
+            cash_delta=cash_delta,
+            positions=tuple(
+                PositionState(
+                    instrument_id=item.instrument_id,
+                    quantity=item.quantity,
+                    cost_basis=quantize_money(item.cost_basis, "position cost_basis"),
+                )
+                for item in positions.values()
+            ),
+        )
+        for instant, (cash_delta, positions) in sorted(by_instant.items())
+    )
+    return _FillLedger(
+        events=events,
+        trades=TradeStatistics(
+            fill_count=fill_count,
+            closing_trade_count=closing_count,
+            winning_trade_count=winning_count,
+            losing_trade_count=losing_count,
+            realized_pnl=quantize_money(realized_pnl, "realized_pnl"),
+            total_fees=quantize_money(total_fees, "total_fees"),
+            total_slippage=quantize_money(total_slippage, "total_slippage"),
+        ),
+        ending_cash=cash,
+        ending_positions=tuple(
+            sorted(book.values(), key=lambda item: item.instrument_id)
+        ),
+    )
+
+
 def _performance_summary(
     run_snapshot: RunSnapshot,
     records: Iterable[ResultRecord],
+    valuation_series: ValuationSeries | None,
+    calculated_at: datetime,
 ) -> PerformanceSummary:
     ordered = tuple(sorted(records, key=_record_key))
-    fills = tuple(
-        item for item in ordered if item.kind is ResultRecordKind.FILL
+    calculated_at = _utc(calculated_at, "calculated_at")
+    ledger = _fill_ledger(run_snapshot, ordered)
+
+    if valuation_series is None:
+        series = ValuationSeries.event_driven(ledger.events, through=calculated_at)
+    elif isinstance(valuation_series, ValuationSeries):
+        series = valuation_series
+    else:
+        raise ResultSnapshotValidationError(
+            "valuation_series must be a ValuationSeries"
+        )
+    curve = build_equity_curve(run_snapshot.initial_cash, ledger.events, series)
+    metrics = build_metrics(curve, ledger.trades)
+
+    source_set_hash = _sha256(
+        _canonical_bytes(
+            {
+                "domain": SOURCE_SET_HASH_DOMAIN,
+                "run_snapshot": _run_payload(run_snapshot),
+                "records": [_record_payload(item) for item in ordered],
+            }
+        )
     )
+    input_hash = _sha256(
+        _canonical_bytes(
+            {
+                "domain": INPUT_HASH_DOMAIN,
+                "source_set_hash": source_set_hash,
+                "metric_catalog_version": METRIC_CATALOG_VERSION,
+                "calculation_rules_version": CALCULATION_RULES_VERSION,
+                "precision_rules_version": PRECISION_RULES_VERSION,
+                "calculated_at": _timestamp(calculated_at),
+                "valuation": _series_payload(series),
+            }
+        )
+    )
+    result_hash = _sha256(
+        _canonical_bytes(
+            {
+                "domain": RESULT_HASH_DOMAIN,
+                "input_hash": input_hash,
+                "equity_curve": _curve_payload(curve),
+                "metrics": metrics_hash_material(metrics),
+            }
+        )
+    )
+
     return PerformanceSummary(
         run_snapshot_id=run_snapshot.snapshot_id,
         order_count=len({item.order_id for item in ordered}),
-        fill_count=len(fills),
+        fill_count=ledger.trades.fill_count,
         cancellation_count=sum(
             item.kind is ResultRecordKind.CANCELLATION for item in ordered
         ),
         rejection_count=sum(
             item.kind is ResultRecordKind.REJECTION for item in ordered
         ),
-        total_fees=sum((item.fee or ZERO for item in fills), ZERO),
-        total_slippage=sum(
-            (item.slippage_amount or ZERO for item in fills), ZERO
-        ),
-        realized_pnl=sum((item.realized_pnl or ZERO for item in fills), ZERO),
+        total_fees=ledger.trades.total_fees,
+        total_slippage=ledger.trades.total_slippage,
+        realized_pnl=ledger.trades.realized_pnl,
         initial_cash=run_snapshot.initial_cash,
-        ending_cash=(ordered[-1].cash_after if ordered else run_snapshot.initial_cash),
-        ending_positions=(ordered[-1].positions_after if ordered else ()),
+        ending_cash=ledger.ending_cash,
+        ending_positions=ledger.ending_positions,
+        equity_curve=curve,
+        metrics=metrics,
+        calculated_at=calculated_at,
+        source_set_hash=source_set_hash,
+        input_hash=input_hash,
+        result_hash=result_hash,
     )
 
 
@@ -862,6 +1286,55 @@ def _record_payload(record: ResultRecord) -> dict[str, object]:
     return payload
 
 
+def _series_payload(series: ValuationSeries) -> dict[str, object]:
+    """Exact text form of the valuation grid, marks quantized before hashing."""
+    return {
+        "basis": series.basis.value,
+        "basis_rule_id": series.basis.rule_id,
+        "periodicity": series.periodicity.value,
+        "opening_at": _timestamp(series.opening_at),
+        "instants": [
+            {
+                "as_of": _timestamp(instant.as_of),
+                "marks": [
+                    [
+                        mark.instrument_id,
+                        format_money(quantize_money(mark.price, "mark price")),
+                    ]
+                    for mark in instant.marks
+                ],
+            }
+            for instant in series.instants
+        ],
+    }
+
+
+def _curve_payload(curve: EquityCurve) -> dict[str, object]:
+    """Every stored curve value is already quantized by `build_equity_curve`."""
+    return {
+        "basis": curve.basis.value,
+        "periodicity": curve.periodicity.value,
+        "points": [
+            {
+                "as_of": _timestamp(point.as_of),
+                "cash": format_money(point.cash),
+                "position_value": format_money(point.position_value),
+                "equity": format_money(point.equity),
+                "holdings": [
+                    [
+                        holding.instrument_id,
+                        _decimal_text(holding.quantity),
+                        format_money(holding.mark_price),
+                        format_money(holding.market_value),
+                    ]
+                    for holding in point.holdings
+                ],
+            }
+            for point in curve.points
+        ],
+    }
+
+
 def _summary_payload(summary: PerformanceSummary) -> dict[str, object]:
     return {
         "run_snapshot_id": summary.run_snapshot_id,
@@ -877,6 +1350,12 @@ def _summary_payload(summary: PerformanceSummary) -> dict[str, object]:
         "ending_positions": [
             _position_payload(item) for item in summary.ending_positions
         ],
+        "metric_catalog_version": summary.metric_catalog_version,
+        "calculation_rules_version": summary.calculation_rules_version,
+        "calculated_at": _timestamp(summary.calculated_at),
+        "source_set_hash": summary.source_set_hash,
+        "input_hash": summary.input_hash,
+        "result_hash": summary.result_hash,
     }
 
 

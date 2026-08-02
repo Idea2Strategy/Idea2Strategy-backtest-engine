@@ -1,8 +1,42 @@
+"""The `/api/v1` HTTP surface for the backtest engine (D28).
+
+Five owner-scoped query endpoints, one acceptance endpoint for B's
+`OFFICIAL_BACKTEST_REQUESTED`, and one result-ingestion endpoint for the worker.
+
+Authentication and authorisation are separate concerns here, and the difference is
+visible in the status codes:
+
+* **401** - the request carried no usable credential. The `Authorization` header was
+  absent, malformed, or names a token this deployment does not know.
+* **403** - the credential is valid but the run belongs to a different account.
+
+Returning 404 for a foreign run would hide the distinction and is a defensible choice
+in some products, but it also hides genuine authorisation bugs from the client and from
+this test suite, so the boundary is explicit.
+
+There is no default authenticator and no default gateway: `create_app` requires both.
+A backtest API that silently falls back to an in-memory store, or to "any token works",
+is precisely the class of empty implementation this rebuild exists to remove.
+
+Result ingestion is written for at-least-once delivery:
+
+* Replaying a byte-identical event returns the first outcome with `applied: false`.
+* Replaying a *different* event under the same idempotency key is `409`.
+* An `If-Match` that no longer matches the run is `412`, and the response body carries
+  the run's current state so a worker whose previous response was lost can reconcile
+  rather than guess.
+* A structurally invalid event is poison; it is dead-lettered rather than retried.
+"""
+
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, Protocol
+from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 
 from .contracts import ContractValidationError
 from .lifecycle import (
@@ -10,59 +44,406 @@ from .lifecycle import (
     BacktestRun,
     BacktestRunNotFound,
     IdempotencyConflict,
-    InMemoryBacktestJobQueue,
-    InMemoryBacktestRunStore,
+    InvalidStatusTransition,
+    NotRunOwner,
+    PreconditionFailed,
+    RequestNotSatisfiable,
+)
+from .persistence.rows import (
+    DetailManifestRow,
+    MonthlyJudgmentSummaryRow,
+    PerformanceSummaryRow,
+    RunAttemptRow,
+    RunRow,
 )
 
 
-def _response(run: BacktestRun) -> dict[str, Any]:
+__all__ = [
+    "API_PREFIX",
+    "Authenticator",
+    "Principal",
+    "StaticTokenAuthenticator",
+    "create_app",
+    "run",
+]
+
+
+API_PREFIX = "/api/v1"
+
+
+@dataclass(frozen=True, slots=True)
+class Principal:
+    """An authenticated caller."""
+
+    account_id: UUID
+    scopes: frozenset[str] = frozenset()
+
+    def has(self, scope: str) -> bool:
+        return scope in self.scopes
+
+
+class Authenticator(Protocol):
+    """Resolves a bearer token to a principal, or `None` if it is not valid."""
+
+    def authenticate(self, token: str) -> Principal | None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class StaticTokenAuthenticator:
+    """Explicit token to principal map.
+
+    Suitable for tests and for a deployment that injects tokens from a secret store.
+    There is deliberately no wildcard and no "development mode" bypass.
+    """
+
+    principals: Mapping[str, Principal]
+
+    def authenticate(self, token: str) -> Principal | None:
+        return self.principals.get(token)
+
+
+#: Scope required to publish worker results. Query endpoints need only ownership.
+RESULT_INGEST_SCOPE = "backtest:results:write"
+
+
+# ---------------------------------------------------------------------------
+# Serialisation
+# ---------------------------------------------------------------------------
+
+
+def _run_payload(run: BacktestRun) -> dict[str, Any]:
+    row: RunRow = run.run
     return {
-        "backtest_run_id": run.backtest_run_id,
-        "idempotency_key": run.idempotency_key,
-        "status": run.status,
-        "version": run.version,
-        "status_result": run.status_result,
+        "backtestRunId": str(row.id),
+        "botId": str(row.bot_id),
+        "ownerAccountId": str(row.owner_account_id),
+        "status": row.status.value,
+        "configurationHash": row.configuration_hash,
+        "evaluationStart": row.evaluation_start.isoformat(),
+        "evaluationEnd": row.evaluation_end.isoformat(),
+        "initialCashAmount": f"{row.initial_cash_amount:.8f}",
+        "marketRulesVersion": row.market_rules_version,
+        "accountingRulesVersion": row.accounting_rules_version,
+        "precisionRulesVersion": row.precision_rules_version,
+        "feePolicyId": str(row.fee_policy_id),
+        "slippageRateBps": row.slippage_rate_bps,
+        "buyingPowerBufferPolicyId": str(row.buying_power_buffer_policy_id),
+        "idempotencyKey": row.idempotency_key,
+        "queuedAt": _iso(row.queued_at),
+        "startedAt": _iso(row.started_at),
+        "completedAt": _iso(row.completed_at),
+        "failureCode": row.failure_code,
+        "resultHash": row.result_hash,
+        "attemptCount": len(run.attempts),
     }
 
 
-def create_app(lifecycle: BacktestLifecycleService | None = None) -> FastAPI:
-    app = FastAPI(title="Idea2Strategy Backtest API", version="0.1.0")
-    service = lifecycle or BacktestLifecycleService(
-        InMemoryBacktestRunStore(),
-        InMemoryBacktestJobQueue(),
-    )
+def _attempt_payload(row: RunAttemptRow) -> dict[str, Any]:
+    return {
+        "attemptId": str(row.id),
+        "backtestRunId": str(row.run_id),
+        "attemptNumber": row.attempt_number,
+        "workerExecutionKey": row.worker_execution_key,
+        "status": row.status.value,
+        "startedAt": _iso(row.started_at),
+        "completedAt": _iso(row.completed_at),
+        "failureCode": row.failure_code,
+    }
+
+
+def _performance_payload(row: PerformanceSummaryRow) -> dict[str, Any]:
+    return {
+        "backtestRunId": str(row.run_id),
+        "metricCatalogVersion": row.metric_catalog_version,
+        "metricsDocument": dict(row.metrics_document),
+        "calculationRulesVersion": row.calculation_rules_version,
+        "sourceSetHash": row.source_set_hash,
+        "inputHash": row.input_hash,
+        "resultHash": row.result_hash,
+        "calculatedAt": _iso(row.calculated_at),
+    }
+
+
+def _monthly_payload(row: MonthlyJudgmentSummaryRow) -> dict[str, Any]:
+    return {
+        "monthlySummaryId": str(row.id),
+        "backtestRunId": str(row.run_id),
+        "etYearMonth": row.et_year_month,
+        "evaluationCount": row.evaluation_count,
+        "activeBranchCount": row.active_branch_count,
+        "tradeEventCount": row.trade_event_count,
+        "dataGapCount": row.data_gap_count,
+        "triggeredCount": row.triggered_count,
+        "rejectedCount": row.rejected_count,
+        "summaryDocument": dict(row.summary_document),
+        "summaryHash": row.summary_hash,
+    }
+
+
+def _manifest_payload(row: DetailManifestRow) -> dict[str, Any]:
+    return {
+        "manifestId": str(row.id),
+        "backtestRunId": str(row.run_id),
+        "objectId": str(row.object_id),
+        "recordType": row.record_type,
+        "weekStartDate": row.week_start_date.isoformat(),
+        "periodStart": _iso(row.period_start),
+        "periodEnd": _iso(row.period_end),
+        "partNumber": row.part_number,
+        "rowCount": row.row_count,
+        "schemaVersion": row.schema_version,
+        "sourceSetHash": row.source_set_hash,
+        "supersedesManifestId": str(row.supersedes_manifest_id) if row.supersedes_manifest_id else None,
+        "detailHash": row.detail_hash,
+        "createdAt": _iso(row.created_at),
+    }
+
+
+def _iso(value: Any) -> str | None:
+    return None if value is None else value.isoformat().replace("+00:00", "Z")
+
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
+
+
+def create_app(
+    lifecycle: BacktestLifecycleService,
+    authenticator: Authenticator,
+) -> FastAPI:
+    """Build the `/api/v1` application.
+
+    Both arguments are required. See the module docstring for why there is no default.
+    """
+    if lifecycle is None:
+        raise ValueError("a BacktestLifecycleService is required")
+    if authenticator is None:
+        raise ValueError("an Authenticator is required")
+
+    app = FastAPI(title="Idea2Strategy Backtest API", version="1.0.0")
+
+    def current_principal(authorization: str | None = Header(default=None)) -> Principal:
+        if not authorization:
+            raise _unauthenticated("an Authorization header is required")
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not token.strip():
+            raise _unauthenticated("only 'Authorization: Bearer <token>' is accepted")
+        principal = authenticator.authenticate(token.strip())
+        if principal is None:
+            raise _unauthenticated("the bearer token is not recognised")
+        return principal
+
+    Auth = Depends(current_principal)
 
     @app.get("/health", tags=["operations"])
     def health() -> dict[str, str]:
         return {"status": "ok", "service": "backtest-api"}
 
-    @app.post(
-        "/backtests",
-        status_code=status.HTTP_202_ACCEPTED,
-        tags=["backtests"],
-    )
-    def accept_backtest(request: dict[str, Any]) -> dict[str, Any]:
-        try:
-            return _response(service.accept(request))
-        except ContractValidationError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        except IdempotencyConflict as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    # -- acceptance -------------------------------------------------------
 
-    @app.get("/backtests/{backtest_run_id}", tags=["backtests"])
-    def get_backtest(backtest_run_id: str) -> dict[str, Any]:
+    @app.post(f"{API_PREFIX}/backtests", status_code=status.HTTP_202_ACCEPTED, tags=["backtests"])
+    def accept_backtest(
+        body: dict[str, Any],
+        response: Response,
+        principal: Principal = Auth,
+    ) -> dict[str, Any]:
+        """Accept B's `OFFICIAL_BACKTEST_REQUESTED`.
+
+        The body is `{"request": <strategy-bot.v1 message>, "compiledPlan": <plan>}`.
+        The plan is optional: when omitted it is resolved through the configured
+        `CompiledPlanSource`, and the request is rejected if neither supplies it.
+        """
+        request_document = body.get("request", body)
+        compiled_plan = body.get("compiledPlan")
         try:
-            return _response(service.get(backtest_run_id))
+            accepted = lifecycle.accept(request_document, compiled_plan=compiled_plan)
+        except RequestNotSatisfiable as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "message": str(exc),
+                    "reasonCode": exc.reason_code,
+                    "missingRequirements": list(exc.missing),
+                },
+            ) from exc
+        except ContractValidationError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        except IdempotencyConflict as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+        run = accepted.run
+        if run.owner_account_id != principal.account_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="the authenticated account does not own the bot this request names",
+            )
+        response.headers["ETag"] = run.etag
+        response.headers["Location"] = f"{API_PREFIX}/backtests/{run.backtest_run_id}"
+        return {
+            "run": _run_payload(run),
+            "created": accepted.created,
+            "dispatched": accepted.dispatched,
+        }
+
+    # -- queries ----------------------------------------------------------
+
+    @app.get(f"{API_PREFIX}/backtests", tags=["backtests"])
+    def list_backtests(
+        limit: int = 50,
+        offset: int = 0,
+        principal: Principal = Auth,
+    ) -> dict[str, Any]:
+        """Query 1/5: the authenticated owner's runs. Never another account's."""
+        if not 1 <= limit <= 200:
+            raise HTTPException(status_code=422, detail="limit must be between 1 and 200")
+        if offset < 0:
+            raise HTTPException(status_code=422, detail="offset must not be negative")
+        runs = lifecycle.list_runs(principal.account_id, limit=limit, offset=offset)
+        return {
+            "items": [_run_payload(run) for run in runs],
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @app.get(f"{API_PREFIX}/backtests/{{run_id}}", tags=["backtests"])
+    def get_backtest(run_id: UUID, response: Response, principal: Principal = Auth) -> dict[str, Any]:
+        """Query 2/5: one run."""
+        run = _owned(lifecycle, run_id, principal)
+        response.headers["ETag"] = run.etag
+        return _run_payload(run)
+
+    @app.get(f"{API_PREFIX}/backtests/{{run_id}}/attempts", tags=["backtests"])
+    def get_attempts(run_id: UUID, principal: Principal = Auth) -> dict[str, Any]:
+        """Query 3/5: the durable attempt history behind a run."""
+        _owned(lifecycle, run_id, principal)
+        attempts = lifecycle.attempts_of(run_id, owner_account_id=principal.account_id)
+        return {"items": [_attempt_payload(row) for row in attempts]}
+
+    @app.get(f"{API_PREFIX}/backtests/{{run_id}}/performance", tags=["backtests"])
+    def get_performance(run_id: UUID, principal: Principal = Auth) -> dict[str, Any]:
+        """Query 4/5: the immutable performance summary, once the run completed."""
+        _owned(lifecycle, run_id, principal)
+        summary = lifecycle.performance_of(run_id, owner_account_id=principal.account_id)
+        if summary is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"backtest run {run_id} has no performance summary yet",
+            )
+        return _performance_payload(summary)
+
+    @app.get(f"{API_PREFIX}/backtests/{{run_id}}/monthly-summaries", tags=["backtests"])
+    def get_monthly(run_id: UUID, principal: Principal = Auth) -> dict[str, Any]:
+        """Query 5/5: per-ET-month judgment summaries with all six canonical counters."""
+        _owned(lifecycle, run_id, principal)
+        summaries = lifecycle.monthly_of(run_id, owner_account_id=principal.account_id)
+        return {"items": [_monthly_payload(row) for row in summaries]}
+
+    @app.get(f"{API_PREFIX}/backtests/{{run_id}}/detail-manifests", tags=["backtests"])
+    def get_manifests(run_id: UUID, principal: Principal = Auth) -> dict[str, Any]:
+        """Detail object manifests: ET Monday week boundaries plus `partNumber`."""
+        _owned(lifecycle, run_id, principal)
+        manifests = lifecycle.manifests_of(run_id, owner_account_id=principal.account_id)
+        return {"items": [_manifest_payload(row) for row in manifests]}
+
+    # -- result ingestion --------------------------------------------------
+
+    @app.post(f"{API_PREFIX}/backtests/{{run_id}}/results", tags=["backtests"])
+    def ingest_result(
+        run_id: UUID,
+        event: dict[str, Any],
+        request: Request,
+        response: Response,
+        if_match: str | None = Header(default=None, alias="If-Match"),
+        principal: Principal = Auth,
+    ) -> Any:
+        """Apply a `backtest.v1` result event published by a worker."""
+        if not principal.has(RESULT_INGEST_SCOPE):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"the {RESULT_INGEST_SCOPE} scope is required to publish results",
+            )
+        if str(event.get("backtestRunId")) != str(run_id):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="the event's backtestRunId does not match the path",
+            )
+
+        delivery_attempt = _delivery_attempt(request)
+        try:
+            outcome = lifecycle.ingest_result(
+                event, if_match=if_match, delivery_attempt=delivery_attempt
+            )
         except BacktestRunNotFound as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except PreconditionFailed as exc:
+            return JSONResponse(
+                status_code=status.HTTP_412_PRECONDITION_FAILED,
+                headers={"ETag": exc.current.etag},
+                content={
+                    "detail": str(exc),
+                    "current": _run_payload(exc.current),
+                },
+            )
+        except IdempotencyConflict as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        except InvalidStatusTransition as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        except ContractValidationError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+
+        response.headers["ETag"] = outcome.run.etag
+        return {"run": _run_payload(outcome.run), "applied": outcome.applied}
 
     return app
 
 
-app = create_app()
+def _owned(lifecycle: BacktestLifecycleService, run_id: UUID, principal: Principal) -> BacktestRun:
+    try:
+        return lifecycle.get(run_id, owner_account_id=principal.account_id)
+    except BacktestRunNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except NotRunOwner as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
 
 
-def run() -> None:
-    import uvicorn
+def _unauthenticated(detail: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail=detail,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
-    uvicorn.run("backtest_engine.api:app", host="0.0.0.0", port=8082)
+
+def _delivery_attempt(request: Request) -> int:
+    """SQS surfaces its redelivery count; a direct caller may state it explicitly."""
+    raw = request.headers.get("X-Delivery-Attempt")
+    if raw is None:
+        return 1
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="X-Delivery-Attempt must be an integer",
+        ) from exc
+    if parsed < 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="X-Delivery-Attempt starts at 1",
+        )
+    return parsed
+
+
+def run() -> None:  # pragma: no cover - process entry point
+    """Entry point for `backtest-api`.
+
+    Deliberately unimplemented: wiring a real deployment needs a database URL, a
+    queue URL and a token source, and inventing defaults for those here is how the
+    pre-rebuild build shipped an API backed by a dictionary.
+    """
+    raise NotImplementedError(
+        "backtest-api has no runnable default wiring yet: build the "
+        "BacktestLifecycleService with PersistenceRunGateway plus a real "
+        "Authenticator and serve create_app(...) from your deployment entry point"
+    )

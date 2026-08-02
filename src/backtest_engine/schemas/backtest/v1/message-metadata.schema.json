@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.idea2strategy.io/backtest/v1/message-metadata.schema.json",
+  "title": "backtest.v1 message metadata envelope",
+  "description": "D-owned envelope. Deliberately identical in shape and conventions to strategy-bot.v1 metadata: camelCase fields and sha256:-prefixed lowercase idempotency keys.",
+  "type": "object",
+  "required": [
+    "contractVersion",
+    "messageType",
+    "messageId",
+    "occurredAt",
+    "correlationId",
+    "idempotencyKey"
+  ],
+  "properties": {
+    "contractVersion": {"const": "backtest.v1"},
+    "messageType": {
+      "enum": [
+        "BACKTEST_QUEUED",
+        "BACKTEST_RUNNING",
+        "BACKTEST_COMPLETED",
+        "BACKTEST_FAILED",
+        "BACKTEST_UNAVAILABLE"
+      ]
+    },
+    "messageId": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/uuid"},
+    "occurredAt": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/utcTimestamp"},
+    "correlationId": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/uuid"},
+    "idempotencyKey": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/sha256Prefixed"}
+  }
+}

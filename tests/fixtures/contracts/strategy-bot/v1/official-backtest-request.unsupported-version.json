@@ -1,0 +1,7 @@
+{
+  "metadata": {
+    "contractVersion": "strategy-bot.v999",
+    "messageType": "OFFICIAL_BACKTEST_REQUESTED"
+  },
+  "rejectionReason": "UNSUPPORTED_CONTRACT_VERSION"
+}

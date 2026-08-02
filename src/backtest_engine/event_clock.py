@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from enum import Enum
 from types import MappingProxyType
@@ -69,11 +69,21 @@ class OfficialTradingSession:
 
 @dataclass(frozen=True, slots=True)
 class OfficialSessionSchedule:
-    """Pinned official-calendar coverage and its regular sessions."""
+    """Pinned official-calendar coverage and its regular sessions.
+
+    Construction validates and indexes the sessions, so
+    :meth:`session_at` and :meth:`status_at` are stateless, side-effect-free
+    queries. :class:`MarketEventClock` is the *monotonic replay* view of the
+    same data; a component that only needs to know whether an instant is inside
+    a session must use these queries rather than advancing a shared clock.
+    """
 
     covered_from_et: date
     covered_through_et: date
     sessions: tuple[OfficialTradingSession, ...]
+    _by_date: Mapping[date, OfficialTradingSession] = field(
+        init=False, repr=False, compare=False, default_factory=dict
+    )
 
     def __post_init__(self) -> None:
         if self.covered_from_et > self.covered_through_et:
@@ -85,7 +95,57 @@ class OfficialSessionSchedule:
             raise EventClockValidationError(
                 "sessions must contain OfficialTradingSession values"
             )
-        object.__setattr__(self, "sessions", sessions)
+        ordered = tuple(sorted(sessions, key=lambda item: item.opens_at))
+        index: dict[date, OfficialTradingSession] = {}
+        previous: OfficialTradingSession | None = None
+        for session in ordered:
+            if session.trading_date_et in index:
+                raise EventClockValidationError(
+                    "official sessions must have unique trading_date_et values"
+                )
+            if not (
+                self.covered_from_et
+                <= session.trading_date_et
+                <= self.covered_through_et
+            ):
+                raise EventClockValidationError(
+                    "official session is outside calendar coverage"
+                )
+            if previous is not None and session.opens_at < previous.closes_at:
+                raise EventClockValidationError("official sessions must not overlap")
+            index[session.trading_date_et] = session
+            previous = session
+        object.__setattr__(self, "sessions", ordered)
+        object.__setattr__(self, "_by_date", MappingProxyType(index))
+
+    def covers(self, instant: datetime) -> bool:
+        market_date = _utc(instant, "instant").astimezone(ET).date()
+        return self.covered_from_et <= market_date <= self.covered_through_et
+
+    def session_at(self, instant: datetime) -> OfficialTradingSession | None:
+        """The official session of the ET date containing ``instant``.
+
+        ``None`` covers both "closed that day" and "outside coverage"; use
+        :meth:`status_at` when the two must be told apart.
+        """
+        assessed_at = _utc(instant, "instant")
+        return self._by_date.get(assessed_at.astimezone(ET).date())
+
+    def status_at(
+        self, instant: datetime
+    ) -> tuple[OfficialTradingSession | None, MarketSessionStatus]:
+        """Session and status at ``instant``, failing closed outside coverage."""
+        assessed_at = _utc(instant, "instant")
+        if not self.covers(assessed_at):
+            return None, MarketSessionStatus.CALENDAR_UNAVAILABLE
+        session = self.session_at(assessed_at)
+        if session is None:
+            return None, MarketSessionStatus.MARKET_CLOSED
+        if assessed_at < session.opens_at:
+            return session, MarketSessionStatus.PRE_MARKET
+        if assessed_at < session.closes_at:
+            return session, MarketSessionStatus.REGULAR_OPEN
+        return session, MarketSessionStatus.POST_MARKET
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,33 +199,8 @@ class MarketEventClock:
             raise EventClockValidationError(
                 "schedule must be an OfficialSessionSchedule"
             )
+        # OfficialSessionSchedule validated and indexed its own sessions.
         self._schedule = schedule
-        ordered_sessions = tuple(
-            sorted(schedule.sessions, key=lambda item: item.opens_at)
-        )
-        self._sessions_by_date: dict[date, OfficialTradingSession] = {}
-        previous: OfficialTradingSession | None = None
-        for session in ordered_sessions:
-            if not isinstance(session, OfficialTradingSession):
-                raise EventClockValidationError(
-                    "sessions must contain OfficialTradingSession values"
-                )
-            if session.trading_date_et in self._sessions_by_date:
-                raise EventClockValidationError(
-                    "official sessions must have unique trading_date_et values"
-                )
-            if not (
-                schedule.covered_from_et
-                <= session.trading_date_et
-                <= schedule.covered_through_et
-            ):
-                raise EventClockValidationError(
-                    "official session is outside calendar coverage"
-                )
-            if previous is not None and session.opens_at < previous.closes_at:
-                raise EventClockValidationError("official sessions must not overlap")
-            self._sessions_by_date[session.trading_date_et] = session
-            previous = session
 
         supplied_events = tuple(events)
         self._validate_events(supplied_events)
@@ -205,8 +240,7 @@ class MarketEventClock:
                 )
             official_order.add(order_key)
 
-            trading_date = event.occurred_at.astimezone(ET).date()
-            session = self._sessions_by_date.get(trading_date)
+            session = self._schedule.session_at(event.occurred_at)
             if session is None or not session.contains(event.occurred_at):
                 raise EventClockValidationError(
                     "event occurred_at is outside an official regular session"
@@ -228,7 +262,7 @@ class MarketEventClock:
             self._cursor += 1
         self._now = target
 
-        session, status = self._assess_session(target)
+        session, status = self._schedule.status_at(target)
         return MarketClockSnapshot(
             now=target,
             status=status,
@@ -242,21 +276,11 @@ class MarketEventClock:
             return None
         return self.advance_to(self._events[self._cursor].available_at)
 
-    def _assess_session(
-        self, assessed_at: datetime
-    ) -> tuple[OfficialTradingSession | None, MarketSessionStatus]:
-        market_date = assessed_at.astimezone(ET).date()
-        if not (
-            self._schedule.covered_from_et
-            <= market_date
-            <= self._schedule.covered_through_et
-        ):
-            return None, MarketSessionStatus.CALENDAR_UNAVAILABLE
-        session = self._sessions_by_date.get(market_date)
-        if session is None:
-            return None, MarketSessionStatus.MARKET_CLOSED
-        if assessed_at < session.opens_at:
-            return session, MarketSessionStatus.PRE_MARKET
-        if assessed_at < session.closes_at:
-            return session, MarketSessionStatus.REGULAR_OPEN
-        return session, MarketSessionStatus.POST_MARKET
+    @property
+    def schedule(self) -> OfficialSessionSchedule:
+        """The pinned schedule, for stateless session queries by other components."""
+        return self._schedule
+
+    @property
+    def pending_event_count(self) -> int:
+        return len(self._events) - self._cursor

@@ -197,13 +197,20 @@ class AvailabilityAssessment:
         )
 
     def unavailable_contract_fields(self) -> dict[str, object]:
+        """The ``BACKTEST_UNAVAILABLE`` detail fields of the published event.
+
+        camelCase, because spec 2.1 binds every D-published contract to B's
+        convention (``metadata`` envelope, camelCase, ``sha256:`` prefixes).
+        These keys are spread straight into
+        :func:`backtest_engine.contracts.build_backtest_result_event`.
+        """
         if self.status is not AvailabilityStatus.UNAVAILABLE:
             raise AvailabilityValidationError(
                 "contract fields require an UNAVAILABLE assessment"
             )
         return {
-            "reason_code": "REQUIRED_DATA_UNAVAILABLE",
-            "missing_requirements": sorted(
+            "reasonCode": "REQUIRED_DATA_UNAVAILABLE",
+            "missingRequirements": sorted(
                 item.contract_value for item in self.missing_requirements
             ),
         }

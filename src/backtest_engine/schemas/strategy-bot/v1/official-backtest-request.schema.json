@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.idea2strategy.io/strategy-bot/v1/official-backtest-request.schema.json",
+  "title": "strategy-bot.v1 OFFICIAL_BACKTEST_REQUESTED",
+  "description": "Consumed verbatim from B. Authoritative fixture: backend/modules/backend-messaging/src/main/resources/contracts/strategy-bot/v1/official-backtest-request.valid.json",
+  "type": "object",
+  "required": [
+    "metadata",
+    "botId",
+    "expectedSnapshotHash",
+    "compiledPlanChecksum",
+    "datasetManifestId",
+    "assumptionsVersion",
+    "requestReason"
+  ],
+  "properties": {
+    "metadata": {
+      "allOf": [
+        {"$ref": "https://contracts.idea2strategy.io/strategy-bot/v1/message-metadata.schema.json"},
+        {"properties": {"messageType": {"const": "OFFICIAL_BACKTEST_REQUESTED"}}}
+      ]
+    },
+    "botId": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/uuid"},
+    "expectedSnapshotHash": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/sha256Prefixed"},
+    "compiledPlanChecksum": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/sha256Prefixed"},
+    "datasetManifestId": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/uuid"},
+    "assumptionsVersion": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/nonEmptyString"},
+    "requestReason": {"const": "STRATEGY_RELEASE"}
+  }
+}

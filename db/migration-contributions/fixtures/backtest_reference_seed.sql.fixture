@@ -1,0 +1,121 @@
+-- Integration-test reference rows for the cross-domain foreign keys that
+-- `backtest.*` depends on. Test-only fixture data: never a seed, never a migration.
+--
+-- Fixed UUIDs so integration assertions can be literal.
+--   account   00000000-0000-4000-8000-0000000000a1
+--   bot       00000000-0000-4000-8000-0000000000b1
+--   fee       00000000-0000-4000-8000-0000000000f1
+--   buffer    00000000-0000-4000-8000-0000000000f2
+--   dataset   00000000-0000-4000-8000-0000000000d1
+--   feature   00000000-0000-4000-8000-0000000000e1
+--   object    00000000-0000-4000-8000-0000000000c1
+--   object2   00000000-0000-4000-8000-0000000000c2
+
+INSERT INTO identity.accounts (id, lifecycle_status, status_changed_at, created_at)
+VALUES ('00000000-0000-4000-8000-0000000000a1', 'ACTIVE',
+        '2026-01-01T00:00:00+00', '2026-01-01T00:00:00+00');
+
+INSERT INTO bot.bots (
+  id, owner_account_id, mode, name, lifecycle_status, lifecycle_changed_at,
+  created_at, execution_eligible_from, edit_sequence, updated_at)
+VALUES ('00000000-0000-4000-8000-0000000000b1', '00000000-0000-4000-8000-0000000000a1',
+        'BASIC', 'integration-fixture-bot', 'RUNNING', '2026-01-01T00:00:00+00',
+        '2026-01-01T00:00:00+00', '2026-01-01T00:00:00+00', 0, '2026-01-01T00:00:00+00');
+
+INSERT INTO trading.fee_policy_versions (
+  id, policy_code, version, fee_rate_bps, calculation_rules_version, rules_hash,
+  effective_from, published_at)
+VALUES ('00000000-0000-4000-8000-0000000000f1', 'OFFICIAL_FEE', '1.0.0', 20, '1.0.0',
+        'fee00000000000000000000000000000000000000000000000000000000000f1',
+        '2026-01-01T00:00:00+00', '2026-01-01T00:00:00+00');
+
+INSERT INTO trading.buying_power_buffer_policy_versions (
+  id, policy_code, version, buffer_bps, rounding_rules_version, rules_hash,
+  effective_from, published_at)
+VALUES ('00000000-0000-4000-8000-0000000000f2', 'OFFICIAL_BUFFER', '1.0.0', 50, '1.0.0',
+        'buf00000000000000000000000000000000000000000000000000000000000f2',
+        '2026-01-01T00:00:00+00', '2026-01-01T00:00:00+00');
+
+INSERT INTO market_data.providers (id, code, display_name, rights_version, status, created_at)
+VALUES ('00000000-0000-4000-8000-000000000091', 'FIXTURE', 'Fixture Provider', '1.0.0',
+        'ACTIVE', '2026-01-01T00:00:00+00');
+
+INSERT INTO market_data.feeds (
+  id, provider_id, code, data_kind, resolution, timezone_name, feed_version, created_at)
+VALUES ('00000000-0000-4000-8000-000000000092', '00000000-0000-4000-8000-000000000091',
+        'FIXTURE_BARS', 'BAR', 'PT1M', 'America/New_York', '1.0.0', '2026-01-01T00:00:00+00');
+
+INSERT INTO market_data.instruments (
+  id, asset_type, primary_exchange_mic, currency_code, created_at)
+VALUES ('00000000-0000-4000-8000-000000000093', 'STOCK', 'XNYS', 'USD', '2026-01-01T00:00:00+00');
+
+INSERT INTO market_data.dataset_manifests (
+  id, feed_id, instrument_id, data_layer, resolution, revision_number, status,
+  period_start, period_end, schema_version, dataset_hash, created_at, available_at)
+VALUES ('00000000-0000-4000-8000-0000000000d1', '00000000-0000-4000-8000-000000000092',
+        '00000000-0000-4000-8000-000000000093', 'VALIDATED', 'PT1M', 1, 'AVAILABLE',
+        '2024-01-01T00:00:00+00', '2024-12-31T00:00:00+00', '1.0.0',
+        'ds000000000000000000000000000000000000000000000000000000000000d1',
+        '2026-01-01T00:00:00+00', '2026-01-01T00:00:00+00');
+
+INSERT INTO strategy.element_catalog_versions (
+  id, language_version, schema_version, catalog_version, data_requirement_version,
+  definition_hash, published_at)
+VALUES ('00000000-0000-4000-8000-000000000094', '1.0.0', '1.0.0', '1.0.0', '1.0.0',
+        'ec000000000000000000000000000000000000000000000000000000000000094',
+        '2026-01-01T00:00:00+00');
+
+INSERT INTO market_data.feature_definitions (
+  id, element_catalog_version_id, feature_code, calculator_version, resolution,
+  normalized_parameters, output_value_type, required_history_points, definition_hash, created_at)
+VALUES ('00000000-0000-4000-8000-000000000095', '00000000-0000-4000-8000-000000000094',
+        'RSI', '1.0.0', 'PT1M', '{"period":14}', 'DECIMAL', 14,
+        'fd000000000000000000000000000000000000000000000000000000000000095',
+        '2026-01-01T00:00:00+00');
+
+INSERT INTO market_data.pipeline_runs (
+  id, pipeline_code, pipeline_version, idempotency_key, status, input_hash, output_hash,
+  started_at, completed_at)
+VALUES ('00000000-0000-4000-8000-000000000096', 'FEATURE_MATERIALIZE', '1.0.0',
+        'FIXTURE:FEATURE:1', 'SUCCEEDED',
+        'in000000000000000000000000000000000000000000000000000000000000096',
+        'ou000000000000000000000000000000000000000000000000000000000000096',
+        '2026-01-01T00:00:00+00', '2026-01-01T00:10:00+00');
+
+INSERT INTO market_data.feature_materializations (
+  id, feature_definition_id, instrument_id, pipeline_run_id, input_dataset_set_hash,
+  period_start, period_end, source_watermark, output_dataset_manifest_id, result_hash,
+  status, available_at, created_at)
+VALUES ('00000000-0000-4000-8000-0000000000e1', '00000000-0000-4000-8000-000000000095',
+        '00000000-0000-4000-8000-000000000093', '00000000-0000-4000-8000-000000000096',
+        'is0000000000000000000000000000000000000000000000000000000000000e1',
+        '2024-01-01T00:00:00+00', '2024-12-31T00:00:00+00', 'watermark-1',
+        '00000000-0000-4000-8000-0000000000d1',
+        'rh0000000000000000000000000000000000000000000000000000000000000e1',
+        'SUCCEEDED', '2026-01-01T00:10:00+00', '2026-01-01T00:00:00+00');
+
+INSERT INTO storage.objects (
+  id, status, storage_provider, bucket_name, object_key, provider_version_id,
+  content_hash, byte_size, file_format, compression_codec, media_type, schema_version,
+  row_count, period_start, period_end, retention_policy_version, legal_hold,
+  created_at, verified_at)
+VALUES ('00000000-0000-4000-8000-0000000000c1', 'AVAILABLE', 'local', 'i2s-backtest-fixture',
+        'backtest-results/00000000-0000-4000-8000-000000000001/ORDER_DECISIONS/week_start=2024-03-04/part=0001/'
+        || 'ob000000000000000000000000000000000000000000000000000000000000c1.parquet',
+        'v1', 'ob000000000000000000000000000000000000000000000000000000000000c1', 4096,
+        'PARQUET', 'UNCOMPRESSED', 'application/vnd.apache.parquet', '1.0.0', 128,
+        '2024-03-04T14:30:00+00', '2024-03-08T21:00:00+00', '1.0.0', false,
+        '2026-01-01T00:00:00+00', '2026-01-01T00:00:00+00');
+
+INSERT INTO storage.objects (
+  id, status, storage_provider, bucket_name, object_key, provider_version_id,
+  content_hash, byte_size, file_format, compression_codec, media_type, schema_version,
+  row_count, period_start, period_end, retention_policy_version, legal_hold,
+  created_at, verified_at)
+VALUES ('00000000-0000-4000-8000-0000000000c2', 'STAGED', 'local', 'i2s-backtest-fixture',
+        'backtest-results/00000000-0000-4000-8000-000000000001/TRADE_DETAILS/week_start=2024-03-04/part=0001/'
+        || 'ob000000000000000000000000000000000000000000000000000000000000c2.parquet',
+        'v1', 'ob000000000000000000000000000000000000000000000000000000000000c2', 2048,
+        'PARQUET', 'UNCOMPRESSED', 'application/vnd.apache.parquet', '1.0.0', 64,
+        '2024-03-04T14:30:00+00', '2024-03-08T21:00:00+00', '1.0.0', false,
+        '2026-01-01T00:00:00+00', NULL);

@@ -4,7 +4,7 @@ from datetime import datetime
 
 import pytest
 
-from backtest_engine.contracts import validate_backtest_result
+from backtest_engine.contracts import build_backtest_result_event
 from backtest_engine.data_availability import (
     AvailabilityStatus,
     AvailabilityValidationError,
@@ -262,7 +262,13 @@ def test_one_instrument_gap_does_not_end_the_run_when_common_time_remains() -> N
     )
 
 
-def test_unavailable_contract_fields_are_stable_sorted_and_d16_compatible() -> None:
+def test_unavailable_contract_fields_are_sorted_and_publish_as_backtest_v1() -> None:
+    """The fields must drop straight into the published ``backtest.v1`` event.
+
+    Not a shape assertion in isolation: the real contract builder validates the
+    assembled document against the JSON Schema, so a snake_case regression or a
+    renamed field fails here rather than at the message broker.
+    """
     requirements = [
         _requirement("z-missing"),
         _requirement("a-missing", instrument_id=OTHER_INSTRUMENT),
@@ -272,27 +278,29 @@ def test_unavailable_contract_fields_are_stable_sorted_and_d16_compatible() -> N
     fields = assessment.unavailable_contract_fields()
 
     assert fields == {
-        "reason_code": "REQUIRED_DATA_UNAVAILABLE",
-        "missing_requirements": [
+        "reasonCode": "REQUIRED_DATA_UNAVAILABLE",
+        "missingRequirements": [
             "a-missing:OBSERVATION_MISSING",
             "z-missing:OBSERVATION_MISSING",
         ],
     }
-    validate_backtest_result(
-        {
-            "contract_id": "com06.backtest-result",
-            "schema_version": 1,
-            "message_id": "00000000-0000-4000-8000-000000000701",
-            "occurred_at": "2025-11-28T14:30:00Z",
-            "correlation_id": "00000000-0000-4000-8000-000000000702",
-            "idempotency_key": "d24-unavailable-result",
-            "event_type": "BACKTEST_UNAVAILABLE",
-            "backtest_run_id": "00000000-0000-4000-8000-000000000703",
-            "status": "UNAVAILABLE",
-            "decided_at": "2025-11-28T14:30:00Z",
-            **fields,
-        }
+    event = build_backtest_result_event(
+        status="UNAVAILABLE",
+        backtest_run_id="00000000-0000-4000-8000-000000000703",
+        bot_id="00000000-0000-4000-8000-000000000704",
+        owner_account_id="00000000-0000-4000-8000-000000000705",
+        expected_snapshot_hash="sha256:" + "a" * 64,
+        input_bundle_fingerprint="sha256:" + "b" * 64,
+        execution_policy_version="official-backtest-policy-v1",
+        message_id="00000000-0000-4000-8000-000000000701",
+        occurred_at="2025-11-28T14:30:00Z",
+        correlation_id="00000000-0000-4000-8000-000000000702",
+        decidedAt="2025-11-28T14:30:00Z",
+        **fields,
     )
+
+    assert event["metadata"]["messageType"] == "BACKTEST_UNAVAILABLE"
+    assert event["missingRequirements"] == fields["missingRequirements"]
 
 
 def test_assessment_is_independent_of_requirement_observation_and_interval_order() -> None:

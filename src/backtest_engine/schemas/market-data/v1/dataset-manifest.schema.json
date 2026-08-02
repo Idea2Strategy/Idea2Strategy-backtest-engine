@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.idea2strategy.io/market-data/v1/dataset-manifest.schema.json",
+  "title": "market-data.v1 dataset-manifest",
+  "description": "Consumed from the data-pipeline repository, which owns this contract (spec 2.1). data-pipeline currently publishes a fixture but no JSON Schema, so this consumer-side validator describes the shape the producer actually emits and is held to it by the byte-identity drift check in tests/test_market_data_reader.py. The producer still declares the legacy `com06.dataset-manifest` contract_id token; retiring that token is a producer-side change and must not be faked here. This file is the ONLY dataset-manifest schema in this repository, and this repository keeps no copy of the producer's fixture.",
+  "type": "object",
+  "required": [
+    "contract_id",
+    "schema_version",
+    "manifest_id",
+    "dataset_id",
+    "revision",
+    "status",
+    "dataset_hash",
+    "schema_id",
+    "period_start",
+    "period_end",
+    "available_at",
+    "objects"
+  ],
+  "properties": {
+    "contract_id": {"const": "com06.dataset-manifest"},
+    "schema_version": {"const": 1},
+    "manifest_id": {"$ref": "#/$defs/uuid"},
+    "dataset_id": {"$ref": "#/$defs/uuid"},
+    "revision": {"type": "integer", "minimum": 1},
+    "status": {"enum": ["STAGED", "AVAILABLE", "QUARANTINED", "SUPERSEDED", "DELETED"]},
+    "dataset_hash": {"$ref": "#/$defs/sha256Hex"},
+    "schema_id": {"$ref": "#/$defs/text"},
+    "period_start": {"$ref": "#/$defs/timestamp"},
+    "period_end": {"$ref": "#/$defs/timestamp"},
+    "available_at": {"$ref": "#/$defs/timestamp"},
+    "objects": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/object"}
+    }
+  },
+  "$defs": {
+    "text": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/nonEmptyString"},
+    "sha256Hex": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/sha256Hex"},
+    "uuid": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/uuid"},
+    "timestamp": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/utcTimestamp"},
+    "object": {
+      "type": "object",
+      "description": "Every field the canonical dataset hash covers is required; a manifest that omits one would hash as null and silently agree with a different object.",
+      "required": [
+        "storage_object_id",
+        "object_key",
+        "content_hash",
+        "object_kind",
+        "partition_granularity",
+        "partition_start",
+        "partition_end",
+        "period_start",
+        "period_end",
+        "shard_key",
+        "part_number",
+        "row_count",
+        "schema_version"
+      ],
+      "properties": {
+        "storage_object_id": {"$ref": "#/$defs/uuid"},
+        "object_key": {"$ref": "#/$defs/text"},
+        "content_hash": {"$ref": "#/$defs/sha256Hex"},
+        "object_kind": {"const": "PARQUET"},
+        "partition_granularity": {"enum": ["DAY", "WEEK", "MONTH"]},
+        "partition_start": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+        "partition_end": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+        "period_start": {"$ref": "#/$defs/timestamp"},
+        "period_end": {"$ref": "#/$defs/timestamp"},
+        "shard_key": {"$ref": "#/$defs/text"},
+        "part_number": {"type": "integer", "minimum": 1},
+        "row_count": {"type": "integer", "minimum": 0},
+        "schema_version": {"$ref": "#/$defs/text"}
+      }
+    }
+  }
+}

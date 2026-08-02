@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.idea2strategy.io/strategy-bot/v1/basic-compiled-plan.schema.json",
+  "title": "strategy-bot.v1 basic-compiled-plan",
+  "description": "Consumed verbatim from B. Authoritative fixture: backend/modules/backend-messaging/src/main/resources/contracts/strategy-bot/v1/basic-compiled-plan.valid.json",
+  "type": "object",
+  "required": [
+    "contractVersion",
+    "schemaVersion",
+    "elementCatalogVersion",
+    "instrumentCatalogVersion",
+    "compilerVersion",
+    "requiredFeatureSetHash",
+    "requiredFeatures",
+    "executionSnapshot",
+    "steps",
+    "planChecksum"
+  ],
+  "properties": {
+    "contractVersion": {"const": "strategy-bot.v1"},
+    "schemaVersion": {"const": "basic-compiled-plan.v1"},
+    "elementCatalogVersion": {"$ref": "#/$defs/text"},
+    "instrumentCatalogVersion": {"$ref": "#/$defs/text"},
+    "compilerVersion": {"$ref": "#/$defs/text"},
+    "requiredFeatureSetHash": {"$ref": "#/$defs/sha256"},
+    "requiredFeatures": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/requiredFeature"}
+    },
+    "executionSnapshot": {"$ref": "#/$defs/executionSnapshot"},
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/planStep"}
+    },
+    "planChecksum": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "text": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/nonEmptyString"},
+    "sha256": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/sha256Prefixed"},
+    "uuid": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/uuid"},
+    "requiredFeature": {
+      "type": "object",
+      "description": "Every field enters the plan checksum, so all of them are required; B normalises `instruments` (sorted, unique, non-empty) before hashing.",
+      "required": [
+        "requirementId",
+        "featureId",
+        "featureVersion",
+        "instruments",
+        "resolution",
+        "requiredObservations"
+      ],
+      "properties": {
+        "requirementId": {"$ref": "#/$defs/text"},
+        "featureId": {"$ref": "#/$defs/uuid"},
+        "featureVersion": {
+          "type": "string",
+          "description": "Exact major.minor.patch; B rejects a range.",
+          "pattern": "^[0-9]+[.][0-9]+[.][0-9]+$"
+        },
+        "instruments": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/uuid"}
+        },
+        "resolution": {
+          "type": "string",
+          "description": "ISO-8601 duration, normalised by B (for example PT1M).",
+          "pattern": "^P(?=[0-9T])([0-9]+D)?(T([0-9]+H)?([0-9]+M)?([0-9]+S)?)?$"
+        },
+        "requiredObservations": {"type": "integer", "minimum": 1}
+      }
+    },
+    "immutableStrategyVersion": {
+      "type": "object",
+      "required": ["snapshotSchemaVersion", "semanticHash", "snapshotHash"],
+      "properties": {
+        "snapshotSchemaVersion": {"const": "basic-launch-snapshot.v1"},
+        "semanticHash": {"$ref": "#/$defs/sha256"},
+        "snapshotHash": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "flow": {
+      "type": "object",
+      "required": ["key", "officialInstrumentIds"],
+      "properties": {
+        "key": {"$ref": "#/$defs/text"},
+        "officialInstrumentIds": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/uuid"}
+        }
+      }
+    },
+    "partition": {
+      "type": "object",
+      "required": ["key", "budgetCapBps", "flows"],
+      "properties": {
+        "key": {"$ref": "#/$defs/text"},
+        "budgetCapBps": {"type": "integer", "minimum": 1, "maximum": 10000},
+        "flows": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/flow"}
+        }
+      }
+    },
+    "executionSnapshot": {
+      "type": "object",
+      "required": [
+        "immutableStrategyVersion",
+        "mode",
+        "initialCashAmount",
+        "currency",
+        "partitions"
+      ],
+      "properties": {
+        "immutableStrategyVersion": {"$ref": "#/$defs/immutableStrategyVersion"},
+        "mode": {"const": "BASIC"},
+        "initialCashAmount": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/moneyAmount"},
+        "currency": {"const": "USD"},
+        "partitions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/partition"}
+        }
+      }
+    },
+    "planStep": {
+      "type": "object",
+      "required": ["sequence", "operation", "arguments"],
+      "properties": {
+        "sequence": {"type": "integer", "minimum": 1},
+        "operation": {
+          "enum": ["LOAD_FEATURE", "COMPARE", "EMIT_ORDER_CANDIDATE"]
+        },
+        "arguments": {
+          "type": "object",
+          "additionalProperties": {"type": "string"}
+        }
+      }
+    }
+  }
+}
