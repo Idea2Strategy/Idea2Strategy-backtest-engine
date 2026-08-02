@@ -1,0 +1,21 @@
+# Byte-preserving paths.
+#
+# `core.autocrlf=true` is common on Windows checkouts, which rewrites LF to CRLF
+# on the way out of the object store. For ordinary source that is harmless. For a
+# file whose *bytes* are compared or hashed it is not: the comparison fails on a
+# checkout setting and reads as a contract or corruption fault.
+#
+# The superproject already carries this rule for its assembled Flyway bundle
+# ("Preserve assembler-produced CI migration bytes so manifest hashes are
+# portable"). These are the same class of file in this repository.
+
+# B owns strategy-bot.v1. These are byte-identical copies of B's authoritative
+# fixtures and test_basic_runtime.py asserts that byte-for-byte against the
+# backend repository. That guard is what caught B's 904a1f6 contract change;
+# a line-ending rewrite on either side would turn it into a false alarm.
+tests/fixtures/contracts/** -text
+
+# CI gate 8 runs `sha256sum -c` over this directory against the recorded digests,
+# and tests/conftest.py applies these exact bytes to the PostgreSQL container.
+db/migration-contributions/fixtures/central-migration/* -text
+db/migration-contributions/fixtures/*.sha256 -text

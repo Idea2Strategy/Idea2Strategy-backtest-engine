@@ -6,18 +6,39 @@ build-backend = "hatchling.build"
 name = "idea2strategy-backtest-engine"
 version = "0.1.0"
 description = "Reproducible server-side backtest API and worker for Idea2Strategy."
-requires-python = "==3.12.*"
+requires-python = ">=3.12,<3.13"
 dependencies = [
-  "fastapi==0.139.2",
+  "boto3>=1.40,<2.0",
+  "fastapi==0.141.1",
+  "jsonschema>=4.23,<5.0",
+  # Runtime, not test-only: `attempt_coordinator.ProcessResourceMonitor` samples CPU and
+  # memory through psutil to enforce the D29 compute limits. While this sat in the `test`
+  # extra a real deployment could not enforce a limit at all.
+  "psutil==7.2.2",
+  "psycopg[binary]>=3.2,<4.0",
   "pyarrow==25.0.0",
+  "sqlalchemy>=2.0,<3.0",
   "tzdata==2026.3",
-  "uvicorn==0.52.0",
+  "uvicorn==0.52.1",
 ]
 
 [project.optional-dependencies]
+# `httpx` (not the non-existent `httpx2`) is what starlette.testclient imports.
 test = [
-  "httpx2==2.9.1",
+  "freezegun==1.5.5",
+  "httpx==0.28.1",
+  "psutil==7.2.2",
   "pytest==9.1.1",
+  "pytest-cov==7.1.0",
+  "testcontainers[postgres]==4.15.0",
+]
+dev = [
+  "idea2strategy-backtest-engine[test]",
+  "mypy==2.3.0",
+  "ruff==0.16.1",
+  # Stubs, not runtime dependencies: without these mypy reports the import itself
+  # as an error and the module's real type errors stay hidden behind it.
+  "types-jsonschema==4.26.0.20260518",
 ]
 
 [project.scripts]
@@ -28,6 +49,134 @@ backtest-worker = "backtest_engine.worker:run"
 packages = ["src/backtest_engine"]
 
 [tool.pytest.ini_options]
-addopts = "-q"
+# The default run is the fast, Docker-free unit suite. `-m docker` on the command
+# line overrides this marker expression and selects the Testcontainers suite.
+addopts = "-q -m 'not docker'"
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+  "docker: integration test requiring a running Docker daemon (Testcontainers PostgreSQL 16).",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["backtest_engine"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "B",    # flake8-bugbear
+  "C4",   # flake8-comprehensions
+  "E",    # pycodestyle errors
+  "F",    # pyflakes
+  "I",    # isort
+  "PIE",  # flake8-pie
+  "PTH",  # flake8-use-pathlib
+  "RET",  # flake8-return
+  "RUF",  # ruff-specific
+  "SIM",  # flake8-simplify
+  "TID",  # flake8-tidy-imports
+  "UP",   # pyupgrade
+  "W",    # pycodestyle warnings
+]
+ignore = [
+  # `timezone.utc` is the spelling used consistently across both D repositories and
+  # the sibling data-pipeline. UP017 would rewrite 29 lines in modules owned by other
+  # rebuild cards purely for an alias.
+  "UP017",
+  # `class X(str, Enum)` is load-bearing here: several of these enums are serialised
+  # into reproducibility hashes and `StrEnum` changes `__str__`/`__format__` behaviour.
+  # Migrating them is a behaviour change that belongs to the card that owns the module.
+  "UP042",
+  # Class-level tuples/frozensets used as immutable lookup tables are intentional and
+  # are never mutated; `ClassVar` annotations would add noise without adding safety.
+  "RUF012",
+  # `pytest.raises(match=...)` patterns in the existing suite use plain prose; making
+  # every one of them an anchored regex is a test-cleanup task (BT7), not a lint gate.
+  "RUF043",
+  # An assignment immediately before `return` is frequently the clearest way to name an
+  # intermediate value in the SQL-building code below.
+  "RET504",
+  # SIM300 reads `assert MONEY_QUANTUM == Decimal("0.00000001")` as a Yoda condition and
+  # proposes flipping it to `Decimal(...) == MONEY_QUANTUM`, which is the actual Yoda
+  # form. The rule's heuristic misfires on SCREAMING_CASE constants, which this codebase
+  # uses heavily for pinned canonical values.
+  "SIM300",
+]
+
+[tool.ruff.lint.isort]
+lines-after-imports = 2
+known-first-party = ["backtest_engine", "d_market_data_testkit", "d_reproducibility_testkit"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "parents"
+
+[tool.ruff.lint.per-file-ignores]
+# Pre-existing violations in modules that belong to other rebuild cards (BT1/BT4/BT6).
+# These are scoped to one file and one rule each so a fix removes the entry; they are
+# not repository-wide suppressions. Every entry is reported back for the owning card.
+"src/backtest_engine/__init__.py" = ["I001", "RUF022"]
+"src/backtest_engine/execution_model.py" = ["I001", "B905"]
+"src/backtest_engine/result_query.py" = ["SIM102"]
+"tests/test_monthly_judgment.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src/backtest_engine", "tests/conftest.py", "tests/persistence"]
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = ["src", "tests"]
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unused_configs = true
+warn_no_return = true
+strict_equality = true
+# The pre-canonical test modules are rewritten wholesale in BT7; typing them now would
+# be churn. `tests/persistence` and `tests/conftest.py` are checked above.
+
+[[tool.mypy.overrides]]
+# The persistence layer is new code and is held to full strictness.
+module = ["backtest_engine.persistence.*", "conftest", "persistence.*"]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_calls = true
+disallow_any_generics = true
+warn_return_any = true
+no_implicit_reexport = true
+
+[[tool.mypy.overrides]]
+# Legacy modules that no rebuild card currently owns. Each entry disables exactly the
+# error code that module still trips, so the suppression cannot hide a new class of
+# defect, and each is reported back as an open item.
+module = ["backtest_engine.market_data"]
+disable_error_code = ["union-attr"]
+
+[[tool.mypy.overrides]]
+module = ["backtest_engine.result_snapshot"]
+disable_error_code = ["arg-type"]
+
+[[tool.mypy.overrides]]
+module = ["backtest_engine.detail_object_manifest"]
+disable_error_code = ["attr-defined"]
+
+[[tool.mypy.overrides]]
+# Third-party packages that ship no type information. Not a suppression of our own
+# errors: mypy simply has nothing to check these imports against.
+module = ["boto3.*", "docker.*", "pyarrow.*", "testcontainers.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# In-flight modules owned by BT1 (contracts/lifecycle rewrite). Each entry names the
+# single error code that module currently trips; delete the entry when BT1 lands.
+module = ["backtest_engine.contracts"]
+disable_error_code = ["union-attr"]
+
+[[tool.mypy.overrides]]
+module = ["backtest_engine.lifecycle"]
+disable_error_code = ["assignment"]
