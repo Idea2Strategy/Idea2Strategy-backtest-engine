@@ -362,10 +362,7 @@ class RunInputPinRepository(_Repository):
 
     def pin(self, row: RunInputPinRow) -> tuple[RunInputPinRow, bool]:
         statement = (
-            pg_insert(run_input_pins)
-            .values(**row_to_params(row))
-            .on_conflict_do_nothing()
-            .returning(*run_input_pins.c)
+            pg_insert(run_input_pins).values(**row_to_params(row)).on_conflict_do_nothing().returning(*run_input_pins.c)
         )
         inserted = _first(self._connection.execute(statement).all())
         if inserted is not None:

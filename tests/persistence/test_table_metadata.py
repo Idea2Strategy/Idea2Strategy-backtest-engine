@@ -41,9 +41,7 @@ from backtest_engine.persistence.tables import (
 
 CONTRIBUTION_ROOT = Path(__file__).resolve().parents[2] / "db" / "migration-contributions"
 
-CENTRAL_BASELINE = (
-    CONTRIBUTION_ROOT / "fixtures" / "central-migration" / "V1__initial_schema.sql.fixture"
-)
+CENTRAL_BASELINE = CONTRIBUTION_ROOT / "fixtures" / "central-migration" / "V1__initial_schema.sql.fixture"
 
 CONTRIBUTED_MIGRATIONS = CONTRIBUTION_ROOT / "migrations"
 
@@ -176,10 +174,7 @@ def canonical_sql() -> str:
     """
 
     sources = [CENTRAL_BASELINE.read_text(encoding="utf-8")]
-    sources.extend(
-        path.read_text(encoding="utf-8")
-        for path in sorted(CONTRIBUTED_MIGRATIONS.glob("V*.sql"))
-    )
+    sources.extend(path.read_text(encoding="utf-8") for path in sorted(CONTRIBUTED_MIGRATIONS.glob("V*.sql")))
     return "\n\n".join(sources)
 
 
@@ -210,10 +205,7 @@ def test_the_contributed_migration_is_the_only_new_backtest_table() -> None:
     """A contributed migration may add tables; it may never redefine an applied one."""
 
     contributed = _parse_baseline(
-        "\n\n".join(
-            path.read_text(encoding="utf-8")
-            for path in sorted(CONTRIBUTED_MIGRATIONS.glob("V*.sql"))
-        )
+        "\n\n".join(path.read_text(encoding="utf-8") for path in sorted(CONTRIBUTED_MIGRATIONS.glob("V*.sql")))
     )
     applied = _parse_baseline(CENTRAL_BASELINE.read_text(encoding="utf-8"))
 

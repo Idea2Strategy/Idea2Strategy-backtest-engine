@@ -128,9 +128,7 @@ def _fill(
         instrument_id=INSTRUMENT_ID,
         order_status=OrderStatus.FILLED,
         cash_after=Decimal(cash_after),
-        positions_after=(
-            PositionAfter(INSTRUMENT_ID, Decimal(quantity_after), Decimal(cost_basis_after)),
-        ),
+        positions_after=(PositionAfter(INSTRUMENT_ID, Decimal(quantity_after), Decimal(cost_basis_after)),),
         fill_id=fill_id,
         quantity=Decimal("1"),
         base_price=Decimal("100"),
@@ -216,9 +214,7 @@ class Published:
         manifest = self.result.manifest
         instants = [record.occurred_at for record in self.result.records]
         StorageObjectRegistrar(self.store, port).publish(
-            object_id=uuid.uuid5(
-                RESULT_OBJECT_NAMESPACE, f"{manifest.run_snapshot_id}|{manifest.content_hash}"
-            ),
+            object_id=uuid.uuid5(RESULT_OBJECT_NAMESPACE, f"{manifest.run_snapshot_id}|{manifest.content_hash}"),
             object_key=manifest.object_key,
             data=self.result.object_bytes,
             schema_version=str(manifest.schema_version),
@@ -295,9 +291,7 @@ def store(tmp_path: Path) -> LocalObjectStore:
 
 
 @pytest.fixture
-def service(
-    persistence: BacktestPersistence, store: LocalObjectStore
-) -> BacktestResultQueryService:
+def service(persistence: BacktestPersistence, store: LocalObjectStore) -> BacktestResultQueryService:
     return build_result_query_service(persistence, store)
 
 
@@ -366,13 +360,9 @@ def test_the_et_week_part_is_split_into_its_two_et_months_on_read(
     assert october[0].price == Decimal("100.05000000")
     assert october[0].fee == Decimal("2.20000000")
     assert october[0].cash_after == Decimal("99897.75000000")
-    assert october[0].positions_after == (
-        PositionAfter(INSTRUMENT_ID, Decimal("1"), Decimal("100.05")),
-    )
+    assert october[0].positions_after == (PositionAfter(INSTRUMENT_ID, Decimal("1"), Decimal("100.05")),)
     assert november[0].cash_after == Decimal("99795.50000000")
-    assert november[0].positions_after == (
-        PositionAfter(INSTRUMENT_ID, Decimal("2"), Decimal("200.10")),
-    )
+    assert november[0].positions_after == (PositionAfter(INSTRUMENT_ID, Decimal("2"), Decimal("200.10")),)
     assert service.monthly_trades(owner, run_id, EtMonth(2025, 12)) == ()
 
 
@@ -392,15 +382,11 @@ def test_listing_is_owner_scoped_newest_first_and_filtered_before_paging(
     # empty page rather than by refusing.
     assert service.list_runs(str(OTHER_ACCOUNT_ID)) == ()
     # The bot filter runs in SQL, before LIMIT: a page of one still respects it.
-    assert [
-        item.run_id for item in service.list_runs(str(ACCOUNT_ID), bot_id=str(BOT_ID), limit=1)
-    ] == [str(newer.run_id)]
-    assert (
-        service.list_runs(str(ACCOUNT_ID), bot_id="00000000-0000-4000-8000-0000000000bf") == ()
-    )
-    assert [
-        item.run_id for item in service.list_runs(str(ACCOUNT_ID), limit=1, offset=1)
-    ] == [str(older.run_id)]
+    assert [item.run_id for item in service.list_runs(str(ACCOUNT_ID), bot_id=str(BOT_ID), limit=1)] == [
+        str(newer.run_id)
+    ]
+    assert service.list_runs(str(ACCOUNT_ID), bot_id="00000000-0000-4000-8000-0000000000bf") == ()
+    assert [item.run_id for item in service.list_runs(str(ACCOUNT_ID), limit=1, offset=1)] == [str(older.run_id)]
 
 
 # ---------------------------------------------------------------------------
@@ -451,9 +437,7 @@ def test_an_unavailable_run_reports_its_reason_from_runs_failure_code(
     run = Published(persistence, store)
     run.accept()
     with persistence.unit_of_work() as uow:
-        uow.runs.mark_unavailable(
-            run.run_id, datetime(2025, 11, 1, 0, 0, tzinfo=UTC), "REQUIRED_DATA_UNAVAILABLE"
-        )
+        uow.runs.mark_unavailable(run.run_id, datetime(2025, 11, 1, 0, 0, tzinfo=UTC), "REQUIRED_DATA_UNAVAILABLE")
 
     overview = service.overview(str(ACCOUNT_ID), str(run.run_id))
 
@@ -479,9 +463,7 @@ def test_a_detail_object_that_disappeared_from_the_store_is_an_error_not_an_empt
     service: BacktestResultQueryService, published: Published, store: LocalObjectStore
 ) -> None:
     trade = next(
-        item
-        for item in published.details.objects
-        if item.descriptor.record_type is DetailObjectKind.TRADE_DETAIL
+        item for item in published.details.objects if item.descriptor.record_type is DetailObjectKind.TRADE_DETAIL
     )
     removed = store.path_for(trade.descriptor.object_key)
     assert removed.is_file(), removed
@@ -497,9 +479,7 @@ def test_a_detail_object_whose_bytes_were_rewritten_is_an_error(
     """`storage.objects.content_hash` is the arbiter, not the file on disk."""
 
     trade = next(
-        item
-        for item in published.details.objects
-        if item.descriptor.record_type is DetailObjectKind.TRADE_DETAIL
+        item for item in published.details.objects if item.descriptor.record_type is DetailObjectKind.TRADE_DETAIL
     )
     rewritten = trade.parquet_bytes[:-8] + b"tampered"
     assert len(rewritten) == len(trade.parquet_bytes), "same length, so only the hash catches it"
