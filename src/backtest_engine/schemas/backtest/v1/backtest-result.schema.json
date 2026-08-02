@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.idea2strategy.io/backtest/v1/backtest-result.schema.json",
+  "title": "backtest.v1 result event",
+  "description": "Published by D (backtest-engine) for every backtest.run_status value in db/schema.dbml: QUEUED, RUNNING, COMPLETED, FAILED, UNAVAILABLE.",
+  "type": "object",
+  "required": [
+    "metadata",
+    "backtestRunId",
+    "botId",
+    "ownerAccountId",
+    "expectedSnapshotHash",
+    "inputBundleFingerprint",
+    "executionPolicyVersion",
+    "precisionRulesVersion",
+    "status"
+  ],
+  "properties": {
+    "metadata": {"$ref": "https://contracts.idea2strategy.io/backtest/v1/message-metadata.schema.json"},
+    "backtestRunId": {"$ref": "#/$defs/uuid"},
+    "botId": {"$ref": "#/$defs/uuid"},
+    "ownerAccountId": {"$ref": "#/$defs/uuid"},
+    "expectedSnapshotHash": {"$ref": "#/$defs/sha256"},
+    "inputBundleFingerprint": {"$ref": "#/$defs/sha256"},
+    "executionPolicyVersion": {"$ref": "#/$defs/text"},
+    "precisionRulesVersion": {"$ref": "#/$defs/text"},
+    "status": {
+      "enum": ["QUEUED", "RUNNING", "COMPLETED", "FAILED", "UNAVAILABLE"]
+    },
+    "queuedAt": {"$ref": "#/$defs/timestamp"},
+    "startedAt": {"$ref": "#/$defs/timestamp"},
+    "completedAt": {"$ref": "#/$defs/timestamp"},
+    "failedAt": {"$ref": "#/$defs/timestamp"},
+    "decidedAt": {"$ref": "#/$defs/timestamp"},
+    "attempt": {"type": "integer", "minimum": 1},
+    "resultManifestId": {"$ref": "#/$defs/uuid"},
+    "resultHash": {"$ref": "#/$defs/sha256"},
+    "failureCode": {"$ref": "#/$defs/text"},
+    "retryable": {"type": "boolean"},
+    "reasonCode": {"$ref": "#/$defs/text"},
+    "missingRequirements": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/text"}
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "QUEUED"}}, "required": ["status"]},
+      "then": {
+        "required": ["queuedAt"],
+        "properties": {
+          "metadata": {"properties": {"messageType": {"const": "BACKTEST_QUEUED"}}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "RUNNING"}}, "required": ["status"]},
+      "then": {
+        "required": ["startedAt", "attempt"],
+        "properties": {
+          "metadata": {"properties": {"messageType": {"const": "BACKTEST_RUNNING"}}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "COMPLETED"}}, "required": ["status"]},
+      "then": {
+        "required": ["completedAt", "attempt", "resultManifestId", "resultHash"],
+        "properties": {
+          "metadata": {"properties": {"messageType": {"const": "BACKTEST_COMPLETED"}}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "FAILED"}}, "required": ["status"]},
+      "then": {
+        "required": ["failedAt", "attempt", "failureCode", "retryable"],
+        "properties": {
+          "metadata": {"properties": {"messageType": {"const": "BACKTEST_FAILED"}}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "UNAVAILABLE"}}, "required": ["status"]},
+      "then": {
+        "required": ["decidedAt", "reasonCode", "missingRequirements"],
+        "properties": {
+          "metadata": {"properties": {"messageType": {"const": "BACKTEST_UNAVAILABLE"}}}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "text": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/nonEmptyString"},
+    "sha256": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/sha256Prefixed"},
+    "uuid": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/uuid"},
+    "timestamp": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/utcTimestamp"}
+  }
+}
