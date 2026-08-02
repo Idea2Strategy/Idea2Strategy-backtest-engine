@@ -15,7 +15,23 @@ Protocol                                       Adapter in this module
 ``worker.ExecutionKeyStore``                   :class:`PersistenceExecutionKeyStore`
 ``worker.JobHandler``                          :class:`OrchestratorJobHandler`
 ``object_store.StorageObjectWritePort``        :class:`PersistenceStorageObjectWritePort`
+``api.create_app`` (whole process)             :func:`build_api_runtime`
 =============================================  ==================================
+
+The API half of the deployment
+------------------------------
+:func:`build_api_runtime` is the other end of the same wire. The worker writes
+``backtest.*`` and the object store through :class:`DurableResultPublisher`;
+the API reads them back through
+:class:`~backtest_engine.result_query.DurableBacktestResultQueryStore`, which is
+built here and handed to ``create_app``. Before this, ``wiring`` built no query
+store at all and the two D29 read routes correctly answered 503 in every real
+deployment: the worker's output was unreachable over HTTP.
+
+Both entry points resolve their collaborators the same way -- required
+environment settings, and ``package.module:factory`` targets through
+:func:`worker.load_factory` -- so ``backtest-api`` and ``backtest-worker`` are
+configured alike and neither can start half-wired.
 
 Sizing lives here, deliberately
 -------------------------------
@@ -47,6 +63,7 @@ from typing import Any, Protocol, cast
 
 from sqlalchemy import update
 
+from .api import create_app
 from .attempt_coordinator import (
     AttemptCoordinator,
     AttemptPolicy,
@@ -65,6 +82,7 @@ from .basic_runtime import (
 from .contracts import build_backtest_result_event
 from .data_availability import AvailabilityAssessment
 from .detail_object_manifest import (
+    DetailIntegrityError,
     DetailObjectBuilder,
     DetailObjectBundle,
     DetailObjectPublisher,
@@ -86,6 +104,7 @@ from .execution_model import (
     TimeInForce,
 )
 from .execution_policy import BASIS_POINTS, ExecutionPolicy, ExecutionPolicyCatalog, ExecutionPolicyUnavailable
+from .lifecycle import BacktestLifecycleService, PersistenceRunGateway, SqsBacktestJobQueue
 from .money import PRECISION_RULES_VERSION, QUANTITY_QUANTUM, apply_rate, quantize_money, quantize_quantity
 from .monthly_judgment import (
     ConditionOutcome,
@@ -110,6 +129,7 @@ from .orchestrator import (
     PublishRequest,
     ReplayOutcome,
     ReplayStatus,
+    ResultPublicationError,
     SessionCalendar,
 )
 from .persistence import (
@@ -126,13 +146,16 @@ from .persistence import (
     RunPublication,
     StorageObjectRow,
     WorkStatus,
+    create_backtest_engine,
     publish_completed_run,
 )
 from .persistence.errors import InvalidStatusTransition as PersistedInvalidStatusTransition
 from .persistence.errors import PersistenceError, PublishConflict, RowNotFound
 from .persistence.tables import run_attempts as _run_attempts_table
+from .result_query import BacktestResultQueryService, DurableBacktestResultQueryStore
 from .result_snapshot import (
     PositionAfter,
+    ResultIntegrityError,
     ResultRecord,
     ResultSnapshot,
     ResultSnapshotBuilder,
@@ -146,15 +169,19 @@ from .worker import (
     JobContext,
     JobOutcome,
     JobResult,
+    WorkerConfigurationError,
+    load_factory,
 )
 
 
 __all__ = [
+    "API_REQUIRED_ENV",
     "COST_MODEL_VERSION",
     "EXECUTION_MODEL_VERSION",
     "RESULT_OBJECT_FILE_FORMAT",
     "SIZING_RULES_VERSION",
     "WIRING_VERSION",
+    "ApiRuntime",
     "BasicPlanReplayFactory",
     "DurableResultPublisher",
     "ExecutionModelEngine",
@@ -166,6 +193,8 @@ __all__ = [
     "PersistenceStorageObjectWritePort",
     "ResultSink",
     "WiringError",
+    "build_api_runtime",
+    "build_result_query_service",
     "dataset_coverage",
     "evaluation_window",
 ]
@@ -811,7 +840,39 @@ class DurableResultPublisher:
     def details(self) -> DetailObjectBundle | None:
         return self._bundle
 
+    #: Failures that cannot become successes on a redelivery. Each one is a statement
+    #: about *content*, not about the machine: the run already has a different
+    #: immutable result, the run has left `RUNNING`, an object id is taken by different
+    #: bytes, or the evidence does not verify against its own hashes. Retrying any of
+    #: them burns the whole delivery budget and dead-letters with the reason hidden.
+    _PERMANENT = (
+        PublishConflict,
+        PersistedInvalidStatusTransition,
+        RowNotFound,
+        ObjectStoreConflict,
+        DetailIntegrityError,
+        ResultIntegrityError,
+    )
+
     def publish(self, request: PublishRequest) -> PublishedManifests:
+        """Write the evidence, classifying a failure the orchestrator cannot classify.
+
+        Anything not in :data:`_PERMANENT` -- a dropped connection, an object store
+        timeout, a verification that may succeed on a second read -- propagates
+        unclassified and the orchestrator retries it.
+        """
+        try:
+            return self._publish(request)
+        except ResultPublicationError:
+            raise
+        except self._PERMANENT as exc:
+            raise ResultPublicationError(
+                f"{type(exc).__name__}: {exc}",
+                retryable=False,
+                reason_code="RESULT_PUBLICATION_CONFLICT",
+            ) from exc
+
+    def _publish(self, request: PublishRequest) -> PublishedManifests:
         binding = self._binding
         snapshot = binding.run_snapshot
         result = ResultSnapshotBuilder().build(
@@ -1408,3 +1469,158 @@ class OrchestratorJobHandler:
             **detail,
         )
         self._sink.publish(event, delivery_attempt=delivery_attempt)
+
+
+# ==========================================================================
+# The API process
+# ==========================================================================
+
+
+#: Every setting `build_api_runtime` refuses to start without. Nine of them are
+#: `package.module:factory` targets, for the same reason
+#: ``BACKTEST_JOB_HANDLER`` is one: the owner directory, the compiled-plan source,
+#: the dataset-manifest source, the execution-policy catalog, the dead-letter sink,
+#: the token source and the object store are all deployment decisions, and a default
+#: for any of them is the hidden policy the rebuild exists to remove.
+API_REQUIRED_ENV: tuple[str, ...] = (
+    "BACKTEST_DATABASE_URL",
+    "BACKTEST_QUEUE_URL",
+    "BACKTEST_API_HOST",
+    "BACKTEST_API_PORT",
+    "BACKTEST_AUTHENTICATOR",
+    "BACKTEST_OBJECT_STORE",
+    "BACKTEST_OWNER_DIRECTORY",
+    "BACKTEST_COMPILED_PLAN_SOURCE",
+    "BACKTEST_DATASET_MANIFEST_SOURCE",
+    "BACKTEST_EXECUTION_POLICY_CATALOG",
+    "BACKTEST_DEAD_LETTER_SINK",
+)
+
+#: Factory settings, in the order they are resolved. Kept beside
+#: :data:`API_REQUIRED_ENV` so adding one cannot forget to make it required.
+_API_FACTORY_ENV: tuple[str, ...] = (
+    "BACKTEST_AUTHENTICATOR",
+    "BACKTEST_OBJECT_STORE",
+    "BACKTEST_OWNER_DIRECTORY",
+    "BACKTEST_COMPILED_PLAN_SOURCE",
+    "BACKTEST_DATASET_MANIFEST_SOURCE",
+    "BACKTEST_EXECUTION_POLICY_CATALOG",
+    "BACKTEST_DEAD_LETTER_SINK",
+)
+
+
+def build_result_query_service(
+    persistence: BacktestPersistence, object_store: ObjectStore
+) -> BacktestResultQueryService:
+    """The D29 result read model, over the rows and objects the worker published.
+
+    This is the join the deployment was missing. ``DurableResultPublisher`` writes
+    ``backtest.*`` and ``storage.objects``; this reads them back and reconstructs the
+    immutable artifacts from the same bytes. Both halves must be given the *same*
+    bucket: ``storage.objects`` identity includes ``bucket_name``, and the read model
+    refuses an object registered against another one rather than serving bytes the row
+    does not describe.
+    """
+
+    return BacktestResultQueryService(
+        DurableBacktestResultQueryStore(persistence=persistence, object_store=object_store)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ApiRuntime:
+    """A fully wired `backtest-api` process, not yet listening.
+
+    Construction performs no I/O, so a configuration mistake is a `WiringError` before
+    anything connects. :meth:`verify` is the separate, deliberate step that touches the
+    database.
+    """
+
+    app: Any
+    persistence: BacktestPersistence
+    object_store: ObjectStore
+    host: str
+    port: int
+
+    def verify(self) -> None:
+        """Refuse to serve against a schema this build does not match.
+
+        The runtime applies no DDL (COM07 `runtime-no-ddl`), so the only safe response
+        to drift is to stop. Starting anyway would serve 500s from every query route
+        while looking healthy.
+        """
+
+        self.persistence.verify_schema()
+
+
+def build_api_runtime(environ: Mapping[str, str]) -> ApiRuntime:
+    """Build the `/api/v1` application from the environment. No defaults, no I/O.
+
+    Every missing setting is reported in one message rather than one per restart, and
+    the message names the settings, not the first line that happened to fail.
+    """
+
+    missing = [name for name in API_REQUIRED_ENV if not environ.get(name)]
+    if missing:
+        raise WiringError(
+            "backtest-api cannot start: missing required environment settings "
+            + ", ".join(sorted(missing))
+            + ". Every one of them is a deployment decision with no safe default; see "
+            "wiring.API_REQUIRED_ENV."
+        )
+
+    port_text = environ["BACKTEST_API_PORT"]
+    try:
+        port = int(port_text)
+    except ValueError as exc:
+        raise WiringError(f"BACKTEST_API_PORT must be an integer, got {port_text!r}") from exc
+    if not 1 <= port <= 65535:
+        raise WiringError(f"BACKTEST_API_PORT must be a TCP port, got {port}")
+
+    try:
+        resolved = {name: load_factory(environ[name], name) for name in _API_FACTORY_ENV}
+    except WorkerConfigurationError as exc:
+        raise WiringError(str(exc)) from exc
+
+    object_store = resolved["BACKTEST_OBJECT_STORE"]
+    if not isinstance(object_store, ObjectStore):
+        raise WiringError(
+            "BACKTEST_OBJECT_STORE must produce an object_store.ObjectStore, got "
+            f"{type(object_store).__name__}"
+        )
+
+    persistence = BacktestPersistence(create_backtest_engine(environ["BACKTEST_DATABASE_URL"]))
+
+    import boto3
+
+    lifecycle = BacktestLifecycleService(
+        gateway=PersistenceRunGateway(persistence),
+        queue=SqsBacktestJobQueue(
+            # AWS's own settings are read from the mapping this function was given, not
+            # from `os.environ`: a caller that passes an explicit environment must get
+            # a client configured from it, or the two disagree about which region and
+            # endpoint the deployment is on.
+            boto3.client(
+                "sqs",
+                endpoint_url=environ.get("AWS_ENDPOINT_URL"),
+                region_name=environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION"),
+            ),
+            environ["BACKTEST_QUEUE_URL"],
+        ),
+        owners=resolved["BACKTEST_OWNER_DIRECTORY"],
+        plans=resolved["BACKTEST_COMPILED_PLAN_SOURCE"],
+        manifests=resolved["BACKTEST_DATASET_MANIFEST_SOURCE"],
+        policies=resolved["BACKTEST_EXECUTION_POLICY_CATALOG"],
+        dead_letters=resolved["BACKTEST_DEAD_LETTER_SINK"],
+    )
+    return ApiRuntime(
+        app=create_app(
+            lifecycle,
+            resolved["BACKTEST_AUTHENTICATOR"],
+            build_result_query_service(persistence, object_store),
+        ),
+        persistence=persistence,
+        object_store=object_store,
+        host=environ["BACKTEST_API_HOST"],
+        port=port,
+    )

@@ -48,6 +48,7 @@ __all__ = [
     "SqsClient",
     "WorkerConfig",
     "WorkerConfigurationError",
+    "load_factory",
     "run",
     "worker_execution_key_for",
 ]
@@ -542,6 +543,7 @@ _REQUIRED_ENV = (
     "BACKTEST_DLQ_URL",
     "BACKTEST_WORKER_ID",
     "BACKTEST_JOB_HANDLER",
+    "BACKTEST_EXECUTION_KEY_STORE",
 )
 
 
@@ -567,7 +569,7 @@ def _config_from_env(environ: Mapping[str, str]) -> WorkerConfig:
     )
 
 
-def _load_factory(target: str, setting: str) -> Any:
+def load_factory(target: str, setting: str) -> Any:
     """Resolve ``package.module:factory`` and call it.
 
     The wiring that binds the orchestrator to the real execution model, result
@@ -578,20 +580,28 @@ def _load_factory(target: str, setting: str) -> Any:
     module_name, _, attribute = target.partition(":")
     if not module_name or not attribute:
         raise WorkerConfigurationError(f"{setting} must be 'package.module:factory'")
-    factory = getattr(importlib.import_module(module_name), attribute)
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise WorkerConfigurationError(f"{setting}={target!r} names an unimportable module: {exc}") from exc
+    try:
+        factory = getattr(module, attribute)
+    except AttributeError as exc:
+        raise WorkerConfigurationError(f"{setting}={target!r} names no attribute {attribute!r}") from exc
     return factory()
 
 
 def run() -> None:
     config = _config_from_env(os.environ)
-    handler: JobHandler = _load_factory(
+    handler: JobHandler = load_factory(
         os.environ["BACKTEST_JOB_HANDLER"], "BACKTEST_JOB_HANDLER"
     )
-    store_target = os.environ.get("BACKTEST_EXECUTION_KEY_STORE")
-    store: ExecutionKeyStore = (
-        _load_factory(store_target, "BACKTEST_EXECUTION_KEY_STORE")
-        if store_target
-        else InMemoryExecutionKeyStore()
+    # No in-memory fallback. `InMemoryExecutionKeyStore` is a process-local dictionary;
+    # a deployment that got it by leaving one variable unset would silently lose the
+    # cross-process duplicate-worker control this whole module exists to provide, and
+    # two workers would execute the same message twice.
+    store: ExecutionKeyStore = load_factory(
+        os.environ["BACKTEST_EXECUTION_KEY_STORE"], "BACKTEST_EXECUTION_KEY_STORE"
     )
 
     import boto3

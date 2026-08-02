@@ -3,9 +3,14 @@
 Only files matching `^V[0-9]{14}__backtest_[a-z0-9]+(?:_[a-z0-9]+)*[.]sql$` may live
 here, and only they enter the central Flyway bundle.
 
-This directory currently contains no SQL. Every `backtest.*` table already exists in
-the applied, immutable central baseline `V1__initial_schema.sql`, so this repository
-has nothing to contribute yet. Do not re-declare those tables here.
+Every table the applied, immutable central baseline `V1__initial_schema.sql` declares
+is off limits here. Do not re-declare or alter one; add a later migration instead.
+
+Contributed so far:
+
+- `V20260802094500__backtest_run_input_pins.sql` — adds `backtest.run_input_pins`, the
+  request identifiers `runs.configuration_hash` hashes over and cannot give back. See
+  `../change-requests/2026-08-02-backtest-run-input-pins.md`.
 
 Before adding a file:
 

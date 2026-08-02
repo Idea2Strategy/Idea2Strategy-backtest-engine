@@ -59,6 +59,7 @@ from .persistence.rows import (
     MonthlyJudgmentSummaryRow,
     PerformanceSummaryRow,
     RunAttemptRow,
+    RunInputPinRow,
     RunRow,
     RunStatus,
 )
@@ -348,7 +349,7 @@ class SqsBacktestJobQueue:
 class RunGateway(Protocol):
     """Everything the lifecycle needs from durable storage, in one transaction each."""
 
-    def accept(self, row: RunRow) -> tuple[RunRow, bool]: ...
+    def accept(self, row: RunRow, pins: RunInputPinRow) -> tuple[RunRow, bool]: ...
 
     def get(self, run_id: UUID) -> RunRow: ...
 
@@ -381,10 +382,23 @@ class PersistenceRunGateway:
         with self._persistence.read_only() as uow:
             yield uow
 
-    def accept(self, row: RunRow) -> tuple[RunRow, bool]:
+    def accept(self, row: RunRow, pins: RunInputPinRow) -> tuple[RunRow, bool]:
+        """Insert the run and its pinned request inputs in **one** transaction.
+
+        Not two calls: a run whose `backtest.run_input_pins` row is missing cannot
+        report its own reproducibility boundary, and `GET /{run_id}/inputs` would have
+        to answer 500 for it forever. Both rows land or neither does.
+        """
+
+        if pins.run_id != row.id:
+            raise IdempotencyConflict(
+                f"pinned inputs belong to run {pins.run_id}, not {row.id}"
+            )
         try:
             with self._write() as uow:
-                return uow.runs.accept(row)
+                accepted, created = uow.runs.accept(row)
+                uow.pins.pin(pins)
+                return accepted, created
         except PersistedIdempotencyConflict as exc:
             raise IdempotencyConflict(str(exc)) from exc
 
@@ -446,9 +460,18 @@ class InMemoryRunGateway:
         self._runs: dict[UUID, RunRow] = {}
         self._by_key: dict[str, UUID] = {}
         self._attempts: dict[UUID, list[RunAttemptRow]] = {}
+        self._pins: dict[UUID, RunInputPinRow] = {}
         self._lock = threading.RLock()
 
-    def accept(self, row: RunRow) -> tuple[RunRow, bool]:
+    def pins_of(self, run_id: UUID) -> RunInputPinRow | None:
+        """Test seam: what `accept` pinned. Mirrors `uow.pins.find`."""
+
+        with self._lock:
+            return self._pins.get(run_id)
+
+    def accept(self, row: RunRow, pins: RunInputPinRow) -> tuple[RunRow, bool]:
+        if pins.run_id != row.id:
+            raise IdempotencyConflict(f"pinned inputs belong to run {pins.run_id}, not {row.id}")
         with self._lock:
             existing_id = self._by_key.get(row.idempotency_key)
             if existing_id is not None:
@@ -481,6 +504,7 @@ class InMemoryRunGateway:
                 raise IdempotencyConflict(f"run id {row.id} is already used by a different idempotency key")
             self._runs[row.id] = row
             self._by_key[row.idempotency_key] = row.id
+            self._pins[row.id] = pins
             return row, True
 
     def get(self, run_id: UUID) -> RunRow:
@@ -568,9 +592,9 @@ class BacktestLifecycleService:
         message returns the existing run and does not enqueue a second job.
         """
         validated = validate_official_backtest_request(request, compiled_plan=compiled_plan)
-        row, message = self._build_run(validated, compiled_plan=compiled_plan)
+        row, pins, message = self._build_run(validated, compiled_plan=compiled_plan)
 
-        run_row, created = self.gateway.accept(row)
+        run_row, created = self.gateway.accept(row, pins)
         dispatched = False
         if created:
             self.queue.publish(message)
@@ -582,7 +606,7 @@ class BacktestLifecycleService:
         request: Mapping[str, Any],
         *,
         compiled_plan: Mapping[str, Any] | None,
-    ) -> tuple[RunRow, dict[str, Any]]:
+    ) -> tuple[RunRow, RunInputPinRow, dict[str, Any]]:
         missing: list[str] = []
 
         bot_id = UUID(request["botId"])
@@ -651,6 +675,21 @@ class BacktestLifecycleService:
             idempotency_key=idempotency_key,
             queued_at=occurred_at,
         )
+        # The four values that go into `configuration_hash` and cannot come back out of
+        # it, plus the dataset pair, so `GET /{run_id}/inputs` can answer before a
+        # worker has locked an input bundle. `dataset_hash` is stored bare, matching
+        # `input_datasets.locked_dataset_hash`; the `sha256:` prefix above belongs to
+        # B's fingerprint material, not to the column.
+        pins = RunInputPinRow(
+            run_id=run_id,
+            compiled_plan_checksum=checksum,
+            strategy_snapshot_hash=request["expectedSnapshotHash"],
+            dataset_manifest_id=manifest_id,
+            dataset_hash=str(manifest["dataset_hash"]),
+            feature_materialization_version=str(manifest["schema_id"]),
+            execution_policy_version=policy.version,
+            pinned_at=occurred_at,
+        )
         message = {
             "backtestRunId": str(run_id),
             "botId": str(bot_id),
@@ -662,7 +701,7 @@ class BacktestLifecycleService:
             "datasetManifestId": str(manifest_id),
             "expectedSnapshotHash": request["expectedSnapshotHash"],
         }
-        return row, message
+        return row, pins, message
 
     # -- queries ----------------------------------------------------------
 

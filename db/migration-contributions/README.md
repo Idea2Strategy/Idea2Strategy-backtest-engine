@@ -23,15 +23,29 @@ at runtime**.
 
 ## Current contents
 
-`migrations/` is intentionally **empty of SQL**. All nine `backtest.*` tables already
-exist in the applied central baseline `V1__initial_schema.sql`
-(`CREATE TABLE "backtest"."runs"` and following). Applied migrations are immutable, so
-there is nothing for this repository to author yet; the mechanism exists so that the
-first genuine `backtest` schema change has a legal home.
+`migrations/` holds one contributed migration:
+
+| file | adds | why |
+|---|---|---|
+| `V20260802094500__backtest_run_input_pins.sql` | `backtest.run_input_pins` | Four of the eight values `GET /api/v1/backtests/{id}/inputs` reports are *arguments* of the SHA-256 in `runs.configuration_hash` and exist in no column. A digest cannot be inverted, so the read model had to invent them, report null, or refuse the route. |
+
+It adds a table; it does not touch one the applied baseline created. All nine original
+`backtest.*` tables remain exactly as `V1__initial_schema.sql` defines them, because
+applied migrations are immutable.
+
+The matching canonical-model change request is
+[`change-requests/2026-08-02-backtest-run-input-pins.md`](change-requests/2026-08-02-backtest-run-input-pins.md).
+The root `db/schema.dbml` lives in the superproject and is owned centrally, so this
+repository proposes the change rather than making it. **It is proposed, not approved.**
+
+`change-requests/` holds those proposals. It is documentation: the central assembler
+never scans it, and nothing there is SQL.
 
 `fixtures/` holds the vendored copy of the central migration bundle that the
 Testcontainers integration tests apply, plus its recorded SHA-256 digests. It contains
-no bundle-eligible filenames.
+no bundle-eligible filenames. `tests/conftest.py` applies the vendored bundle **and
+then** `migrations/`, in the order the central assembler would, so the integration
+suite runs against the schema the deployment will have.
 
 ## Open item: `storage` schema ownership is contradictory
 

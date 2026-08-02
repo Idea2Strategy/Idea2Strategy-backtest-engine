@@ -59,6 +59,7 @@ from backtest_engine.orchestrator import (
     PublishRequest,
     ReplayOutcome,
     ReplayStatus,
+    ResultPublicationError,
 )
 
 
@@ -295,12 +296,15 @@ class RecordingEngine:
 
 
 class RecordingPublisher:
-    def __init__(self, *, explode: bool = False) -> None:
+    def __init__(self, *, explode: bool = False, raises: Exception | None = None) -> None:
         self.requests: list[PublishRequest] = []
         self._explode = explode
+        self._raises = raises
 
     def publish(self, request: PublishRequest) -> PublishedManifests:
         self.requests.append(request)
+        if self._raises is not None:
+            raise self._raises
         if self._explode:
             raise RuntimeError("object store is unreachable")
         return PublishedManifests(
@@ -640,6 +644,59 @@ def test_publisher_failure_is_retryable_and_leaves_the_run_waiting(
     assert coordinator.state is RunState.WAITING
     assert coordinator.attempts[0].state is AttemptState.RETRYABLE_FAILED
     assert coordinator.result_manifest_id is None
+
+
+def test_an_unclassified_publisher_failure_records_and_logs_its_cause(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`RESULT_PUBLICATION_FAILED` alone does not say what went wrong.
+
+    A publisher that does not classify its own failure gets the benefit of the doubt
+    and is retried, but the exception type and message are attached to the outcome and
+    logged, so diagnosing one no longer means reading the source.
+    """
+
+    caplog.set_level("ERROR", logger="backtest_engine.orchestrator")
+
+    outcome, _, coordinator = _run(tmp_path, publisher=RecordingPublisher(explode=True))
+
+    assert outcome.failure_detail == "RuntimeError: object store is unreachable"
+    assert outcome.retryable is True
+    assert coordinator.state is RunState.WAITING
+    logged = [record for record in caplog.records if record.name == "backtest_engine.orchestrator"]
+    assert len(logged) == 1
+    assert "object store is unreachable" in logged[0].getMessage()
+    assert logged[0].exc_info is not None, "the traceback must survive, not just the text"
+
+
+def test_a_publisher_that_declares_a_permanent_failure_is_not_retried(
+    tmp_path: Path,
+) -> None:
+    """A conflict that can never succeed on retry must not be reported as transient.
+
+    `DurableResultPublisher` raises this for `PublishConflict`: the run already has a
+    different immutable official result. Retrying it burns the whole delivery budget
+    and then dead-letters anyway, having hidden the real reason the entire time.
+    """
+
+    publisher = RecordingPublisher(
+        raises=ResultPublicationError(
+            "run already has a different immutable result",
+            retryable=False,
+            reason_code="RESULT_PUBLICATION_CONFLICT",
+        )
+    )
+
+    outcome, _, coordinator = _run(tmp_path, publisher=publisher)
+
+    assert outcome.status is ReplayStatus.FAILED
+    assert outcome.reason_code == "RESULT_PUBLICATION_CONFLICT"
+    assert outcome.retryable is False
+    assert outcome.failure_detail == (
+        "ResultPublicationError: run already has a different immutable result"
+    )
+    assert coordinator.state is RunState.FAILED
+    assert coordinator.attempts[0].state is AttemptState.PERMANENT_FAILED
 
 
 # --------------------------------------------------------------------------

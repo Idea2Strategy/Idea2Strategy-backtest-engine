@@ -6,9 +6,11 @@ never touches Docker.
 
 The container is migrated with the **canonical** SQL: the vendored byte-for-byte copy
 of the applied central Flyway bundle under
-`db/migration-contributions/fixtures/central-migration/`. No DDL is hand-written in
-the suite, so a persistence layer that disagrees with the canonical schema fails here
-rather than in production.
+`db/migration-contributions/fixtures/central-migration/`, followed by this
+repository's own contributed migrations from
+`db/migration-contributions/migrations/`, in exactly the order the central assembler
+applies them. No DDL is hand-written in the suite, so a persistence layer that
+disagrees with the canonical schema fails here rather than in production.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from backtest_engine.persistence import BacktestPersistence, create_backtest_eng
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONTRIBUTION_ROOT = REPO_ROOT / "db" / "migration-contributions"
 VENDORED_MIGRATIONS = CONTRIBUTION_ROOT / "fixtures" / "central-migration"
+CONTRIBUTED_MIGRATIONS = CONTRIBUTION_ROOT / "migrations"
 VENDORED_DIGESTS = CONTRIBUTION_ROOT / "fixtures" / "central-migration.sha256"
 REFERENCE_SEED = CONTRIBUTION_ROOT / "fixtures" / "backtest_reference_seed.sql.fixture"
 
@@ -36,6 +39,7 @@ POSTGRES_IMAGE = os.environ.get("BACKTEST_TEST_POSTGRES_IMAGE", "postgres:16-alp
 _VERSION = re.compile(r"^V(?P<version>[0-9]+)__")
 
 _BACKTEST_TABLES = (
+    "backtest.run_input_pins",
     "backtest.failure_condition_counts",
     "backtest.monthly_judgment_summaries",
     "backtest.performance_summaries",
@@ -110,14 +114,28 @@ def postgres_url() -> Iterator[str]:
         yield url
 
 
-def _apply_canonical_migrations(url: str) -> None:
-    """Apply the vendored central bundle. The only DDL executed anywhere in the suite.
+def contributed_migration_files() -> list[Path]:
+    """This repository's own contributed migrations, in Flyway version order.
 
-    It runs on a *separate, unguarded* engine on purpose: the runtime engine built by
-    `create_backtest_engine` refuses DDL, which `test_runtime_no_ddl.py` asserts.
+    They are applied *after* the vendored central bundle, which is what the central
+    assembler does with them. Without this the integration suite would prove the
+    persistence layer against a schema the deployment will not have.
     """
 
-    _execute_scripts(url, [path.read_text(encoding="utf-8") for path in migration_files()])
+    files = [path for path in CONTRIBUTED_MIGRATIONS.glob("V*.sql") if path.is_file()]
+    return sorted(files, key=lambda path: path.name)
+
+
+def _apply_canonical_migrations(url: str) -> None:
+    """Apply the central bundle then this repository's contributions.
+
+    The only DDL executed anywhere in the suite. It runs on a *separate, unguarded*
+    engine on purpose: the runtime engine built by `create_backtest_engine` refuses
+    DDL, which `test_runtime_no_ddl.py` asserts.
+    """
+
+    ordered = migration_files() + contributed_migration_files()
+    _execute_scripts(url, [path.read_text(encoding="utf-8") for path in ordered])
 
 
 def _apply_reference_seed(url: str) -> None:

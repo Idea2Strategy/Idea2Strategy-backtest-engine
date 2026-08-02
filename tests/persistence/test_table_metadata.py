@@ -1,9 +1,13 @@
 """The SQLAlchemy Core metadata must restate the canonical DDL exactly.
 
 This is a Docker-free test: it parses the vendored copy of the applied central
-baseline and compares it, column by column, with `backtest_engine.persistence.tables`.
-Anything the metadata invents, omits, widens or narrows fails here long before a
-container is started.
+baseline **plus this repository's own contributed migrations**, and compares the union,
+column by column, with `backtest_engine.persistence.tables`. Anything the metadata
+invents, omits, widens or narrows fails here long before a container is started.
+
+The contributed migrations are parsed from the same directory the central Flyway
+assembler reads (`db/migration-contributions/migrations`), in version order, so a table
+this repository authors is held to exactly the same standard as one it inherited.
 """
 
 from __future__ import annotations
@@ -29,19 +33,19 @@ from backtest_engine.persistence.tables import (
     monthly_judgment_summaries,
     performance_summaries,
     run_attempts,
+    run_input_pins,
     runs,
     storage_objects,
 )
 
 
+CONTRIBUTION_ROOT = Path(__file__).resolve().parents[2] / "db" / "migration-contributions"
+
 CENTRAL_BASELINE = (
-    Path(__file__).resolve().parents[2]
-    / "db"
-    / "migration-contributions"
-    / "fixtures"
-    / "central-migration"
-    / "V1__initial_schema.sql.fixture"
+    CONTRIBUTION_ROOT / "fixtures" / "central-migration" / "V1__initial_schema.sql.fixture"
 )
+
+CONTRIBUTED_MIGRATIONS = CONTRIBUTION_ROOT / "migrations"
 
 EXPECTED_TABLES = {
     "backtest.runs",
@@ -53,6 +57,7 @@ EXPECTED_TABLES = {
     "backtest.failure_condition_counts",
     "backtest.performance_summaries",
     "backtest.detail_manifests",
+    "backtest.run_input_pins",
     "storage.objects",
 }
 
@@ -162,11 +167,27 @@ def _parse_baseline(sql: str) -> dict[str, _DdlTable]:
     return tables
 
 
+def canonical_sql() -> str:
+    """The applied baseline followed by this repository's contributed migrations.
+
+    Concatenated in the order the central assembler applies them, so a contributed
+    `CREATE TABLE` is parsed exactly like a baseline one and a contributed table that
+    the metadata does not restate fails the same assertions.
+    """
+
+    sources = [CENTRAL_BASELINE.read_text(encoding="utf-8")]
+    sources.extend(
+        path.read_text(encoding="utf-8")
+        for path in sorted(CONTRIBUTED_MIGRATIONS.glob("V*.sql"))
+    )
+    return "\n\n".join(sources)
+
+
 @pytest.fixture(scope="module")
 def baseline() -> dict[str, _DdlTable]:
-    parsed = _parse_baseline(CENTRAL_BASELINE.read_text(encoding="utf-8"))
+    parsed = _parse_baseline(canonical_sql())
     missing = EXPECTED_TABLES - set(parsed)
-    assert missing == set(), f"canonical baseline does not declare {sorted(missing)}"
+    assert missing == set(), f"canonical DDL does not declare {sorted(missing)}"
     return parsed
 
 
@@ -180,8 +201,24 @@ ALL_TABLES = [
     failure_condition_counts,
     performance_summaries,
     detail_manifests,
+    run_input_pins,
     storage_objects,
 ]
+
+
+def test_the_contributed_migration_is_the_only_new_backtest_table() -> None:
+    """A contributed migration may add tables; it may never redefine an applied one."""
+
+    contributed = _parse_baseline(
+        "\n\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted(CONTRIBUTED_MIGRATIONS.glob("V*.sql"))
+        )
+    )
+    applied = _parse_baseline(CENTRAL_BASELINE.read_text(encoding="utf-8"))
+
+    assert set(contributed) == {"backtest.run_input_pins"}
+    assert set(contributed) & set(applied) == set()
 
 
 def test_metadata_declares_exactly_the_canonical_tables() -> None:
