@@ -1,405 +1,375 @@
-"""Independent D30 fixture kit spanning deterministic pipeline and backtest boundaries."""
+"""D30 fixture data for the reproducibility end-to-end test.
+
+Spec section 4 says the orchestration this module used to carry belongs in
+``src/``. It now does -- :mod:`backtest_engine.orchestrator` assembles and
+replays a run, and :mod:`backtest_engine.wiring` binds it to the execution
+model, the object store and PostgreSQL -- so what is left here is what the spec
+asks for: fixture data and the small builders that render it.
+
+Nothing in this module computes a result, and nothing in it may be used as an
+oracle. The builders below produce *inputs*: a pinned bar series, the
+``market-data.v1`` manifest that describes it, B's ``strategy-bot.v1`` request
+that names it, and the pinned execution policy the run is measured under. Every
+expected digest is a literal in the test that asserts it.
+
+Identifier discipline
+---------------------
+Every cross-domain id is one the canonical reference seed
+(``db/migration-contributions/fixtures/backtest_reference_seed.sql.fixture``)
+actually inserts, so a run built from this fixture satisfies every foreign key
+in ``backtest.runs`` against a real upstream row. The one exception is the
+plan's instrument, which comes from B's published compiled-plan fixture and has
+no ``backtest`` foreign key.
+"""
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, replace
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from backtest_engine.attempt_coordinator import (
-    AttemptCoordinator,
-    AttemptPolicy,
-    ResourceSample,
-    RunState,
-)
 from backtest_engine.contracts import (
-    compute_input_bundle_fingerprint,
-    validate_backtest_request,
+    OFFICIAL_BACKTEST_MESSAGE_TYPE,
+    STRATEGY_BOT_CONTRACT_VERSION,
+    canonical_dataset_hash,
+    compute_message_idempotency_key,
+    official_backtest_operation_key,
     validate_dataset_manifest,
 )
-from backtest_engine.detail_object_manifest import (
-    DetailObjectBuilder,
-    DetailObjectBundle,
-    PerformancePoint,
-    ReplayLedgerDetail,
-)
 from backtest_engine.execution_model import (
-    BacktestExecutionModel,
-    MinuteBar,
-    OrderRequest,
-    OrderSide,
-    OrderType,
-    QuantityMode,
+    EXECUTION_MICROSTRUCTURE_RULES_VERSION,
+    ExecutionMicrostructurePolicy,
+    InstrumentFractionalPolicy,
     RiskLimits,
-    TimeInForce,
 )
-from backtest_engine.execution_policy import D17_EXECUTION_POLICY_FIXTURE
-from backtest_engine.market_data import ParquetMarketDataReader
-from backtest_engine.result_snapshot import (
-    PositionAfter,
-    ResultSnapshot,
-    ResultSnapshotBuilder,
-    RunSnapshot,
-    fill_result_record,
-    order_result_record,
-)
+from backtest_engine.execution_policy import ExecutionPolicy, et_quarter_start
+from backtest_engine.money import PRECISION_RULES_VERSION
 
 
-INSTRUMENT_ID = "11111111-1111-4111-8111-111111111111"
-DATASET_ID = "22222222-2222-4222-8222-222222222222"
-MANIFEST_ID = "33333333-3333-4333-8333-333333333333"
-STORAGE_OBJECT_ID = "44444444-4444-4444-8444-444444444444"
-BACKTEST_RUN_ID = "55555555-5555-4555-8555-555555555555"
-STRATEGY_VERSION_ID = "66666666-6666-4666-8666-666666666666"
-ORDER_ID = "77777777-7777-4777-8777-777777777777"
-PERFORMANCE_POINT_ID = "88888888-8888-4888-8888-888888888888"
-BACKTEST_MEMORY_BYTES = 512 * 1024 * 1024
 ET = ZoneInfo("America/New_York")
 
-FIXED_ALPACA_RESPONSE: tuple[Mapping[str, object], ...] = (
-    {
-        "t": "2024-01-02T14:30:00Z",
-        "o": 100.0,
-        "h": 102.0,
-        "l": 99.0,
-        "c": 101.0,
-        "v": 1000,
-    },
-    {
-        "t": "2024-01-02T15:00:00Z",
-        "o": 101.0,
-        "h": 103.0,
-        "l": 100.0,
-        "c": 102.0,
-        "v": 1200,
-    },
+FIXTURES = Path(__file__).parent / "fixtures/contracts/strategy-bot/v1"
+
+# -- reference-seed identifiers -------------------------------------------------
+# `backtest.runs` has foreign keys to all four of these.
+ACCOUNT_ID = UUID("00000000-0000-4000-8000-0000000000a1")
+BOT_ID = UUID("00000000-0000-4000-8000-0000000000b1")
+FEE_POLICY_ID = UUID("00000000-0000-4000-8000-0000000000f1")
+BUFFER_POLICY_ID = UUID("00000000-0000-4000-8000-0000000000f2")
+#: `market_data.dataset_manifests`, referenced by `backtest.input_datasets`.
+DATASET_MANIFEST_ID = UUID("00000000-0000-4000-8000-0000000000d1")
+
+#: The seeded `trading.buying_power_buffer_policy_versions.buffer_bps`. The
+#: microstructure policy below repeats it rather than choosing its own, so the
+#: run's arithmetic and the row it cites cannot disagree.
+BUFFER_BPS = 50
+
+#: The single official instrument of B's published compiled plan.
+INSTRUMENT_ID = "00000000-0000-4000-8000-000000000301"
+PROVIDER_SYMBOL = "AAPL"
+
+#: Correlation id of B's published request fixture.
+CORRELATION_ID = "00000000-0000-4000-8000-000000000202"
+MESSAGE_ID = "00000000-0000-4000-8000-000000000213"
+
+DATASET_ID = "00000000-0000-4000-8000-0000000000d2"
+STORAGE_OBJECT_ID = "00000000-0000-4000-8000-0000000000d3"
+
+MARKET_DATA_SCHEMA_VERSION = "market-bars-v2"
+OBJECT_KEY = "market-data/adjusted-bars-2024-01-02.parquet"
+
+# -- the pinned session ---------------------------------------------------------
+SESSION_DATE = date(2024, 1, 2)
+#: 09:30 ET on the first XNYS session of 2024-Q1.
+FIRST_BAR_START = datetime(2024, 1, 2, 14, 30, tzinfo=UTC)
+BAR = timedelta(minutes=1)
+BAR_COUNT = 20
+
+#: RSI_14 reads the last 15 closes, so the fifteenth bar is the first instant at
+#: which the plan's ``COMPARE LT 30`` can decide anything at all. Fourteen
+#: consecutive one-point falls put RSI at exactly 0, and the jump to 130 pulls
+#: every later window back above the threshold: the series is shaped so the plan
+#: emits exactly one candidate, at 14:45:00Z.
+CLOSES: tuple[str, ...] = (
+    "114", "113", "112", "111", "110", "109", "108", "107", "106", "105",
+    "104", "103", "102", "101", "100",
+    "130", "131", "132", "133", "134",
+)
+#: One tenth of this is the per-bar fill capacity (D23 volume participation).
+BAR_VOLUME = 20_000
+
+#: The instant the single candidate is decided, and the instant it fills.
+DECISION_INSTANT = FIRST_BAR_START + BAR * 15
+FILL_INSTANT = FIRST_BAR_START + BAR * 16
+
+#: Wall-clock completion instant. Pinned because `result_hash` covers
+#: ``calculated_at``; the replay clock is 2024 market time and is untouched by it.
+COMPLETED_AT = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+
+
+_SCHEMA = pa.schema(
+    [
+        pa.field("instrument_id", pa.string(), nullable=False),
+        pa.field("provider_symbol", pa.string(), nullable=False),
+        pa.field("bar_start_at", pa.timestamp("us", tz="UTC"), nullable=False),
+        pa.field("session_date_et", pa.date32(), nullable=False),
+        pa.field("open", pa.float64(), nullable=False),
+        pa.field("high", pa.float64(), nullable=False),
+        pa.field("low", pa.float64(), nullable=False),
+        pa.field("close", pa.float64(), nullable=False),
+        pa.field("volume", pa.int64(), nullable=False),
+    ],
+    metadata={b"schema_version": MARKET_DATA_SCHEMA_VERSION.encode()},
 )
 
 
-class PipelineResourceLimitExceeded(RuntimeError):
-    """Raised before a fixture object is published beyond its injected budget."""
+# ==========================================================================
+# Execution policy and the D23 policies the model needs alongside it
+# ==========================================================================
+
+#: The pinned policy for this fixture. It differs from
+#: `D17_EXECUTION_POLICY_FIXTURE` in exactly one respect: the fee and buffer
+#: policy ids are the seeded `trading.*` rows, because `backtest.runs` has a
+#: foreign key to both and the D17 ids are not in any database.
+E2E_EXECUTION_POLICY = ExecutionPolicy(
+    version="official-backtest-policy-e2e-2024q1",
+    release_quarter="2024-Q1",
+    period_start=et_quarter_start(2024, 1),
+    period_end=et_quarter_start(2024, 2),
+    fee_rate=Decimal("0.002"),
+    slippage_rate_bps=5,
+    timezone="America/New_York",
+    session_calendar="XNYS",
+    timestamp_unit="us",
+    price_arrow_type="double",
+    volume_arrow_type="int64",
+    market_data_schema_version=MARKET_DATA_SCHEMA_VERSION,
+    calculation_model_version="backtest-calculation-v1",
+    market_rules_version="market:1.0.0",
+    accounting_rules_version="accounting:1.0.0",
+    fee_policy_id=str(FEE_POLICY_ID),
+    buying_power_buffer_policy_id=str(BUFFER_POLICY_ID),
+    good_till_cancelled_horizon=timedelta(days=90),
+    max_order_horizon=timedelta(days=90),
+    precision_rules_version=PRECISION_RULES_VERSION,
+)
+
+E2E_MICROSTRUCTURE = ExecutionMicrostructurePolicy(
+    version=EXECUTION_MICROSTRUCTURE_RULES_VERSION,
+    max_volume_participation_bps=1000,
+    buying_power_buffer_policy_id=str(BUFFER_POLICY_ID),
+    buying_power_buffer_bps=BUFFER_BPS,
+)
+
+#: No instrument in this fixture is fractional-eligible, stated rather than
+#: assumed: `InstrumentFractionalPolicy` has no default set.
+E2E_FRACTIONAL_POLICY = InstrumentFractionalPolicy(
+    policy_version="fractional:e2e:1.0.0", fractional_instrument_ids=frozenset()
+)
+
+#: Deliberately far above anything this fixture can reach, so a risk rejection
+#: in a test is a real finding and not the fixture's own ceiling.
+E2E_RISK_LIMITS = RiskLimits(
+    max_strategy_notional=Decimal("1000000.00000000"),
+    max_gross_exposure=Decimal("1000000.00000000"),
+    max_instrument_exposure=Decimal("1000000.00000000"),
+)
+
+
+# ==========================================================================
+# Market data
+# ==========================================================================
 
 
 @dataclass(frozen=True, slots=True)
-class PipelineComputePolicy:
-    max_input_rows: int
-    max_output_bytes: int
+class MarketDataFixture:
+    """One pinned Parquet object and the manifest that describes it."""
 
-    def __post_init__(self) -> None:
-        if self.max_input_rows <= 0 or self.max_output_bytes <= 0:
-            raise ValueError("pipeline compute limits must be positive")
-
-
-@dataclass(frozen=True, slots=True)
-class PipelineInput:
-    object_path: Path
+    root: Path
+    path: Path
     parquet_bytes: bytes
-    manifest: Mapping[str, Any]
+    manifest: dict[str, Any]
+
+    @property
+    def content_hash(self) -> str:
+        return hashlib.sha256(self.parquet_bytes).hexdigest()
 
 
-@dataclass(frozen=True, slots=True)
-class BacktestComputeSample:
-    cpu_time: timedelta
-    memory_bytes: int
-
-
-@dataclass(frozen=True, slots=True)
-class OfficialBacktestOutcome:
-    request: Mapping[str, Any]
-    result: ResultSnapshot
-    details: DetailObjectBundle
-    attempt_completed: bool
-
-
-def _utc(value: object) -> datetime:
-    if not isinstance(value, str) or not value.endswith("Z"):
-        raise ValueError("Alpaca timestamp must be UTC with a Z suffix")
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.utcoffset() != timedelta(0):
-        raise ValueError("Alpaca timestamp must be UTC")
-    return parsed
-
-
-def _schema() -> pa.Schema:
-    return pa.schema(
-        [
-            pa.field("instrument_id", pa.string(), nullable=False),
-            pa.field("provider_symbol", pa.string(), nullable=False),
-            pa.field("bar_start_at", pa.timestamp("us", tz="UTC"), nullable=False),
-            pa.field("session_date_et", pa.date32(), nullable=False),
-            pa.field("open", pa.float64(), nullable=False),
-            pa.field("high", pa.float64(), nullable=False),
-            pa.field("low", pa.float64(), nullable=False),
-            pa.field("close", pa.float64(), nullable=False),
-            pa.field("volume", pa.int64(), nullable=False),
-        ],
-        metadata={b"schema_version": b"market-bars-v2"},
-    )
-
-
-def _row(payload: Mapping[str, object]) -> dict[str, object]:
-    timestamp = _utc(payload.get("t"))
-    return {
-        "instrument_id": INSTRUMENT_ID,
-        "provider_symbol": "AAPL",
-        "bar_start_at": timestamp,
-        "session_date_et": timestamp.astimezone(ET).date(),
-        "open": payload.get("o"),
-        "high": payload.get("h"),
-        "low": payload.get("l"),
-        "close": payload.get("c"),
-        "volume": payload.get("v"),
-    }
-
-
-def _dataset_hash(objects: Sequence[Mapping[str, Any]]) -> str:
-    fields = (
-        "content_hash",
-        "object_kind",
-        "partition_granularity",
-        "partition_start",
-        "partition_end",
-        "period_start",
-        "period_end",
-        "shard_key",
-        "part_number",
-        "row_count",
-        "schema_version",
-    )
-    rows = [{field: item.get(field) for field in fields} for item in objects]
-    rows.sort(
-        key=lambda item: json.dumps(
-            item, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+def bar_rows(closes: Sequence[str] = CLOSES) -> list[dict[str, Any]]:
+    """One row per one-minute bar, OHLC walked from the previous close."""
+    rows: list[dict[str, Any]] = []
+    previous = Decimal(closes[0])
+    for index, close_text in enumerate(closes):
+        close = Decimal(close_text)
+        starts_at = FIRST_BAR_START + BAR * index
+        rows.append(
+            {
+                "instrument_id": INSTRUMENT_ID,
+                "provider_symbol": PROVIDER_SYMBOL,
+                "bar_start_at": starts_at,
+                "session_date_et": starts_at.astimezone(ET).date(),
+                "open": float(previous),
+                "high": float(max(previous, close)),
+                "low": float(min(previous, close)),
+                "close": float(close),
+                "volume": BAR_VOLUME,
+            }
         )
-    )
-    payload = json.dumps(
-        rows, sort_keys=True, ensure_ascii=False, separators=(",", ":")
-    ).encode()
-    return hashlib.sha256(payload).hexdigest()
+        previous = close
+    return rows
 
 
-def materialize_fixed_alpaca_response(
-    response: Sequence[Mapping[str, object]],
-    target: Path,
-    policy: PipelineComputePolicy,
-) -> PipelineInput:
-    if len(response) > policy.max_input_rows:
-        raise PipelineResourceLimitExceeded("pipeline input row limit exceeded")
-    rows = sorted(
-        (_row(item) for item in response),
-        key=lambda item: item["bar_start_at"],
-    )
-    table = pa.Table.from_pylist(rows, schema=_schema())
+def market_bars_parquet(closes: Sequence[str] = CLOSES) -> bytes:
+    """Deterministic UNCOMPRESSED Parquet bytes for the pinned bar series."""
+    table = pa.Table.from_pylist(bar_rows(closes), schema=_SCHEMA)
     sink = pa.BufferOutputStream()
     pq.write_table(
         table,
         sink,
-        compression="zstd",
-        version="2.6",
+        compression="none",
         use_dictionary=False,
         write_statistics=True,
+        version="2.6",
+        data_page_version="2.0",
+        row_group_size=len(closes),
     )
-    parquet_bytes = sink.getvalue().to_pybytes()
-    if len(parquet_bytes) > policy.max_output_bytes:
-        raise PipelineResourceLimitExceeded("pipeline output byte limit exceeded")
+    return bytes(sink.getvalue().to_pybytes())
 
-    content_hash = hashlib.sha256(parquet_bytes).hexdigest()
-    object_metadata: dict[str, Any] = {
+
+def dataset_manifest(content_hash: str, *, row_count: int, coverage_end: datetime) -> dict[str, Any]:
+    """The ``market-data.v1`` manifest a producer would publish for that object.
+
+    ``period_start``/``period_end`` at manifest level are the *dataset's* window,
+    which `ParquetMarketDataReader` requires to equal the execution policy's
+    pinned quarter. The object's own period is the coverage actually delivered,
+    and that is what decides the run's evaluation window.
+    """
+    metadata: dict[str, Any] = {
         "storage_object_id": STORAGE_OBJECT_ID,
-        "object_key": target.name,
+        "object_key": OBJECT_KEY,
         "content_hash": content_hash,
         "object_kind": "PARQUET",
         "partition_granularity": "DAY",
-        "partition_start": "2024-01-02",
-        "partition_end": "2024-01-03",
-        "period_start": "2024-01-02T14:30:00Z",
-        "period_end": "2024-01-02T15:30:00Z",
+        "partition_start": SESSION_DATE.isoformat(),
+        "partition_end": (SESSION_DATE + timedelta(days=1)).isoformat(),
+        "period_start": _iso(FIRST_BAR_START),
+        "period_end": _iso(coverage_end),
         "shard_key": "s00-of-01",
         "part_number": 1,
-        "row_count": table.num_rows,
-        "schema_version": "market-bars-v2",
+        "row_count": row_count,
+        "schema_version": MARKET_DATA_SCHEMA_VERSION,
     }
     manifest: dict[str, Any] = {
         "contract_id": "com06.dataset-manifest",
         "schema_version": 1,
-        "manifest_id": MANIFEST_ID,
+        "manifest_id": str(DATASET_MANIFEST_ID),
         "dataset_id": DATASET_ID,
         "revision": 1,
         "status": "AVAILABLE",
-        "dataset_hash": _dataset_hash([object_metadata]),
-        "schema_id": "market-bars-v2",
-        "period_start": "2024-01-02T14:30:00Z",
-        "period_end": "2024-01-02T15:30:00Z",
+        "dataset_hash": canonical_dataset_hash([metadata]),
+        "schema_id": MARKET_DATA_SCHEMA_VERSION,
+        "period_start": _iso(E2E_EXECUTION_POLICY.period_start),
+        "period_end": _iso(E2E_EXECUTION_POLICY.period_end),
         "available_at": "2024-01-03T01:00:00Z",
-        "objects": [object_metadata],
+        "objects": [metadata],
     }
     validate_dataset_manifest(manifest)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(parquet_bytes)
-    return PipelineInput(target, parquet_bytes, manifest)
+    return manifest
 
 
-def _request(manifest: Mapping[str, Any]) -> dict[str, Any]:
+def write_market_data(root: Path, closes: Sequence[str] = CLOSES) -> MarketDataFixture:
+    """Materialise the pinned object under ``root`` and describe it."""
+    parquet_bytes = market_bars_parquet(closes)
+    path = root / OBJECT_KEY
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(parquet_bytes)
+    manifest = dataset_manifest(
+        hashlib.sha256(parquet_bytes).hexdigest(),
+        row_count=len(closes),
+        coverage_end=FIRST_BAR_START + BAR * len(closes),
+    )
+    return MarketDataFixture(root=root, path=path, parquet_bytes=parquet_bytes, manifest=manifest)
+
+
+# ==========================================================================
+# B's contracts
+# ==========================================================================
+
+
+def compiled_plan() -> dict[str, Any]:
+    """B's published ``basic-compiled-plan``, consumed unmodified."""
+    return json.loads((FIXTURES / "basic-compiled-plan.valid.json").read_text(encoding="utf-8"))
+
+
+def official_backtest_request(
+    *,
+    plan: Mapping[str, Any] | None = None,
+    occurred_at: str = "2024-01-03T01:01:00Z",
+) -> dict[str, Any]:
+    """B's ``OFFICIAL_BACKTEST_REQUESTED``, re-addressed to the seeded bot.
+
+    Only ``botId`` and ``occurredAt`` differ from B's published fixture, and both
+    have to: ``backtest.runs.bot_id`` is a foreign key into ``bot.bots`` and the
+    execution policy is selected by the ET release quarter of ``occurredAt``. The
+    ``idempotencyKey`` is then B's own canonical material for *this* message --
+    the same function B's ``StrategyBotContractFixtures`` uses -- because an
+    unchanged key copied from a different message would be a forgery, not a
+    fixture.
+    """
+    document = plan if plan is not None else compiled_plan()
     request: dict[str, Any] = {
-        "contract_id": "com06.backtest-request",
-        "schema_version": 1,
-        "message_id": "99999999-9999-4999-8999-999999999999",
-        "occurred_at": "2024-01-03T01:01:00Z",
-        "correlation_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        "idempotency_key": "d30-fixed-official-backtest",
-        "event_type": "BACKTEST_REQUESTED",
-        "backtest_run_id": BACKTEST_RUN_ID,
-        "strategy_version_id": STRATEGY_VERSION_ID,
-        "strategy_snapshot_hash": "a" * 64,
-        "compiled_plan_hash": "b" * 64,
-        "dataset_manifest_id": manifest["manifest_id"],
-        "dataset_hash": manifest["dataset_hash"],
-        "feature_materialization_version": "feature-materialization-v1",
-        "execution_policy_version": D17_EXECUTION_POLICY_FIXTURE.version,
-        "requested_at": "2024-01-03T01:01:00Z",
+        "metadata": {
+            "contractVersion": STRATEGY_BOT_CONTRACT_VERSION,
+            "messageType": OFFICIAL_BACKTEST_MESSAGE_TYPE,
+            "messageId": MESSAGE_ID,
+            "occurredAt": occurred_at,
+            "correlationId": CORRELATION_ID,
+            "idempotencyKey": "",
+        },
+        "botId": str(BOT_ID),
+        "expectedSnapshotHash": document["executionSnapshot"]["immutableStrategyVersion"][
+            "snapshotHash"
+        ],
+        "compiledPlanChecksum": document["planChecksum"],
+        "datasetManifestId": str(DATASET_MANIFEST_ID),
+        "assumptionsVersion": "accounting:1.0.0",
+        "requestReason": "STRATEGY_RELEASE",
     }
-    request["input_bundle_fingerprint"] = compute_input_bundle_fingerprint(request)
-    validate_backtest_request(request)
+    request["metadata"]["idempotencyKey"] = compute_message_idempotency_key(
+        contract_version=STRATEGY_BOT_CONTRACT_VERSION,
+        message_type=OFFICIAL_BACKTEST_MESSAGE_TYPE,
+        aggregate_id=request["botId"],
+        snapshot_hash=request["expectedSnapshotHash"],
+        operation_key=official_backtest_operation_key(request),
+    )
     return request
 
 
-def _minute_bar(row: Mapping[str, object]) -> MinuteBar:
-    starts_at = row["bar_start_at"]
-    assert isinstance(starts_at, datetime)
-    return MinuteBar(
-        instrument_id=str(row["instrument_id"]),
-        starts_at=starts_at,
-        ends_at=starts_at + timedelta(minutes=1),
-        open=Decimal(str(row["open"])),
-        high=Decimal(str(row["high"])),
-        low=Decimal(str(row["low"])),
-        close=Decimal(str(row["close"])),
-        volume=Decimal(str(row["volume"])),
-    )
+def policy_with(**overrides: Any) -> ExecutionPolicy:
+    """A variant of the pinned policy, for tests that move one input."""
+    return replace(E2E_EXECUTION_POLICY, **overrides)
 
 
-def run_official_backtest(
-    pipeline_input: PipelineInput,
-    *,
-    compute_sample: BacktestComputeSample | None = None,
-) -> OfficialBacktestOutcome:
-    request = _request(pipeline_input.manifest)
-    table = ParquetMarketDataReader(pipeline_input.object_path.parent).read(
-        pipeline_input.manifest,
-        D17_EXECUTION_POLICY_FIXTURE,
-    )
+def plan_with_budget_cap(budget_cap_bps: int) -> dict[str, Any]:
+    """B's plan with one partition budget cap changed and the checksum re-sealed."""
+    from backtest_engine.contracts import compute_compiled_plan_checksum
 
-    attempt_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    coordinator = AttemptCoordinator(
-        BACKTEST_RUN_ID,
-        AttemptPolicy(
-            max_attempts=2,
-            lease_duration=timedelta(minutes=1),
-            attempt_timeout=timedelta(minutes=10),
-            max_cpu_time=timedelta(minutes=5),
-            max_memory_bytes=BACKTEST_MEMORY_BYTES,
-        ),
-        attempt_time,
-    )
-    lease = coordinator.acquire("d30-worker", attempt_time)
-    sample = compute_sample or BacktestComputeSample(
-        cpu_time=timedelta(seconds=1), memory_bytes=64 * 1024 * 1024
-    )
-    coordinator.heartbeat(
-        lease,
-        attempt_time + timedelta(seconds=1),
-        ResourceSample(sample.cpu_time, sample.memory_bytes),
-    )
+    document = copy.deepcopy(compiled_plan())
+    document["executionSnapshot"]["partitions"][0]["budgetCapBps"] = budget_cap_bps
+    document["planChecksum"] = compute_compiled_plan_checksum(document)
+    return document
 
-    run = RunSnapshot(
-        backtest_run_id=BACKTEST_RUN_ID,
-        strategy_version_id=STRATEGY_VERSION_ID,
-        input_bundle_fingerprint=str(request["input_bundle_fingerprint"]),
-        calculation_model_version=(
-            D17_EXECUTION_POLICY_FIXTURE.calculation_model_version
-        ),
-        cost_model_version="official-cost-v1",
-        execution_model_version="official-execution-v1",
-        initial_cash=Decimal("10000"),
-    )
-    model = BacktestExecutionModel(
-        D17_EXECUTION_POLICY_FIXTURE,
-        run.initial_cash,
-        RiskLimits(Decimal("10000"), Decimal("10000"), Decimal("10000")),
-    )
-    rows = table.to_pylist()
-    accepted = model.submit(
-        OrderRequest(
-            order_id=ORDER_ID,
-            instrument_id=INSTRUMENT_ID,
-            side=OrderSide.BUY,
-            order_type=OrderType.MARKET,
-            quantity=Decimal("10"),
-            quantity_mode=QuantityMode.WHOLE_SHARES,
-            time_in_force=TimeInForce.DAY,
-            submitted_at=rows[0]["bar_start_at"],
-            eligible_at=rows[1]["bar_start_at"],
-            day_expires_at=D17_EXECUTION_POLICY_FIXTURE.period_end,
-            reference_price=Decimal(str(rows[0]["close"])),
-        )
-    )
-    records = [
-        order_result_record(run, accepted, accepted.submitted_at, model.cash, ())
-    ]
-    fills = model.process_bars([_minute_bar(row) for row in rows])
-    position = model.position(INSTRUMENT_ID)
-    positions = (
-        PositionAfter(position.instrument_id, position.quantity, position.cost_basis),
-    )
-    records.append(
-        fill_result_record(
-            run,
-            fills[0],
-            model.order(ORDER_ID),
-            model.cash,
-            positions,
-        )
-    )
-    completed_at = datetime(2024, 1, 2, 15, 5, tzinfo=timezone.utc)
-    result = ResultSnapshotBuilder().build(run, records, completed_at)
-    last_close = Decimal(str(rows[-1]["close"]))
-    equity = model.cash + position.quantity * last_close
-    details = DetailObjectBuilder().build(
-        result,
-        [
-            ReplayLedgerDetail(run.snapshot_id, transaction)
-            for transaction in model.ledger_transactions
-        ],
-        [
-            PerformancePoint(
-                PERFORMANCE_POINT_ID,
-                run.snapshot_id,
-                datetime(2024, 1, 2, 15, 1, tzinfo=timezone.utc),
-                "equity",
-                equity,
-                None,
-            )
-        ],
-        completed_at,
-    )
-    coordinator.complete(
-        lease,
-        attempt_time + timedelta(seconds=2),
-        result.manifest.result_manifest_id,
-        details.manifest.detail_manifest_id,
-    )
-    return OfficialBacktestOutcome(
-        request=request,
-        result=result,
-        details=details,
-        attempt_completed=coordinator.state is RunState.COMPLETE,
-    )
+
+def _iso(value: datetime) -> str:
+    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
