@@ -6,9 +6,11 @@ never touches Docker.
 
 The container is migrated with the **canonical** SQL: the vendored byte-for-byte copy
 of the applied central Flyway bundle under
-`db/migration-contributions/fixtures/central-migration/`. No DDL is hand-written in
-the suite, so a persistence layer that disagrees with the canonical schema fails here
-rather than in production.
+`db/migration-contributions/fixtures/central-migration/`, followed by this
+repository's own contributed migrations from
+`db/migration-contributions/migrations/`, in exactly the order the central assembler
+applies them. No DDL is hand-written in the suite, so a persistence layer that
+disagrees with the canonical schema fails here rather than in production.
 
 The LocalStack fixtures (`localstack`, `sqs`, `s3`, `queues`, `bucket`) live here
 rather than in one test module because three integration modules -- the D30/D31
@@ -37,6 +39,7 @@ from backtest_engine.persistence import BacktestPersistence, create_backtest_eng
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONTRIBUTION_ROOT = REPO_ROOT / "db" / "migration-contributions"
 VENDORED_MIGRATIONS = CONTRIBUTION_ROOT / "fixtures" / "central-migration"
+CONTRIBUTED_MIGRATIONS = CONTRIBUTION_ROOT / "migrations"
 VENDORED_DIGESTS = CONTRIBUTION_ROOT / "fixtures" / "central-migration.sha256"
 REFERENCE_SEED = CONTRIBUTION_ROOT / "fixtures" / "backtest_reference_seed.sql.fixture"
 
@@ -46,6 +49,7 @@ LOCALSTACK_IMAGE = os.environ.get("BACKTEST_TEST_LOCALSTACK_IMAGE", "localstack/
 _VERSION = re.compile(r"^V(?P<version>[0-9]+)__")
 
 _BACKTEST_TABLES = (
+    "backtest.run_input_pins",
     "backtest.failure_condition_counts",
     "backtest.monthly_judgment_summaries",
     "backtest.performance_summaries",
@@ -129,10 +133,15 @@ def contributed_migration_files() -> list[Path]:
     assembler does, so the container ends up with the schema this repository is
     actually asking for. Without this step a contributed column would be invisible
     to every integration test and the contribution would be untested SQL.
+
+    Filename order is timestamp order, which is what makes two independently
+    contributed migrations -- `V20260802094500__backtest_run_input_pins` and
+    `V20260802143000__backtest_run_outcome_detail` -- apply in the same sequence
+    here as centrally.
     """
 
-    directory = CONTRIBUTION_ROOT / "migrations"
-    return sorted(path for path in directory.glob("V*.sql") if path.is_file())
+    files = [path for path in CONTRIBUTED_MIGRATIONS.glob("V*.sql") if path.is_file()]
+    return sorted(files, key=lambda path: path.name)
 
 
 def _apply_canonical_migrations(url: str) -> None:
@@ -143,9 +152,8 @@ def _apply_canonical_migrations(url: str) -> None:
     DDL, which `test_runtime_no_ddl.py` asserts.
     """
 
-    scripts = [path.read_text(encoding="utf-8") for path in migration_files()]
-    scripts += [path.read_text(encoding="utf-8") for path in contributed_migration_files()]
-    _execute_scripts(url, scripts)
+    ordered = migration_files() + contributed_migration_files()
+    _execute_scripts(url, [path.read_text(encoding="utf-8") for path in ordered])
 
 
 def _apply_reference_seed(url: str) -> None:

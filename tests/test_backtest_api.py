@@ -52,7 +52,7 @@ from backtest_engine.lifecycle import (
     run_id_for,
 )
 from backtest_engine.monthly_judgment import MonthlyJudgmentBuilder, MonthlyJudgmentSummary
-from backtest_engine.persistence.rows import RunAttemptRow, WorkStatus
+from backtest_engine.persistence.rows import RunAttemptRow, RunStatus, WorkStatus
 from backtest_engine.result_query import (
     BacktestResultQueryService,
     InMemoryBacktestResultQueryStore,
@@ -292,6 +292,21 @@ class Harness:
 
     def project(self, status: str) -> None:
         self.results.upsert_run(_projection(status))
+
+    def complete_run(self, request: dict[str, Any]) -> None:
+        """Walk the *write* model's run to COMPLETED, as an ingested result does."""
+        _accept(self, request)
+        run_id = UUID(EXPECTED_RUN_ID)
+        self.gateway.transition(
+            run_id, RunStatus.RUNNING, started_at=datetime(2026, 7, 31, 12, 5, tzinfo=timezone.utc)
+        )
+        self.gateway.transition(
+            run_id,
+            RunStatus.COMPLETED,
+            completed_at=datetime(2026, 7, 31, 12, 9, tzinfo=timezone.utc),
+            result_hash="c" * 64,
+            failure_code=None,
+        )
 
 
 #: B's published request is dated 2026-07-31, so the policy the catalog must select is
@@ -881,16 +896,46 @@ def test_attempt_history_is_exposed(
     ]
 
 
-def test_performance_is_404_until_the_run_produces_one(
-    harness: Harness, official_request: dict[str, Any]
+@pytest.mark.parametrize(
+    "suffix",
+    ["/performance", "/monthly-summaries", "/detail-manifests"],
+)
+def test_evidence_routes_are_409_until_the_run_completes(
+    harness: Harness, official_request: dict[str, Any], suffix: str
 ) -> None:
+    """One status code for "the run is yours, it just has no result yet".
+
+    `/monthly-trades` already answered 409 through the result read model while
+    `/performance` answered 404 and the two list routes answered `200 {"items": []}`.
+    Three answers to one question is three branches in the UI, and the empty list is
+    indistinguishable from a finished run that traded nothing.
+    """
+
     _accept(harness, official_request)
 
     response = harness.client.get(
-        f"/api/v1/backtests/{EXPECTED_RUN_ID}/performance", headers=harness.owner()
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}{suffix}", headers=harness.owner()
     )
 
-    assert response.status_code == 404
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["reasonCode"] == "BACKTEST_RESULT_NOT_READY"
+    assert detail["status"] == "QUEUED"
+
+
+def test_a_completed_run_that_produced_no_detail_objects_is_an_empty_list_not_409(
+    harness: Harness, official_request: dict[str, Any]
+) -> None:
+    """409 is about the run's status, never about the answer being empty."""
+
+    harness.complete_run(official_request)
+
+    response = harness.client.get(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}/detail-manifests", headers=harness.owner()
+    )
+
+    assert response.status_code == 200
+    assert response.json()["items"] == []
 
 
 def test_unknown_run_is_404_for_every_query(harness: Harness) -> None:
@@ -1108,9 +1153,10 @@ def test_monthly_trade_detail_of_an_unfinished_run_is_409_not_a_partial_answer(
     )
 
     assert response.status_code == 409
-    assert response.json()["detail"] == (
-        f"backtest result is not available for status {status}"
-    )
+    assert response.json()["detail"] == {
+        "message": f"backtest result is not available for status {status}",
+        "reasonCode": "BACKTEST_RESULT_NOT_READY",
+    }
 
 
 @pytest.mark.parametrize(

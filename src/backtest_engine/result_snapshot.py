@@ -859,6 +859,50 @@ class ResultSnapshotBuilder:
         return result
 
     @staticmethod
+    def rebuild(object_bytes: bytes, calculated_at: datetime) -> ResultSnapshot:
+        """Recover a published `ResultSnapshot` from its stored object bytes.
+
+        The durable read model keeps no copy of the snapshot: the JSON object in
+        storage is the evidence, and `backtest.performance_summaries.calculated_at` is
+        the completion instant the manifest and every hash were taken at. Parsing is
+        deliberately *not* trusted — the parsed records are re-serialised through
+        :meth:`build`, and the result is rejected unless the bytes it produces are
+        byte-identical to the ones supplied. A field this parser dropped, coerced or
+        re-ordered therefore fails here instead of being served as evidence.
+
+        Raises `ResultIntegrityError`; never returns a partially recovered snapshot.
+        """
+        if not isinstance(object_bytes, bytes):
+            raise ResultIntegrityError("result object content must be bytes")
+        try:
+            payload = json.loads(object_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ResultIntegrityError(f"result object is not valid JSON: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise ResultIntegrityError("result object must be a JSON object")
+        if payload.get("schema_version") != SCHEMA_VERSION:
+            raise ResultIntegrityError(
+                f"result object schema_version must be {SCHEMA_VERSION}, "
+                f"got {payload.get('schema_version')!r}"
+            )
+        try:
+            run_snapshot = _run_snapshot_from_payload(payload["run_snapshot"])
+            records = [
+                _record_from_payload(run_snapshot.snapshot_id, item)
+                for item in payload["records"]
+            ]
+        except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+            raise ResultIntegrityError(f"result object cannot be parsed: {exc}") from exc
+
+        rebuilt = ResultSnapshotBuilder().build(run_snapshot, records, calculated_at)
+        if rebuilt.object_bytes != object_bytes:
+            raise ResultIntegrityError(
+                "rebuilt result object does not match the stored bytes; the stored "
+                "object, the parse, or the completion instant disagree"
+            )
+        return rebuilt
+
+    @staticmethod
     def verify(result: ResultSnapshot) -> None:
         if not isinstance(result, ResultSnapshot):
             raise ResultIntegrityError("result snapshot type is invalid")
@@ -990,6 +1034,92 @@ class InMemoryResultSnapshotStore:
             ) from exc
         ResultSnapshotBuilder.verify(result)
         return result
+
+
+#: The nine columns a FILL record carries and no other kind may.
+_FILL_FIELDS = (
+    "fill_id",
+    "quantity",
+    "base_price",
+    "price",
+    "gross_amount",
+    "slippage_amount",
+    "fee",
+    "cost_basis",
+    "realized_pnl",
+)
+
+
+def _parse_instant(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"timestamp must be a string, got {value!r}")
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _parse_decimal(value: object) -> Decimal:
+    if not isinstance(value, str):
+        raise ValueError(f"decimal must be canonical text, got {value!r}")
+    return Decimal(value)
+
+
+def _run_snapshot_from_payload(payload: object) -> RunSnapshot:
+    """Inverse of `_run_payload`. Every field is required; nothing defaults."""
+
+    if not isinstance(payload, dict):
+        raise ValueError("run_snapshot must be a JSON object")
+    return RunSnapshot(
+        backtest_run_id=payload["backtest_run_id"],
+        strategy_version_id=payload["strategy_version_id"],
+        input_bundle_fingerprint=payload["input_bundle_fingerprint"],
+        calculation_model_version=payload["calculation_model_version"],
+        cost_model_version=payload["cost_model_version"],
+        execution_model_version=payload["execution_model_version"],
+        initial_cash=_parse_decimal(payload["initial_cash"]),
+    )
+
+
+def _record_from_payload(run_snapshot_id: str, payload: object) -> ResultRecord:
+    """Inverse of `_record_payload`.
+
+    `reason_code` and the nine fill columns are omitted from the payload rather than
+    written as null, so "absent" is the only representation of "not applicable" and
+    reading one back must not invent a zero.
+    """
+
+    if not isinstance(payload, dict):
+        raise ValueError("result record must be a JSON object")
+    if payload["run_snapshot_id"] != run_snapshot_id:
+        raise ValueError("result record references a different run snapshot")
+    kind = ResultRecordKind(payload["kind"])
+    optional: dict[str, object] = {}
+    if "reason_code" in payload:
+        optional["reason_code"] = payload["reason_code"]
+    if kind is ResultRecordKind.FILL:
+        optional["fill_id"] = payload["fill_id"]
+        optional.update(
+            {name: _parse_decimal(payload[name]) for name in _FILL_FIELDS if name != "fill_id"}
+        )
+    elif any(name in payload for name in _FILL_FIELDS):
+        raise ValueError(f"a {kind.value} record must not carry fill columns")
+    return ResultRecord(
+        run_snapshot_id=payload["run_snapshot_id"],
+        record_id=payload["record_id"],
+        kind=kind,
+        occurred_at=_parse_instant(payload["occurred_at"]),
+        order_id=payload["order_id"],
+        instrument_id=payload["instrument_id"],
+        order_status=OrderStatus(payload["order_status"]),
+        cash_after=_parse_decimal(payload["cash_after"]),
+        positions_after=tuple(
+            PositionAfter(
+                instrument_id=item["instrument_id"],
+                quantity=_parse_decimal(item["quantity"]),
+                cost_basis=_parse_decimal(item["cost_basis"]),
+            )
+            for item in payload["positions_after"]
+        ),
+        **optional,
+    )
 
 
 def _event_id(

@@ -34,8 +34,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import StrEnum
@@ -47,6 +48,7 @@ from .attempt_coordinator import (
     AttemptCoordinator,
     AttemptFailure,
     AttemptLease,
+    AttemptState,
     FailureKind,
     ResourceMonitor,
 )
@@ -88,6 +90,7 @@ __all__ = [
     "ReplayOutcome",
     "ReplayStatus",
     "ReplayStep",
+    "ResultPublicationError",
     "ResultPublisher",
     "SessionCalendar",
     "bar_events_from_table",
@@ -105,8 +108,38 @@ ORCHESTRATOR_VERSION = "backtest-orchestrator:1.0.0"
 BAR_CLOSED_EVENT_TYPE = "BAR_CLOSED"
 
 
+_LOG = logging.getLogger(__name__)
+
+
 class OrchestratorError(RuntimeError):
     """Raised when a job cannot be assembled into a runnable replay."""
+
+
+class ResultPublicationError(RuntimeError):
+    """A `ResultPublisher` failed, and says whether retrying could ever help.
+
+    Publication is the only step where "try again" and "never try again" are both
+    plausible and the orchestrator cannot tell them apart: an unreachable object store
+    is transient, while a run that already carries a *different* immutable official
+    result is a conflict no number of redeliveries will resolve. Only the publisher
+    knows which happened, so it states it here instead of raising a bare exception and
+    letting the orchestrator guess `retryable=True`.
+
+    A publisher that raises anything else is treated as transient - a bounded number of
+    retries is the safer error - but its exception type and message are recorded on the
+    outcome and logged with the traceback.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool,
+        reason_code: str = "RESULT_PUBLICATION_FAILED",
+    ) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+        self.reason_code = reason_code
 
 
 class ReplayStatus(StrEnum):
@@ -291,6 +324,13 @@ class ReplayOutcome:
     result_manifest_id: str | None = None
     detail_manifest_id: str | None = None
     result_hash: str | None = None
+    #: `"<ExceptionType>: <message>"` when a failure had an exception behind it. A
+    #: `reason_code` names the *class* of failure; this names the instance, so a
+    #: `RESULT_PUBLICATION_FAILED` can be diagnosed without reading the source.
+    failure_detail: str | None = None
+    #: Whether this failure was reported to the attempt coordinator as retryable.
+    #: `None` for a successful outcome.
+    retryable: bool | None = None
 
     @property
     def skipped_step_count(self) -> int:
@@ -694,11 +734,29 @@ class BacktestOrchestrator:
         )
         try:
             published = self._publisher.publish(request)
-        except Exception:
+        except Exception as exc:
+            # The replay itself succeeded; only the write-out failed. Which reason code
+            # and which retryability are the publisher's to state (`ResultPublicationError`);
+            # anything else is unclassified, and an unclassified failure is retried but
+            # never silently: the cause travels on the outcome and into the log.
+            if isinstance(exc, ResultPublicationError):
+                reason_code, retryable = exc.reason_code, exc.retryable
+            else:
+                reason_code, retryable = "RESULT_PUBLICATION_FAILED", True
+            detail = f"{type(exc).__name__}: {exc}"
+            _LOG.error(
+                "backtest run %s could not publish its result (%s, retryable=%s): %s",
+                job.run_id,
+                reason_code,
+                retryable,
+                detail,
+                exc_info=exc,
+            )
             return self._abort(
-                job, coordinator, lease, "RESULT_PUBLICATION_FAILED",
-                retryable=True, status=ReplayStatus.FAILED,
+                job, coordinator, lease, reason_code,
+                retryable=retryable, status=ReplayStatus.FAILED,
                 availability=assessment.status, steps=steps, digest=digest,
+                detail=detail,
             )
 
         coordinator.complete(
@@ -732,6 +790,7 @@ class BacktestOrchestrator:
         availability: AvailabilityStatus = AvailabilityStatus.UNAVAILABLE,
         steps: tuple[ReplayStep, ...] = (),
         digest: str = "",
+        detail: str | None = None,
     ) -> ReplayOutcome:
         coordinator.fail(
             lease, self._wall_clock(), reason_code=reason_code, retryable=retryable
@@ -743,6 +802,8 @@ class BacktestOrchestrator:
             steps=steps,
             replay_digest=digest,
             reason_code=reason_code,
+            failure_detail=detail,
+            retryable=retryable,
         )
 
 
@@ -805,16 +866,17 @@ def _from_attempt_failure(
         steps=steps,
         replay_digest="",
         reason_code=recorded or failure.kind.value,
+        failure_detail=f"{type(failure).__name__}: {failure}",
+        # Read off the attempt the coordinator already recorded rather than re-derived,
+        # for the same reason `reason_code` is: the outcome and the durable attempt row
+        # must not be able to disagree about whether this is worth retrying.
+        retryable=(
+            attempts[-1].state is AttemptState.RETRYABLE_FAILED if attempts else None
+        ),
     )
 
 
 def _with_missing(outcome: ReplayOutcome, missing: tuple[str, ...]) -> ReplayOutcome:
-    return ReplayOutcome(
-        run_id=outcome.run_id,
-        status=outcome.status,
-        availability_status=outcome.availability_status,
-        steps=outcome.steps,
-        replay_digest=outcome.replay_digest,
-        reason_code=outcome.reason_code,
-        missing_requirements=missing,
-    )
+    """`replace`, not a re-construction: a new field must not be dropped here."""
+
+    return replace(outcome, missing_requirements=missing)

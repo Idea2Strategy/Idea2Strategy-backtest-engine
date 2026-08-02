@@ -204,7 +204,15 @@ def test_storage_object_reader_has_no_write_methods() -> None:
 
     public = {name for name in dir(StorageObjectReader) if not name.startswith("_")}
 
-    assert public == {"connection", "find", "find_by_key", "get", "list_by_ids", "require_available"}
+    assert public == {
+        "connection",
+        "find",
+        "find_by_key",
+        "find_result_snapshot_object",
+        "get",
+        "list_by_ids",
+        "require_available",
+    }
 
 
 def test_require_available_rejects_a_staged_object(persistence: BacktestPersistence) -> None:

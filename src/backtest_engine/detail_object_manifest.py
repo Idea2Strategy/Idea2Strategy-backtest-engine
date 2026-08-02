@@ -99,6 +99,7 @@ __all__ = [
     "PublishedDetails",
     "ReplayLedgerDetail",
     "StoredDetailObject",
+    "reassemble_detail_bundle",
 ]
 
 
@@ -896,6 +897,88 @@ def _verify_parts(manifest: DetailObjectManifest) -> None:
         for earlier, later in pairwise(ordered):
             if earlier.period_end > later.period_start:
                 raise DetailIntegrityError("detail parts must not overlap in time")
+
+
+def reassemble_detail_bundle(
+    *,
+    result_manifest_id: str,
+    run_snapshot_id: str,
+    backtest_run_id: str,
+    strategy_version_id: str,
+    created_at: datetime,
+    parts: Sequence[tuple[DetailObjectDescriptor, bytes]],
+    supersedes_manifest_id: str | None = None,
+) -> DetailObjectBundle:
+    """Rebuild a published bundle from its per-part rows and the stored bytes.
+
+    `backtest.detail_manifests` holds one row per Parquet part; the *bundle* identity
+    (`detail_manifest_id`, `manifest_hash`, `source_set_hash`) is not a column anywhere,
+    because it is a pure function of the parts. This derives it the same way
+    :meth:`DetailObjectBuilder.build` does, so a bundle read back out of PostgreSQL and
+    the object store is identical to the one the worker published, or it fails.
+
+    Two things are checked before any hash is taken:
+
+    * every part must carry the bundle's `created_at`. `build` stamps one instant on
+      every part, so a part that disagrees came from a different publish; and
+    * the part order is re-derived rather than trusted, because SQL returns rows in
+      whatever order the query asked for and the bundle hash covers the sequence.
+
+    `verify` then re-derives every published fact from the Parquet bytes themselves, so
+    a lost, truncated or edited object raises `DetailIntegrityError` here rather than
+    producing a short answer downstream.
+    """
+
+    created_at = _utc(created_at, "created_at")
+    ordered = sorted(
+        parts, key=lambda item: (item[0].week, item[0].record_type.value, item[0].part_number)
+    )
+    for descriptor, _ in ordered:
+        if not isinstance(descriptor, DetailObjectDescriptor):
+            raise DetailIntegrityError("detail parts must carry DetailObjectDescriptor values")
+        if descriptor.created_at != created_at:
+            raise DetailIntegrityError(
+                f"detail part {descriptor.object_key} has created_at "
+                f"{descriptor.created_at.isoformat()}, but this bundle was published at "
+                f"{created_at.isoformat()}"
+            )
+
+    descriptors = tuple(descriptor for descriptor, _ in ordered)
+    source_set_hash = _sha256(_canonical(_source_set_payload(descriptors)))
+    manifest_hash = _sha256(
+        _canonical(
+            _manifest_payload(
+                result_manifest_id,
+                run_snapshot_id,
+                backtest_run_id,
+                strategy_version_id,
+                descriptors,
+                source_set_hash,
+                created_at,
+                supersedes_manifest_id,
+            )
+        )
+    )
+    bundle = DetailObjectBundle(
+        manifest=DetailObjectManifest(
+            detail_manifest_id=_bundle_manifest_id(manifest_hash),
+            result_manifest_id=result_manifest_id,
+            run_snapshot_id=run_snapshot_id,
+            backtest_run_id=backtest_run_id,
+            strategy_version_id=strategy_version_id,
+            objects=descriptors,
+            source_set_hash=source_set_hash,
+            manifest_hash=manifest_hash,
+            created_at=created_at,
+            supersedes_manifest_id=supersedes_manifest_id,
+        ),
+        objects=tuple(
+            StoredDetailObject(descriptor=descriptor, parquet_bytes=data)
+            for descriptor, data in ordered
+        ),
+    )
+    DetailObjectBuilder.verify(bundle)
+    return bundle
 
 
 # --------------------------------------------------------------------------------

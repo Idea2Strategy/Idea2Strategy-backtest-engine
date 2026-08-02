@@ -15,9 +15,14 @@ Every leg is real, and each is *observed* rather than assumed:
     B's ``OFFICIAL_BACKTEST_REQUESTED`` is posted to the FastAPI app through
     ``fastapi.testclient.TestClient``. The worker posts its ``backtest.v1``
     events back to ``POST /api/v1/backtests/{id}/results``, and the results are
-    read out again through the five owner-scoped query endpoints. A server-side
-    ASGI recorder captures the requests the app actually received, so the
-    ``X-Delivery-Attempt`` assertions are about what arrived, not what was sent.
+    read out again through all eight owner-scoped query endpoints - including
+    ``monthly-trades``, which closes the loop: the app is built with a real
+    ``BacktestResultQueryService`` over the same PostgreSQL and the same S3
+    bucket the worker published into, so the traversal asserts that the trade
+    row in the Parquet object is readable back over HTTP rather than only that
+    it was written. A server-side ASGI recorder captures the requests the app
+    actually received, so the ``X-Delivery-Attempt`` assertions are about what
+    arrived, not what was sent.
 
 ``SQS``
     A real LocalStack queue. The test asserts the queue depth goes 0 -> 1 on
@@ -68,6 +73,10 @@ from sqlalchemy import Engine
 from backtest_engine.attempt_coordinator import ResourceSample
 from backtest_engine.persistence import BacktestPersistence
 from backtest_engine.worker import MessageDisposition
+
+# `build_stack` builds the app *with* a real `BacktestResultQueryService` (see
+# `d_integration_stack`), which is what lets the traversal below read the published
+# run back over HTTP rather than only assert that the worker wrote it.
 from d_integration_stack import (
     ScriptedMonitor,
     Stack,
@@ -301,8 +310,8 @@ def test_an_official_request_traverses_http_sqs_worker_postgres_and_the_object_s
 
     # -- the trade detail really carries the fill the engine computed -------
     trade_key = _trade_detail_key(objects, manifests)
-    trades = pq.read_table(io.BytesIO(fetch_object(s3, stack.bucket, trade_key))).to_pylist()
-    fill = next(row for row in trades if row["kind"] == "FILL")
+    trades_rows = pq.read_table(io.BytesIO(fetch_object(s3, stack.bucket, trade_key))).to_pylist()
+    fill = next(row for row in trades_rows if row["kind"] == "FILL")
     assert fill["instrument_id"] == INSTRUMENT_ID
     assert fill["quantity"] == "992.00000000"
     assert fill["price"] == "100.05000000"
@@ -333,6 +342,58 @@ def test_an_official_request_traverses_http_sqs_worker_postgres_and_the_object_s
         f"/api/v1/backtests/{run_id}/detail-manifests", headers=stack.owner()
     ).json()["items"]
     assert len(api_manifests) == len(manifests)
+
+    # -- D29's whole point: the published trade detail, read back over HTTP --
+    #
+    # Everything above proves the worker wrote the evidence. This proves a client can
+    # get it: the read model finds the run in `backtest.runs`, its ET-week parts in
+    # `backtest.detail_manifests`, their bytes in `storage.objects` and S3, re-hashes
+    # them, re-verifies the Parquet footers, and places each row in its own ET month.
+    # The row asserted here is the *same* row `fill` above was read from with raw
+    # boto3, to the last of its eight decimal places.
+    trades = stack.client.get(
+        f"/api/v1/backtests/{run_id}/monthly-trades?et_month=2024-01",
+        headers=stack.owner(),
+    )
+    assert trades.status_code == 200, trades.text
+    body = trades.json()
+    assert body["etMonth"] == "2024-01"
+    over_http = next(item for item in body["items"] if item["kind"] == "FILL")
+    assert over_http["recordId"] == fill["record_id"]
+    assert over_http["instrumentId"] == INSTRUMENT_ID
+    assert over_http["quantity"] == "992.00000000"
+    assert over_http["price"] == "100.05000000"
+    assert over_http["fee"] == "198.49920000"
+    assert over_http["cashAfter"] == "551.90080000"
+    assert over_http["orderStatus"] == "FILLED"
+    # `trade_event_count` for the month is 2 (the accepted order and its fill), and the
+    # read model cross-checks the Parquet rows against exactly that summary.
+    assert [item["kind"] for item in body["items"]] == ["ORDER", "FILL"]
+    assert {item["recordId"] for item in body["items"]} == {
+        str(row["record_id"]) for row in trades_rows
+    }
+    # A month the run never traded in is empty, not a 404 and not an error.
+    assert stack.client.get(
+        f"/api/v1/backtests/{run_id}/monthly-trades?et_month=2024-02",
+        headers=stack.owner(),
+    ).json()["items"] == []
+
+    # -- and the pinned inputs the acceptance transaction recorded ----------
+    api_inputs = stack.client.get(
+        f"/api/v1/backtests/{run_id}/inputs", headers=stack.owner()
+    )
+    assert api_inputs.status_code == 200, api_inputs.text
+    reported = api_inputs.json()
+    assert reported["status"] == "COMPLETED"
+    assert reported["inputBundleFingerprint"] == EXPECTED_INPUT_BUNDLE_FINGERPRINT
+    assert reported["compiledPlanChecksum"] == stack.request["compiledPlanChecksum"]
+    assert reported["strategySnapshotHash"] == stack.request["expectedSnapshotHash"]
+    assert reported["datasetManifestId"] == str(DATASET_MANIFEST_ID)
+    assert reported["executionPolicyVersion"] == E2E_EXECUTION_POLICY.version
+    assert reported["precisionRulesVersion"] == "precision:1.0.0"
+    # Model versions come from the stored result object, not from the request.
+    assert reported["costModelVersion"] == "backtest-cost:1.0.0"
+    assert reported["executionModelVersion"] == "backtest-execution:1.0.0"
 
     # -- the worker's own events really went over HTTP ----------------------
     posted = stack.recorder.result_posts()

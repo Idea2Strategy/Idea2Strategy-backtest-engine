@@ -65,7 +65,7 @@ portfolio,performance,market_data,manifests}/` 는 존재하지 않습니다.
 | 큐 | `SqsBacktestJobQueue` 는 발행만 합니다. 소비자, DLQ, 재전달 처리가 없습니다. |
 | API 표면 | `/api/v1` prefix, 인증, 소유자 스코프, 5개 조회 엔드포인트, 결과 수신 엔드포인트가 없습니다. |
 | 호출부 전환 | 도메인 모듈은 여전히 `InMemory*Store` 를 씁니다. 영속성 리포지토리로의 교체는 후속 단계입니다. |
-| 마이그레이션 SQL | `db/migration-contributions/migrations/` 는 비어 있습니다. 모든 테이블이 이미 정본 baseline에 있습니다. |
+| 마이그레이션 SQL | `db/migration-contributions/migrations/` 에 `V20260802094500__backtest_run_input_pins.sql` 1건이 있습니다. 나머지 테이블은 이미 정본 baseline에 있습니다. DBML 변경 요청은 `db/migration-contributions/change-requests/` 에 **제안 상태**로만 있습니다. |
 
 ## 실행
 
@@ -78,13 +78,40 @@ python -m venv .venv
 .venv\Scripts\python -m pytest -m docker             # Testcontainers PostgreSQL 16 통합
 .venv\Scripts\python -m ruff check src tests
 .venv\Scripts\python -m mypy
-.venv\Scripts\backtest-api                           # http://0.0.0.0:8082
+.venv\Scripts\backtest-api                           # 환경변수 필요, 아래 참조
 ```
 
 기본 `pytest` 실행은 `-m 'not docker'` 로 설정되어 있어 Docker를 건드리지 않습니다.
 `-m docker` 를 주면 그 설정을 덮어써 통합 스위트만 실행합니다.
 
-`backtest-worker` 는 아직 종료 신호를 기다리는 것 외에 아무 일도 하지 않습니다.
+### `backtest-api` 환경변수
+
+`backtest_engine.wiring.API_REQUIRED_ENV` 가 정본 목록입니다. 하나라도 없으면 프로세스는
+누락된 이름을 **전부 한 번에** 알려주고 기동을 거부합니다. 기본값은 하나도 없습니다.
+
+| 변수 | 값 |
+|---|---|
+| `BACKTEST_DATABASE_URL` | SQLAlchemy URL |
+| `BACKTEST_QUEUE_URL` | 작업 SQS 큐 URL |
+| `BACKTEST_API_HOST` / `BACKTEST_API_PORT` | bind 주소 |
+| `BACKTEST_AUTHENTICATOR` | `package.module:factory` → `api.Authenticator` |
+| `BACKTEST_OBJECT_STORE` | `package.module:factory` → `object_store.ObjectStore` |
+| `BACKTEST_OWNER_DIRECTORY` | `package.module:factory` → `lifecycle.OwnerDirectory` |
+| `BACKTEST_COMPILED_PLAN_SOURCE` | `package.module:factory` → `lifecycle.CompiledPlanSource` |
+| `BACKTEST_DATASET_MANIFEST_SOURCE` | `package.module:factory` → `lifecycle.DatasetManifestSource` |
+| `BACKTEST_EXECUTION_POLICY_CATALOG` | `package.module:factory` → `ExecutionPolicyCatalog` |
+| `BACKTEST_DEAD_LETTER_SINK` | `package.module:factory` → `lifecycle.DeadLetterSink` |
+
+`AWS_REGION`/`AWS_DEFAULT_REGION` 과 `AWS_ENDPOINT_URL` 은 boto3 자체 설정입니다.
+
+기동 순서는 **구성 → 스키마 검증 → 서비스** 입니다. 런타임은 DDL을 실행하지 않으므로
+스키마 drift 는 복구 대상이 아니라 기동 실패 사유입니다.
+
+`backtest-worker` 는 `BACKTEST_QUEUE_URL`, `BACKTEST_DLQ_URL`, `BACKTEST_WORKER_ID`,
+`BACKTEST_JOB_HANDLER`, `BACKTEST_EXECUTION_KEY_STORE` 를 모두 요구합니다.
+`BACKTEST_EXECUTION_KEY_STORE` 는 더 이상 선택 사항이 아닙니다. 비워 두면 프로세스 지역
+딕셔너리(`InMemoryExecutionKeyStore`)로 조용히 대체되어, 이 모듈이 존재하는 이유인
+프로세스 간 중복 실행 방지가 사라집니다.
 
 자세한 경계는 [DEVELOPMENT.md](DEVELOPMENT.md), 마이그레이션 기여 규약은
 [db/migration-contributions/README.md](db/migration-contributions/README.md) 를 확인합니다.

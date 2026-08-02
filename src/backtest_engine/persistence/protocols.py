@@ -23,18 +23,30 @@ canonical `backtest.runs` table has no column for:
   `release_dispatch()` are exactly the durable, cross-process control that the current
   in-memory flag only pretends to be.
 
-`result_query.BacktestResultQueryStore` has the same problem one level up: its
-`_QueryEntry` embeds a `ResultSnapshot` that holds the object *bytes*, which live in
-object storage, not in PostgreSQL.
+## What `result_query` did about the same problem — resolved
 
-Two honest options, both out of scope for this stage because it authors no migration:
+`result_query.BacktestResultQueryStore` had the same problem one level up: its
+`_QueryEntry` embeds a `ResultSnapshot` that holds the object *bytes*, which live in
+object storage, not in PostgreSQL. That is now settled.
+`result_query.DurableBacktestResultQueryStore` takes **option 2 below** and
+reconstructs the projection on read; the reasoning and the price are written down in
+that module's docstring. It stores no projection, so there is nothing here for it to
+drift from. The one row it needed that no canonical table had —
+`backtest.run_input_pins`, the request identifiers `runs.configuration_hash` hashes
+over — is an input row written in the acceptance transaction, contributed by
+`db/migration-contributions/migrations/V20260802094500__backtest_run_input_pins.sql`
+with a change request beside it.
+
+## What is still open: `lifecycle.BacktestRunStore`
+
+Two honest options for the *write* aggregate, both still out of scope here:
 
 1. Add a `backtest.run_dispatches` table (or `runs.dispatch_state`/`runs.row_version`
    columns) in a reviewed `db/schema.dbml` change plus a new central migration, then
    implement `BacktestRunStore` over it.
 2. Change the lifecycle aggregate so the request envelope is not part of durable run
-   state, and reconstruct the query projection from `runs` + `input_bundles` +
-   `performance_summaries` + `detail_manifests` + the object store.
+   state, and reconstruct what is needed from `runs` + `input_bundles` +
+   `run_input_pins` + `performance_summaries` + `detail_manifests` + the object store.
 
 Until one of those is decided, a call site that needs `BacktestRunStore` semantics
 should use `RunStore` below, which is the subset the canonical schema actually

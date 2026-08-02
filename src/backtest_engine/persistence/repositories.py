@@ -37,6 +37,7 @@ from .errors import (
     RowNotFound,
 )
 from .rows import (
+    RUN_INPUT_PIN_IDENTITY_FIELDS,
     RUN_STATUS_TRANSITIONS,
     DetailManifestRow,
     FailureConditionCountRow,
@@ -47,6 +48,7 @@ from .rows import (
     ObjectStatus,
     PerformanceSummaryRow,
     RunAttemptRow,
+    RunInputPinRow,
     RunRow,
     RunStatus,
     StorageObjectRow,
@@ -62,6 +64,7 @@ from .tables import (
     monthly_judgment_summaries,
     performance_summaries,
     run_attempts,
+    run_input_pins,
     runs,
     storage_objects,
 )
@@ -74,6 +77,7 @@ __all__ = [
     "MonthlyJudgmentRepository",
     "PerformanceSummaryRepository",
     "RunAttemptRepository",
+    "RunInputPinRepository",
     "RunRepository",
     "StorageObjectReader",
     "StorageObjectRepository",
@@ -179,17 +183,29 @@ class RunRepository(_Repository):
     def find_by_idempotency_key(self, idempotency_key: str) -> RunRow | None:
         return self._fetch_one(select(runs).where(runs.c.idempotency_key == idempotency_key), RunRow)
 
-    def list_by_owner(self, owner_account_id: UUID, *, limit: int = 50, offset: int = 0) -> tuple[RunRow, ...]:
+    def list_by_owner(
+        self,
+        owner_account_id: UUID,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        bot_id: UUID | None = None,
+    ) -> tuple[RunRow, ...]:
+        """One page of an owner's runs, newest first.
+
+        `bot_id` filters in SQL, before `LIMIT`. Filtering the page afterwards would
+        silently drop runs the caller can never page to.
+        """
+
         if limit < 1:
             raise ValueError("limit must be positive")
         if offset < 0:
             raise ValueError("offset must not be negative")
+        statement = select(runs).where(runs.c.owner_account_id == owner_account_id)
+        if bot_id is not None:
+            statement = statement.where(runs.c.bot_id == bot_id)
         return self._fetch_all(
-            select(runs)
-            .where(runs.c.owner_account_id == owner_account_id)
-            .order_by(runs.c.queued_at.desc(), runs.c.id)
-            .limit(limit)
-            .offset(offset),
+            statement.order_by(runs.c.queued_at.desc(), runs.c.id).limit(limit).offset(offset),
             RunRow,
         )
 
@@ -397,6 +413,56 @@ class RunAttemptRepository(_Repository):
         """Advisory only. `(run_id, attempt_number)` is the real arbiter."""
 
         return len(self.list_for_run(run_id)) + 1
+
+
+class RunInputPinRepository(_Repository):
+    """`backtest.run_input_pins` — the request identifiers, pinned once at acceptance.
+
+    Written in the same transaction as the `backtest.runs` insert, so a run either has
+    its pins or does not exist. Idempotent on `run_id`, because acceptance itself is
+    idempotent on `runs.idempotency_key`; a *different* pin set for a run that already
+    has one means two materially different requests derived the same run id, which is
+    the same conflict `RunRepository.accept` refuses.
+    """
+
+    def pin(self, row: RunInputPinRow) -> tuple[RunInputPinRow, bool]:
+        statement = (
+            pg_insert(run_input_pins).values(**row_to_params(row)).on_conflict_do_nothing().returning(*run_input_pins.c)
+        )
+        inserted = _first(self._connection.execute(statement).all())
+        if inserted is not None:
+            return _hydrate(RunInputPinRow, inserted), True
+
+        existing = self.find(row.run_id)
+        if existing is None:  # pragma: no cover - only reachable on a torn write
+            raise PublishConflict(f"run input pins for run {row.run_id} vanished during insert")
+        differing = [
+            field for field in RUN_INPUT_PIN_IDENTITY_FIELDS if getattr(existing, field) != getattr(row, field)
+        ]
+        if differing:
+            raise IdempotencyConflict(
+                f"run {row.run_id} already pinned different request inputs; differing fields: {differing}"
+            )
+        return existing, False
+
+    def find(self, run_id: UUID) -> RunInputPinRow | None:
+        return self._fetch_one(select(run_input_pins).where(run_input_pins.c.run_id == run_id), RunInputPinRow)
+
+    def get(self, run_id: UUID) -> RunInputPinRow:
+        found = self.find(run_id)
+        if found is None:
+            raise RowNotFound(f"run input pins not found for run: {run_id}")
+        return found
+
+    def list_by_ids(self, run_ids: Sequence[UUID]) -> tuple[RunInputPinRow, ...]:
+        """One query for a page of runs, so listing is not N+1."""
+
+        if not run_ids:
+            return ()
+        return self._fetch_all(
+            select(run_input_pins).where(run_input_pins.c.run_id.in_(list(run_ids))),
+            RunInputPinRow,
+        )
 
 
 class InputBundleRepository(_Repository):
@@ -660,6 +726,39 @@ class StorageObjectReader(_Repository):
             StorageObjectRow,
         )
 
+    def find_result_snapshot_object(self, run_id: UUID, *, bucket_name: str) -> StorageObjectRow | None:
+        """The immutable result-snapshot object one run published, or `None`.
+
+        `backtest.*` has no column pointing at it: the JSON snapshot is registered in
+        `storage.objects` only, and `runs.result_hash` is the *summary* digest, not the
+        object's content hash. Its key is content-addressed under a run-scoped prefix
+        (`result_snapshot.ResultSnapshotBuilder.build`), so the prefix is the only
+        handle, and the bucket is required because object identity in
+        `storage.objects` includes it — the same content in another deployment's
+        bucket is a different row and must not be served here.
+
+        A `LIKE` with no wildcard in the interpolated part: `run_id` is a `UUID`, whose
+        text form cannot contain `%` or `_`.
+        """
+
+        prefix = f"backtest-results/{run_id}/%.json"
+        rows = self._fetch_all(
+            select(storage_objects)
+            .where(
+                storage_objects.c.bucket_name == bucket_name,
+                storage_objects.c.object_key.like(prefix),
+                storage_objects.c.status == ObjectStatus.AVAILABLE.value,
+            )
+            .order_by(storage_objects.c.created_at, storage_objects.c.id),
+            StorageObjectRow,
+        )
+        if len(rows) > 1:
+            raise PublishConflict(
+                f"run {run_id} has {len(rows)} AVAILABLE result snapshot objects in bucket "
+                f"{bucket_name!r}; an official result is immutable and has exactly one"
+            )
+        return rows[0] if rows else None
+
     def list_by_ids(self, object_ids: Sequence[UUID]) -> tuple[StorageObjectRow, ...]:
         if not object_ids:
             return ()
@@ -827,6 +926,7 @@ class BacktestUnitOfWork:
         self.connection = connection
         self.runs = RunRepository(connection)
         self.attempts = RunAttemptRepository(connection)
+        self.pins = RunInputPinRepository(connection)
         self.inputs = InputBundleRepository(connection)
         self.monthly = MonthlyJudgmentRepository(connection)
         self.performance = PerformanceSummaryRepository(connection)

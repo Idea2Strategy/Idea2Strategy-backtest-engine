@@ -69,6 +69,10 @@ class MonthlyJudgmentValidationError(ValueError):
     """Raised when monthly judgment evidence is ambiguous or inconsistent."""
 
 
+class MonthlyJudgmentIntegrityError(RuntimeError):
+    """Raised when a stored summary document no longer matches its content address."""
+
+
 class StrategyMode(str, Enum):
     BASIC = "BASIC"
     PRO = "PRO"
@@ -502,6 +506,73 @@ class MonthlyJudgmentBuilder:
                 )
             )
         return tuple(summaries)
+
+
+def summary_from_document(
+    document: Mapping[str, Any], summary_hash: str
+) -> MonthlyJudgmentSummary:
+    """Recover one summary from the `summary_document` jsonb and its `summary_hash`.
+
+    `summary_document` is the whole aggregate — the six counters, the first-failure
+    histogram and the month's trade record identities — and `summary_hash` is its
+    content address. So a `backtest.monthly_judgment_summaries` row is sufficient on
+    its own, and the durable read model does not need a second copy of the month.
+
+    The hash is re-derived from the document before anything is returned: a row whose
+    jsonb was edited in place no longer addresses its own content, and serving it would
+    let a `trade_event_count` that never happened reach the API. That is
+    `MonthlyJudgmentIntegrityError`, not a validation error, because the caller sent
+    nothing wrong — the stored evidence is.
+    """
+
+    _hash(summary_hash, "summary_hash")
+    if not isinstance(document, Mapping):
+        raise MonthlyJudgmentValidationError("summary_document must be a mapping")
+    recomputed = _document_hash(document)
+    if recomputed != summary_hash:
+        raise MonthlyJudgmentIntegrityError(
+            f"monthly summary_document does not hash to its summary_hash "
+            f"({recomputed} != {summary_hash})"
+        )
+    if document.get("schema_version") != SUMMARY_SCHEMA_VERSION:
+        raise MonthlyJudgmentIntegrityError(
+            f"monthly summary_document schema_version must be {SUMMARY_SCHEMA_VERSION}, "
+            f"got {document.get('schema_version')!r}"
+        )
+    if document.get("timezone_id") != ET_TIMEZONE_ID:
+        raise MonthlyJudgmentIntegrityError(
+            f"monthly summary_document timezone_id must be {ET_TIMEZONE_ID}, "
+            f"got {document.get('timezone_id')!r}"
+        )
+
+    try:
+        year, _, month = str(document["et_year_month"]).partition("-")
+        et_month = EtMonth(int(year), int(month))
+        counters = {name: int(document[name]) for name in CANONICAL_COUNTERS}
+        failure_counts = tuple(
+            FirstFailureCount(
+                mode=StrategyMode(item["mode"]),
+                scope_id=item["flow_or_branch_key"],
+                condition_id=item["first_failure_condition_key"],
+                count=int(item["occurrence_count"]),
+            )
+            for item in document["failure_counts"]
+        )
+        return MonthlyJudgmentSummary(
+            summary_id=_summary_id(summary_hash),
+            run_snapshot_id=document["run_snapshot_id"],
+            result_manifest_id=document["result_manifest_id"],
+            et_month=et_month,
+            failure_counts=failure_counts,
+            trade_record_ids=tuple(document["trade_record_ids"]),
+            summary_document=document,
+            summary_hash=summary_hash,
+            **counters,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise MonthlyJudgmentIntegrityError(
+            f"monthly summary_document is not a readable summary: {exc}"
+        ) from exc
 
 
 def _first_failure(

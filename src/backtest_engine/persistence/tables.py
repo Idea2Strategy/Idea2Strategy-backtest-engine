@@ -50,6 +50,7 @@ __all__ = [
     "monthly_judgment_summaries",
     "performance_summaries",
     "run_attempts",
+    "run_input_pins",
     "runs",
     "storage_objects",
 ]
@@ -181,6 +182,33 @@ run_attempts = Table(
     Column("completed_at", TIMESTAMP(timezone=True)),
     Column("failure_code", VARCHAR(80)),
     Index("uq_run_attempts_run_id_attempt_number", "run_id", "attempt_number", unique=True),
+    schema=BACKTEST_SCHEMA,
+)
+
+#: Contributed by this repository, not by the applied baseline:
+#: `db/migration-contributions/migrations/V20260802094500__backtest_run_input_pins.sql`
+#: plus the change request beside it. The four version/checksum columns are inputs of
+#: `runs.configuration_hash`, which is a one-way digest, so `GET /{run_id}/inputs`
+#: cannot recover them from any existing column. Written once, in the acceptance
+#: transaction, so the route answers at `QUEUED` and `UNAVAILABLE` too.
+run_input_pins = Table(
+    "run_input_pins",
+    METADATA,
+    Column(
+        "run_id",
+        UUID(as_uuid=True),
+        ForeignKey(runs.c.id, deferrable=True, initially="IMMEDIATE"),
+        primary_key=True,
+    ),
+    Column("compiled_plan_checksum", VARCHAR(128), nullable=False),
+    Column("strategy_snapshot_hash", VARCHAR(128), nullable=False),
+    # `market_data.dataset_manifests.id`: read-only upstream reference, declared in the
+    # migration exactly as `input_datasets.dataset_manifest_id` is.
+    Column("dataset_manifest_id", UUID(as_uuid=True), nullable=False),
+    Column("dataset_hash", VARCHAR(128), nullable=False),
+    Column("feature_materialization_version", VARCHAR(80), nullable=False),
+    Column("execution_policy_version", VARCHAR(80), nullable=False),
+    Column("pinned_at", TIMESTAMP(timezone=True), nullable=False),
     schema=BACKTEST_SCHEMA,
 )
 
@@ -385,6 +413,7 @@ storage_objects = Table(
 WRITABLE_TABLES: tuple[Table, ...] = (
     runs,
     run_attempts,
+    run_input_pins,
     input_bundles,
     input_datasets,
     input_feature_materializations,

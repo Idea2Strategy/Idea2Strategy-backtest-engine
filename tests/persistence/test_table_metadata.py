@@ -1,9 +1,13 @@
 """The SQLAlchemy Core metadata must restate the canonical DDL exactly.
 
 This is a Docker-free test: it parses the vendored copy of the applied central
-baseline and compares it, column by column, with `backtest_engine.persistence.tables`.
-Anything the metadata invents, omits, widens or narrows fails here long before a
-container is started.
+baseline **plus this repository's own contributed migrations**, and compares the union,
+column by column, with `backtest_engine.persistence.tables`. Anything the metadata
+invents, omits, widens or narrows fails here long before a container is started.
+
+The contributed migrations are parsed from the same directory the central Flyway
+assembler reads (`db/migration-contributions/migrations`), in version order, so a table
+this repository authors is held to exactly the same standard as one it inherited.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ from backtest_engine.persistence.tables import (
     monthly_judgment_summaries,
     performance_summaries,
     run_attempts,
+    run_input_pins,
     runs,
     storage_objects,
 )
@@ -39,11 +44,17 @@ CONTRIBUTION_ROOT = Path(__file__).resolve().parents[2] / "db" / "migration-cont
 CENTRAL_BASELINE = CONTRIBUTION_ROOT / "fixtures" / "central-migration" / "V1__initial_schema.sql.fixture"
 
 #: This repository's own contributed migrations. The canonical schema this metadata
-#: must restate is *baseline plus contributions*, not the baseline alone: a column
-#: this repository legally added is as canonical as one the baseline declared, and
-#: comparing against the baseline alone would make every legal contribution look
+#: must restate is *baseline plus contributions*, not the baseline alone: a table or
+#: column this repository legally added is as canonical as one the baseline declared,
+#: and comparing against the baseline alone would make every legal contribution look
 #: like an invention. `tests/conftest.py` applies exactly these files to the
 #: container after the bundle, so the two halves cannot drift apart.
+#:
+#: Two kinds of contribution are folded in, because this repository has one of each:
+#: `V20260802094500__backtest_run_input_pins` adds a whole table (parsed by
+#: `_parse_baseline`, like any `CREATE TABLE`), and
+#: `V20260802143000__backtest_run_outcome_detail` adds columns to an applied table
+#: (folded in by `_apply_contributions`).
 CONTRIBUTED_MIGRATIONS = CONTRIBUTION_ROOT / "migrations"
 
 EXPECTED_TABLES = {
@@ -56,6 +67,7 @@ EXPECTED_TABLES = {
     "backtest.failure_condition_counts",
     "backtest.performance_summaries",
     "backtest.detail_manifests",
+    "backtest.run_input_pins",
     "storage.objects",
 }
 
@@ -165,6 +177,27 @@ def _parse_baseline(sql: str) -> dict[str, _DdlTable]:
     return tables
 
 
+def contributed_migration_files() -> list[Path]:
+    """This repository's contributed migrations, in filename (= timestamp) order."""
+
+    return sorted(CONTRIBUTED_MIGRATIONS.glob("V*.sql"))
+
+
+def canonical_sql() -> str:
+    """The applied baseline followed by this repository's contributed migrations.
+
+    Concatenated in the order the central assembler applies them, so a contributed
+    `CREATE TABLE` is parsed exactly like a baseline one and a contributed table that
+    the metadata does not restate fails the same assertions. Contributed `ADD COLUMN`
+    clauses are *not* handled here -- `_parse_baseline` only reads `CREATE TABLE` --
+    which is why `baseline()` folds them in afterwards with `_apply_contributions`.
+    """
+
+    sources = [CENTRAL_BASELINE.read_text(encoding="utf-8")]
+    sources.extend(path.read_text(encoding="utf-8") for path in contributed_migration_files())
+    return "\n\n".join(sources)
+
+
 _ADD_COLUMN = re.compile(
     r'ALTER TABLE\s+"(?P<schema>[a-z_]+)"\."(?P<name>[a-z_]+)"\s+(?P<body>.*?);',
     re.S | re.I,
@@ -208,10 +241,19 @@ def _apply_contributions(tables: dict[str, _DdlTable], sql: str) -> None:
 
 @pytest.fixture(scope="module")
 def baseline() -> dict[str, _DdlTable]:
-    parsed = _parse_baseline(CENTRAL_BASELINE.read_text(encoding="utf-8"))
+    """The canonical schema: applied baseline + contributed tables + contributed columns.
+
+    Both contribution shapes are applied, in that order. `canonical_sql` brings in
+    contributed `CREATE TABLE`s (so `backtest.run_input_pins` exists to be compared
+    at all), and `_apply_contributions` then folds contributed `ADD COLUMN` clauses
+    onto whichever table they target -- baseline or contributed alike, which is why
+    the folding runs after the parse rather than against the baseline alone.
+    """
+
+    parsed = _parse_baseline(canonical_sql())
     missing = EXPECTED_TABLES - set(parsed)
-    assert missing == set(), f"canonical baseline does not declare {sorted(missing)}"
-    for path in sorted(CONTRIBUTED_MIGRATIONS.glob("V*.sql")):
+    assert missing == set(), f"canonical DDL does not declare {sorted(missing)}"
+    for path in contributed_migration_files():
         _apply_contributions(parsed, path.read_text(encoding="utf-8"))
     return parsed
 
@@ -226,7 +268,7 @@ def test_the_contributed_migrations_really_add_the_columns_this_module_folds_in(
     """
     parsed = _parse_baseline(CENTRAL_BASELINE.read_text(encoding="utf-8"))
     before = set(parsed["backtest.runs"].columns)
-    for path in sorted(CONTRIBUTED_MIGRATIONS.glob("V*.sql")):
+    for path in contributed_migration_files():
         _apply_contributions(parsed, path.read_text(encoding="utf-8"))
 
     assert set(parsed["backtest.runs"].columns) - before == {
@@ -251,8 +293,39 @@ ALL_TABLES = [
     failure_condition_counts,
     performance_summaries,
     detail_manifests,
+    run_input_pins,
     storage_objects,
 ]
+
+
+def test_both_contributed_migrations_are_present_in_timestamp_order() -> None:
+    """Both contributions exist and apply in the order the central assembler uses.
+
+    Named explicitly rather than counted: the two migrations were authored on
+    separate branches, and the failure mode a merge introduces is that one of them
+    quietly disappears while every other assertion in this module still passes,
+    because each half is individually self-consistent.
+    """
+
+    assert [path.name for path in contributed_migration_files()] == [
+        "V20260802094500__backtest_run_input_pins.sql",
+        "V20260802143000__backtest_run_outcome_detail.sql",
+    ]
+
+
+def test_the_contributed_migration_is_the_only_new_backtest_table() -> None:
+    """A contributed migration may add tables; it may never redefine an applied one."""
+
+    contributed = _parse_baseline(
+        "\n\n".join(path.read_text(encoding="utf-8") for path in contributed_migration_files())
+    )
+    applied = _parse_baseline(CENTRAL_BASELINE.read_text(encoding="utf-8"))
+
+    # Only the input-pins contribution creates a table; the outcome-detail
+    # contribution is `ALTER TABLE ... ADD COLUMN` only, which `_parse_baseline`
+    # does not see and `_apply_contributions` folds in instead.
+    assert set(contributed) == {"backtest.run_input_pins"}
+    assert set(contributed) & set(applied) == set()
 
 
 def test_metadata_declares_exactly_the_canonical_tables() -> None:

@@ -26,6 +26,22 @@ Returning 404 for a foreign run would hide the distinction and is a defensible c
 in some products, but it also hides genuine authorisation bugs from the client and from
 this test suite, so the boundary is explicit.
 
+**409, not 404, for "the run has no result yet".** The five evidence routes -
+`performance`, `monthly-summaries`, `detail-manifests`, `monthly-trades` and the model
+half of `inputs` - all answer `409 Conflict` with
+`reasonCode: BACKTEST_RESULT_NOT_READY` while the run has not reached `COMPLETED`.
+They previously disagreed: `performance` answered 404, `monthly-trades` answered 409
+through the result read model, and the two list routes answered `200 {"items": []}`.
+Three answers to one question is three branches in a UI that only has two things to do
+- give up, or poll - and the empty list was the worst of them, because a finished run
+that traded nothing looks exactly the same.
+
+404 keeps one meaning across the whole surface: *there is no such run, or it is not
+yours*. 409 means *the run is yours and this evidence does not exist yet, so come
+back*. The status is repeated in the body so a client does not have to re-read the run
+to know which. Emptiness is never a reason for 409: a `COMPLETED` run with no detail
+objects returns `200 {"items": []}`, which is the true answer.
+
 **The two result-read-model routes deliberately answer 404 instead.** They serve a
 run's evidence rather than its metadata, so confirming that a run id exists and that
 another account finished it is a disclosure in itself. `result_query` fails closed the
@@ -51,6 +67,7 @@ Result ingestion is written for at-least-once delivery:
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -80,6 +97,7 @@ from .persistence.rows import (
     PerformanceSummaryRow,
     RunAttemptRow,
     RunRow,
+    RunStatus,
 )
 from .result_query import (
     BacktestOverview,
@@ -455,19 +473,21 @@ def create_app(
     @app.get(f"{API_PREFIX}/backtests/{{run_id}}/performance", tags=["backtests"])
     def get_performance(run_id: UUID, principal: Principal = Auth) -> dict[str, Any]:
         """Query 4/8: the immutable performance summary, once the run completed."""
-        _owned(lifecycle, run_id, principal)
+        _require_completed(_owned(lifecycle, run_id, principal))
         summary = lifecycle.performance_of(run_id, owner_account_id=principal.account_id)
         if summary is None:
+            # COMPLETED with no summary row is not "not ready"; it is a run whose
+            # publish wrote the status without the evidence.
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"backtest run {run_id} has no performance summary yet",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"backtest run {run_id} is COMPLETED but has no performance summary",
             )
         return _performance_payload(summary)
 
     @app.get(f"{API_PREFIX}/backtests/{{run_id}}/monthly-summaries", tags=["backtests"])
     def get_monthly(run_id: UUID, principal: Principal = Auth) -> dict[str, Any]:
         """Query 5/8: per-ET-month judgment summaries with all six canonical counters."""
-        _owned(lifecycle, run_id, principal)
+        _require_completed(_owned(lifecycle, run_id, principal))
         summaries = lifecycle.monthly_of(run_id, owner_account_id=principal.account_id)
         return {"items": [_monthly_payload(row) for row in summaries]}
 
@@ -477,7 +497,7 @@ def create_app(
 
         These are the evidence *objects*. The rows inside them are `monthly-trades`.
         """
-        _owned(lifecycle, run_id, principal)
+        _require_completed(_owned(lifecycle, run_id, principal))
         manifests = lifecycle.manifests_of(run_id, owner_account_id=principal.account_id)
         return {"items": [_manifest_payload(row) for row in manifests]}
 
@@ -605,6 +625,35 @@ def _with_attempt_counts(
     ]
 
 
+#: The reason code every "your run exists, it just has no result yet" answer carries.
+#: One token for the UI to branch on, on every evidence route.
+RESULT_NOT_READY_REASON = "BACKTEST_RESULT_NOT_READY"
+
+
+def _require_completed(run: BacktestRun) -> BacktestRun:
+    """409 unless the run reached `COMPLETED`. See `_query_errors` for the rule.
+
+    Applied to the three write-model evidence routes so they agree with the two
+    result-read-model ones. Note what this is *not*: a check that the answer is
+    non-empty. A `COMPLETED` run that published no detail objects legitimately returns
+    an empty list, and turning that into a 409 would make "finished and traded nothing"
+    indistinguishable from "still running" all over again.
+    """
+    if run.status is not RunStatus.COMPLETED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": (
+                    f"backtest run {run.backtest_run_id} is {run.status.value}; its result "
+                    "evidence exists only once the run is COMPLETED"
+                ),
+                "reasonCode": RESULT_NOT_READY_REASON,
+                "status": run.status.value,
+            },
+        )
+    return run
+
+
 def _result_query(results: BacktestResultQueryService | None) -> BacktestResultQueryService:
     if results is None:
         raise HTTPException(
@@ -635,7 +684,10 @@ def _query_errors() -> Iterator[None]:
     except QueryNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except QueryNotReady as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"message": str(exc), "reasonCode": RESULT_NOT_READY_REASON},
+        ) from exc
     except QueryValidationError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
@@ -675,15 +727,26 @@ def _delivery_attempt(request: Request) -> int:
 
 
 def run() -> None:  # pragma: no cover - process entry point
-    """Entry point for `backtest-api`.
+    """Entry point for `backtest-api`. Mirrors `worker.run`.
 
-    Deliberately unimplemented: wiring a real deployment needs a database URL, a
-    queue URL and a token source, and inventing defaults for those here is how the
-    pre-rebuild build shipped an API backed by a dictionary.
+    Three steps, in this order and no other:
+
+    1. **build** the whole application from the environment. Every required setting is
+       listed in `wiring.API_REQUIRED_ENV` and none of them has a default, so a missing
+       one is a `WiringError` naming all of them at once - not a process that starts
+       and serves an empty store.
+    2. **verify** the live schema. The runtime applies no DDL, so drift is fatal rather
+       than repairable, and finding out at start-up beats finding out per request.
+    3. **serve**.
+
+    The import is local because `wiring` imports `create_app` from this module; making
+    it a module-level import would be a cycle.
     """
-    raise NotImplementedError(
-        "backtest-api has no runnable default wiring yet: build the "
-        "BacktestLifecycleService with PersistenceRunGateway plus a real "
-        "Authenticator and a BacktestResultQueryService, and serve create_app(...) "
-        "from your deployment entry point"
-    )
+    from .wiring import build_api_runtime
+
+    runtime = build_api_runtime(os.environ)
+    runtime.verify()
+
+    import uvicorn
+
+    uvicorn.run(runtime.app, host=runtime.host, port=runtime.port)

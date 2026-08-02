@@ -24,6 +24,7 @@ from .errors import MoneyPrecisionError
 __all__ = [
     "MONEY_PRECISION",
     "MONEY_SCALE",
+    "RUN_INPUT_PIN_IDENTITY_FIELDS",
     "DetailManifestRow",
     "FailureConditionCountRow",
     "InputBundleRow",
@@ -33,6 +34,7 @@ __all__ = [
     "ObjectStatus",
     "PerformanceSummaryRow",
     "RunAttemptRow",
+    "RunInputPinRow",
     "RunRow",
     "RunStatus",
     "StorageObjectRow",
@@ -45,6 +47,18 @@ __all__ = [
 #: `numeric(24,8)`.
 MONEY_PRECISION = 24
 MONEY_SCALE = 8
+
+#: What makes two `backtest.run_input_pins` offers the same pin. Everything except
+#: `pinned_at`: two acceptances of the same request pin the same inputs, but they do
+#: not happen at the same instant.
+RUN_INPUT_PIN_IDENTITY_FIELDS: tuple[str, ...] = (
+    "compiled_plan_checksum",
+    "strategy_snapshot_hash",
+    "dataset_manifest_id",
+    "dataset_hash",
+    "feature_materialization_version",
+    "execution_policy_version",
+)
 
 
 class RunStatus(StrEnum):
@@ -193,6 +207,37 @@ class RunAttemptRow:
             raise ValueError("attempt_number starts at 1")
         if not self.worker_execution_key.strip():
             raise ValueError("worker_execution_key must not be blank")
+
+
+@dataclass(frozen=True, slots=True)
+class RunInputPinRow:
+    """`backtest.run_input_pins`. The request's pinned identifiers, written at accept.
+
+    Every field is required. `runs.configuration_hash` is a digest *over* these values,
+    so a blank one here would mean the fingerprint covers an empty string and the
+    reproducibility boundary the API reports would be a fiction.
+    """
+
+    run_id: UUID
+    compiled_plan_checksum: str
+    strategy_snapshot_hash: str
+    dataset_manifest_id: UUID
+    dataset_hash: str
+    feature_materialization_version: str
+    execution_policy_version: str
+    pinned_at: datetime
+
+    def __post_init__(self) -> None:
+        for name in (
+            "compiled_plan_checksum",
+            "strategy_snapshot_hash",
+            "dataset_hash",
+            "feature_materialization_version",
+            "execution_policy_version",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} is NOT NULL in backtest.run_input_pins and must not be blank")
 
 
 @dataclass(frozen=True, slots=True)

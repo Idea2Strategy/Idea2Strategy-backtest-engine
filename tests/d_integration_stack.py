@@ -43,6 +43,7 @@ from backtest_engine.wiring import (
     OrchestratorJobHandler,
     PersistenceExecutionKeyStore,
     PersistenceStorageObjectWritePort,
+    build_result_query_service,
 )
 from backtest_engine.worker import BacktestWorker, WorkerConfig
 from d_reproducibility_testkit import (
@@ -245,10 +246,18 @@ def build_stack(
             ),
         }
     )
-    recorder = HeaderRecorder(create_app(lifecycle, authenticator))
+    store = S3ObjectStore(bucket, client=s3_client, sleep=lambda _seconds: None)
+    # The D29 join. The same `persistence` and the same bucket the worker publishes
+    # into are what the read model reads back, so `GET /monthly-trades` and
+    # `GET /inputs` answer from the rows and objects the run actually wrote.
+    # `create_app(lifecycle, authenticator)` with no query service - which is what
+    # this wiring did before D29 landed - leaves those two routes answering 503, and
+    # no integration module can then assert that a published run is readable.
+    recorder = HeaderRecorder(
+        create_app(lifecycle, authenticator, build_result_query_service(persistence, store))
+    )
     client = TestClient(recorder)
     sink = HttpResultSink(client, WORKER_TOKEN)
-    store = S3ObjectStore(bucket, client=s3_client, sleep=lambda _seconds: None)
 
     handler = OrchestratorJobHandler(
         persistence=persistence,
@@ -334,7 +343,8 @@ def truncate_backtest(engine: Engine) -> None:
     """Empty `backtest.*`, leaving the reference seed and stored objects alone."""
     with engine.begin() as connection:
         connection.exec_driver_sql(
-            "TRUNCATE TABLE backtest.failure_condition_counts, "
+            "TRUNCATE TABLE backtest.run_input_pins, "
+            "backtest.failure_condition_counts, "
             "backtest.monthly_judgment_summaries, backtest.performance_summaries, "
             "backtest.detail_manifests, backtest.input_datasets, "
             "backtest.input_feature_materializations, backtest.input_bundles, "
