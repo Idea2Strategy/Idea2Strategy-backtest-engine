@@ -1,0 +1,13 @@
+{
+  "metadata": {
+    "contractVersion": "strategy-bot.v1",
+    "messageType": "BOT_STOP_COMMAND",
+    "messageId": "00000000-0000-4000-8000-000000000212",
+    "occurredAt": "2026-07-31T12:00:00Z",
+    "correlationId": "00000000-0000-4000-8000-000000000202",
+    "idempotencyKey": "sha256:f3992c2d2718a329ec14ded3268479e90d8821b7542207dcc9758f3ddf57ba9c"
+  },
+  "botId": "00000000-0000-4000-8000-000000000201",
+  "expectedSnapshotHash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "reasonCode": "USER_REQUESTED"
+}

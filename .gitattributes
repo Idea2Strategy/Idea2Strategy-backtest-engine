@@ -19,3 +19,9 @@ tests/fixtures/contracts/** -text
 # and tests/conftest.py applies these exact bytes to the PostgreSQL container.
 db/migration-contributions/fixtures/central-migration/* -text
 db/migration-contributions/fixtures/*.sha256 -text
+
+# The D92 conformance fixture is the shared oracle for two runtimes in two
+# languages, and both bindings assert its digest before parsing. A line-ending
+# rewrite on either checkout makes D's Python test and C's Java test disagree
+# about the same file, which is the exact failure the digest exists to prevent.
+conformance/** -text

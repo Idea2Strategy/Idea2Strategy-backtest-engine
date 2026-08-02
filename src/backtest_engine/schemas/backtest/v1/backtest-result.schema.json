@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://contracts.idea2strategy.io/backtest/v1/backtest-result.schema.json",
   "title": "backtest.v1 result event",
-  "description": "Published by D (backtest-engine) for every backtest.run_status value in db/schema.dbml: QUEUED, RUNNING, COMPLETED, FAILED, UNAVAILABLE.",
+  "description": "Published by D (backtest-engine) for every backtest.run_status value in db/schema.dbml: QUEUED, RUNNING, COMPLETED, FAILED, UNAVAILABLE. Card D93: source/eventType/livePerformanceEligible are constants that mark the event as a backtest result, matching exactly the input E's room-performance/v1 live-performance-input.backtest-rejected.json declares it refuses.",
   "type": "object",
   "required": [
     "metadata",
@@ -13,10 +13,25 @@
     "inputBundleFingerprint",
     "executionPolicyVersion",
     "precisionRulesVersion",
-    "status"
+    "status",
+    "source",
+    "eventType",
+    "livePerformanceEligible"
   ],
   "properties": {
     "metadata": {"$ref": "https://contracts.idea2strategy.io/backtest/v1/message-metadata.schema.json"},
+    "source": {
+      "description": "D93: always BACKTEST. A live consumer must be able to refuse this event on its own content, not on the topic it arrived from.",
+      "const": "BACKTEST"
+    },
+    "eventType": {
+      "description": "D93: always BACKTEST_RESULT, the value E's live-performance-input.backtest-rejected.json rejects with BACKTEST_SOURCE_NOT_ALLOWED.",
+      "const": "BACKTEST_RESULT"
+    },
+    "livePerformanceEligible": {
+      "description": "D93: always false. Stated positively so an unrecognised source token can never be read as eligibility.",
+      "const": false
+    },
     "backtestRunId": {"$ref": "#/$defs/uuid"},
     "botId": {"$ref": "#/$defs/uuid"},
     "ownerAccountId": {"$ref": "#/$defs/uuid"},

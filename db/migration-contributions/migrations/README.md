@@ -4,13 +4,27 @@ Only files matching `^V[0-9]{14}__backtest_[a-z0-9]+(?:_[a-z0-9]+)*[.]sql$` may 
 here, and only they enter the central Flyway bundle.
 
 Every table the applied, immutable central baseline `V1__initial_schema.sql` declares
-is off limits here. Do not re-declare or alter one; add a later migration instead.
+is off limits here. Do not re-declare or alter one of those tables; contribute only
+the changes this repository legitimately needs on top of them. A genuinely new
+`backtest.*` table this repository owns — one the baseline does not declare — is a
+legitimate contribution; re-declaring a baseline table is not.
 
-Contributed so far:
+## Contents
 
-- `V20260802094500__backtest_run_input_pins.sql` — adds `backtest.run_input_pins`, the
-  request identifiers `runs.configuration_hash` hashes over and cannot give back. See
-  `../change-requests/2026-08-02-backtest-run-input-pins.md`.
+| file | change |
+|---|---|
+| `V20260802094500__backtest_run_input_pins.sql` | adds `backtest.run_input_pins`, the request identifiers `runs.configuration_hash` hashes over and cannot give back. See `../change-requests/2026-08-02-backtest-run-input-pins.md` |
+| `V20260802143000__backtest_run_outcome_detail.sql` | adds `result_manifest_id`, `retryable` and `missing_requirements` to `backtest.runs`, plus the CHECK that mirrors the `backtest.v1` UNAVAILABLE branch's `minItems: 1` |
+
+The two apply in timestamp order, which is filename order: the new table first, then
+the columns on the baseline table.
+
+`tests/conftest.py` applies every file here to the Testcontainers PostgreSQL 16 after
+the vendored central bundle, and `tests/persistence/test_table_metadata.py` holds both
+shapes to the same standard — a contributed `CREATE TABLE` is parsed like a baseline
+one, and contributed `ADD COLUMN` clauses are folded into the expected schema — so a
+contributed table or column is verified against a real database rather than only
+asserted in Python.
 
 Before adding a file:
 

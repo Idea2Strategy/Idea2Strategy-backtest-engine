@@ -58,13 +58,9 @@ PostgreSQL and the object store hold.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import io
 import json
-import uuid
-from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -72,67 +68,36 @@ from typing import Any
 
 import pyarrow.parquet as pq
 import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine
 
-from backtest_engine.api import RESULT_INGEST_SCOPE, Principal, StaticTokenAuthenticator, create_app
-from backtest_engine.attempt_coordinator import AttemptPolicy, ResourceSample
-from backtest_engine.basic_runtime import BasicPlanRuntime
-from backtest_engine.calendar import XNYS_CALENDAR
-from backtest_engine.execution_policy import ExecutionPolicyCatalog
-from backtest_engine.lifecycle import (
-    BacktestLifecycleService,
-    InMemoryDeadLetterQueue,
-    PersistenceRunGateway,
-    SqsBacktestJobQueue,
-    StaticCompiledPlanSource,
-    StaticDatasetManifestSource,
-    StaticOwnerDirectory,
-)
-from backtest_engine.market_data import ParquetMarketDataReader
-from backtest_engine.object_store import S3ObjectStore
+from backtest_engine.attempt_coordinator import ResourceSample
 from backtest_engine.persistence import BacktestPersistence
-from backtest_engine.wiring import (
-    OrchestratorJobHandler,
-    PersistenceExecutionKeyStore,
-    PersistenceStorageObjectWritePort,
-    build_result_query_service,
+from backtest_engine.worker import MessageDisposition
+
+# `build_stack` builds the app *with* a real `BacktestResultQueryService` (see
+# `d_integration_stack`), which is what lets the traversal below read the published
+# run back over HTTP rather than only assert that the worker wrote it.
+from d_integration_stack import (
+    ScriptedMonitor,
+    Stack,
+    build_stack,
+    fetch_object,
+    sql_all,
+    sql_one,
+    truncate_backtest,
 )
-from backtest_engine.worker import BacktestWorker, MessageDisposition, WorkerConfig
-from conftest import docker_is_available
 from d_reproducibility_testkit import (
     ACCOUNT_ID,
     BOT_ID,
     CLOSES,
-    COMPLETED_AT,
-    CORRELATION_ID,
     DATASET_MANIFEST_ID,
     E2E_EXECUTION_POLICY,
-    E2E_FRACTIONAL_POLICY,
-    E2E_MICROSTRUCTURE,
-    E2E_RISK_LIMITS,
     INSTRUMENT_ID,
-    MarketDataFixture,
-    compiled_plan,
-    official_backtest_request,
-    write_market_data,
 )
 
 
 pytestmark = pytest.mark.docker
 
-
-LOCALSTACK_IMAGE = "localstack/localstack:4.7.0"
-OWNER_TOKEN = "e2e-owner-token"
-WORKER_TOKEN = "e2e-worker-token"
-
-ATTEMPT_POLICY = AttemptPolicy(
-    max_attempts=3,
-    lease_duration=timedelta(minutes=5),
-    attempt_timeout=timedelta(minutes=30),
-    max_cpu_time=timedelta(minutes=5),
-    max_memory_bytes=512 * 1024 * 1024,
-)
 
 # ---------------------------------------------------------------------------
 # Pinned digests
@@ -160,280 +125,8 @@ EXPECTED_TRADE_DETAIL_CONTENT_HASH = (
 
 
 # ---------------------------------------------------------------------------
-# Infrastructure
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="module")
-def localstack() -> Iterator[Any]:
-    """One LocalStack with **both** services this test needs."""
-    if not docker_is_available():  # pragma: no cover - environment dependent
-        pytest.skip(
-            "missing dependency: a reachable Docker daemon for the "
-            f"{LOCALSTACK_IMAGE} SQS + S3 emulator. Without it the queue and "
-            "object-store legs of this end-to-end test are NOT covered."
-        )
-    from testcontainers.community.localstack import LocalStackContainer
-
-    # us-east-1: any other region makes CreateBucket require a LocationConstraint.
-    container = LocalStackContainer(image=LOCALSTACK_IMAGE, region_name="us-east-1")
-    with container.with_services("sqs", "s3") as running:
-        yield running
-
-
-@pytest.fixture(scope="module")
-def sqs(localstack: Any) -> Any:
-    return localstack.get_client("sqs")
-
-
-@pytest.fixture(scope="module")
-def s3(localstack: Any) -> Any:
-    return localstack.get_client("s3")
-
-
-@pytest.fixture
-def queues(sqs: Any, request: pytest.FixtureRequest) -> Iterator[tuple[str, str]]:
-    suffix = uuid.uuid4().hex[:12]
-    main = sqs.create_queue(
-        QueueName=f"bt7-main-{suffix}",
-        Attributes={"VisibilityTimeout": "30", "ReceiveMessageWaitTimeSeconds": "0"},
-    )["QueueUrl"]
-    dead = sqs.create_queue(QueueName=f"bt7-dlq-{suffix}")["QueueUrl"]
-    yield main, dead
-    for url in (main, dead):
-        with contextlib.suppress(Exception):  # best-effort cleanup
-            sqs.delete_queue(QueueUrl=url)
-
-
-@pytest.fixture(scope="module")
-def bucket(s3: Any) -> str:
-    """One bucket for the module, as a deployment has one bucket.
-
-    Not per test: `storage.objects` identity includes `bucket_name`, and every
-    object here is content-addressed. Re-publishing the same content into a
-    *different* bucket under the same object id is exactly the conflict
-    `StorageObjectRepository.register` exists to refuse, and it is a real
-    conflict, not a test artefact.
-    """
-    name = f"bt7-{uuid.uuid4().hex[:12]}"
-    s3.create_bucket(Bucket=name)
-    return name
-
-
-# ---------------------------------------------------------------------------
-# Server-side observation
-# ---------------------------------------------------------------------------
-
-
-class HeaderRecorder:
-    """A pass-through ASGI app that records what the server actually received.
-
-    Deliberately *not* a wrapper around the HTTP client: an assertion about what
-    the client sent would be an assertion about the test's own code.
-    """
-
-    def __init__(self, app: Any) -> None:
-        self._app = app
-        self.requests: list[tuple[str, str, Mapping[str, str]]] = []
-
-    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        if scope["type"] == "http":
-            headers = {
-                key.decode("latin-1").lower(): value.decode("latin-1")
-                for key, value in scope["headers"]
-            }
-            self.requests.append((scope["method"], scope["path"], headers))
-        await self._app(scope, receive, send)
-
-    def result_posts(self) -> list[Mapping[str, str]]:
-        return [
-            headers
-            for method, path, headers in self.requests
-            if method == "POST" and path.endswith("/results")
-        ]
-
-
-class HttpResultSink:
-    """The worker's `ResultSink`, bound to the real `/api/v1` endpoint."""
-
-    def __init__(self, client: TestClient, token: str) -> None:
-        self._client = client
-        self._token = token
-        self.responses: list[Any] = []
-
-    def publish(self, event: Mapping[str, Any], *, delivery_attempt: int) -> None:
-        response = self._client.post(
-            f"/api/v1/backtests/{event['backtestRunId']}/results",
-            json=dict(event),
-            headers={
-                "Authorization": f"Bearer {self._token}",
-                "X-Delivery-Attempt": str(delivery_attempt),
-            },
-        )
-        self.responses.append(response)
-        if response.status_code != 200:
-            raise AssertionError(
-                f"result ingestion rejected a {event['status']} event: "
-                f"{response.status_code} {response.text}"
-            )
-
-
-class ScriptedMonitor:
-    """A resource monitor whose samples are a pinned script, not the real process."""
-
-    def __init__(self, *samples: ResourceSample) -> None:
-        self._samples = list(samples)
-        self.calls = 0
-        self._steady = ResourceSample(timedelta(seconds=1), 64 * 1024 * 1024)
-
-    def sample(self) -> ResourceSample:
-        self.calls += 1
-        if self._samples:
-            return self._samples.pop(0)
-        return self._steady
-
-
-# ---------------------------------------------------------------------------
 # The stack under test
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class Stack:
-    client: TestClient
-    recorder: HeaderRecorder
-    sink: HttpResultSink
-    worker: BacktestWorker
-    handler: OrchestratorJobHandler
-    store: S3ObjectStore
-    dead_letters: InMemoryDeadLetterQueue
-    request: dict[str, Any]
-    market_data: MarketDataFixture
-    bucket: str
-    main_queue: str
-    dead_letter_queue: str
-    sqs: Any
-
-    def owner(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {OWNER_TOKEN}"}
-
-    def accept(self) -> Any:
-        return self.client.post(
-            "/api/v1/backtests",
-            json={"request": self.request, "compiledPlan": compiled_plan()},
-            headers=self.owner(),
-        )
-
-    def visible(self, queue_url: str) -> int:
-        attributes = self.sqs.get_queue_attributes(
-            QueueUrl=queue_url, AttributeNames=["ApproximateNumberOfMessages"]
-        )["Attributes"]
-        return int(attributes["ApproximateNumberOfMessages"])
-
-
-def build_stack(
-    *,
-    persistence: BacktestPersistence,
-    sqs_client: Any,
-    s3_client: Any,
-    queues: tuple[str, str],
-    bucket: str,
-    root: Path,
-    closes: tuple[str, ...] = CLOSES,
-    monitor: Any | None = None,
-) -> Stack:
-    main, dead = queues
-    market_data = write_market_data(root, closes)
-    plan = compiled_plan()
-    request = official_backtest_request(plan=plan)
-
-    plans = StaticCompiledPlanSource({plan["planChecksum"]: plan})
-    manifests = StaticDatasetManifestSource({DATASET_MANIFEST_ID: market_data.manifest})
-    policies = ExecutionPolicyCatalog([E2E_EXECUTION_POLICY])
-    dead_letters = InMemoryDeadLetterQueue()
-
-    lifecycle = BacktestLifecycleService(
-        gateway=PersistenceRunGateway(persistence),
-        queue=SqsBacktestJobQueue(sqs_client, main),
-        owners=StaticOwnerDirectory({BOT_ID: ACCOUNT_ID}),
-        plans=plans,
-        manifests=manifests,
-        policies=policies,
-        dead_letters=dead_letters,
-    )
-    authenticator = StaticTokenAuthenticator(
-        {
-            OWNER_TOKEN: Principal(account_id=ACCOUNT_ID),
-            WORKER_TOKEN: Principal(
-                account_id=ACCOUNT_ID, scopes=frozenset({RESULT_INGEST_SCOPE})
-            ),
-        }
-    )
-    store = S3ObjectStore(bucket, client=s3_client, sleep=lambda _seconds: None)
-    # The join this stage exists to make. The same `persistence` and the same bucket
-    # the worker publishes into are what the read model reads back, so
-    # `GET /monthly-trades` answers from the rows and objects the run actually wrote.
-    # Passing `create_app(lifecycle, authenticator)` here - as this file did - left the
-    # two D29 routes answering 503 and made the traversal unable to assert the one
-    # thing the card is for.
-    recorder = HeaderRecorder(
-        create_app(lifecycle, authenticator, build_result_query_service(persistence, store))
-    )
-    client = TestClient(recorder)
-    sink = HttpResultSink(client, WORKER_TOKEN)
-
-    handler = OrchestratorJobHandler(
-        persistence=persistence,
-        policies=policies,
-        plans=plans,
-        manifests=manifests,
-        reader=ParquetMarketDataReader(market_data.root),
-        calendar=XNYS_CALENDAR,
-        object_store=store,
-        storage_write_port=PersistenceStorageObjectWritePort(persistence),
-        sink=sink,
-        attempt_policy=ATTEMPT_POLICY,
-        monitor=monitor or ScriptedMonitor(),
-        microstructure=E2E_MICROSTRUCTURE,
-        fractional_policy=E2E_FRACTIONAL_POLICY,
-        risk_limits=E2E_RISK_LIMITS,
-        runtime=BasicPlanRuntime(),
-        # Pinned: `result_hash` covers `calculated_at`, so the wall clock is an
-        # input of the run rather than an accident of when it ran. The replay
-        # clock is 2024 market time and is untouched by this.
-        wall_clock=lambda: COMPLETED_AT,
-        correlation_id=CORRELATION_ID,
-    )
-    worker = BacktestWorker(
-        client=sqs_client,
-        config=WorkerConfig(
-            queue_url=main,
-            dead_letter_queue_url=dead,
-            worker_id="bt7-worker",
-            max_receive_count=3,
-            visibility_timeout=timedelta(seconds=30),
-            wait_time=timedelta(seconds=1),
-            max_messages=1,
-            heartbeat_interval=timedelta(seconds=10),
-        ),
-        handler=handler,
-        store=PersistenceExecutionKeyStore(persistence),
-    )
-    return Stack(
-        client=client,
-        recorder=recorder,
-        sink=sink,
-        worker=worker,
-        handler=handler,
-        store=store,
-        dead_letters=dead_letters,
-        request=request,
-        market_data=market_data,
-        bucket=bucket,
-        main_queue=main,
-        dead_letter_queue=dead,
-        sqs=sqs_client,
-    )
 
 
 @pytest.fixture
@@ -453,26 +146,6 @@ def stack(
         bucket=bucket,
         root=tmp_path / "market-data",
     )
-
-
-# ---------------------------------------------------------------------------
-# Reading the world back
-# ---------------------------------------------------------------------------
-
-
-def sql_one(engine: Engine, statement: str, **params: Any) -> Any:
-    with engine.connect() as connection:
-        return connection.execute(text(statement), params).mappings().one()
-
-
-def sql_all(engine: Engine, statement: str, **params: Any) -> list[Any]:
-    with engine.connect() as connection:
-        return [dict(row) for row in connection.execute(text(statement), params).mappings()]
-
-
-def fetch_object(s3_client: Any, bucket_name: str, key: str) -> bytes:
-    body: bytes = s3_client.get_object(Bucket=bucket_name, Key=key)["Body"].read()
-    return body
 
 
 def run_once(stack: Stack) -> str:
@@ -771,7 +444,7 @@ def test_the_same_official_request_reproduces_every_digest(
     first = _digests(admin_engine, run_id)
     first_objects = _object_hashes(admin_engine, run_id)
 
-    _truncate_backtest(admin_engine)
+    truncate_backtest(admin_engine)
 
     second_stack = build_stack(
         persistence=persistence,
@@ -900,19 +573,6 @@ def _stored_parts(engine: Engine, run_id: str) -> list[tuple[str, str]]:
         id=run_id,
     )
     return [(str(row["object_key"]), str(row["content_hash"])) for row in rows]
-
-
-def _truncate_backtest(engine: Engine) -> None:
-    """Empty `backtest.*` between the two runs, leaving the seed and objects alone."""
-    with engine.begin() as connection:
-        connection.exec_driver_sql(
-            "TRUNCATE TABLE backtest.run_input_pins, "
-            "backtest.failure_condition_counts, "
-            "backtest.monthly_judgment_summaries, backtest.performance_summaries, "
-            "backtest.detail_manifests, backtest.input_datasets, "
-            "backtest.input_feature_materializations, backtest.input_bundles, "
-            "backtest.run_attempts, backtest.runs RESTART IDENTITY CASCADE"
-        )
 
 
 # ===========================================================================

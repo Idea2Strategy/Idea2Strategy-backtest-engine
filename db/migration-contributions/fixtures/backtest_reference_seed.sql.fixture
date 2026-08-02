@@ -4,9 +4,11 @@
 -- Fixed UUIDs so integration assertions can be literal.
 --   account   00000000-0000-4000-8000-0000000000a1
 --   bot       00000000-0000-4000-8000-0000000000b1
+--   b's bot   00000000-0000-4000-8000-000000000201  (B's published fixture, card D91)
 --   fee       00000000-0000-4000-8000-0000000000f1
 --   buffer    00000000-0000-4000-8000-0000000000f2
 --   dataset   00000000-0000-4000-8000-0000000000d1
+--   b's data  00000000-0000-4000-8000-000000000203  (B's published fixture, card D91)
 --   feature   00000000-0000-4000-8000-0000000000e1
 --   object    00000000-0000-4000-8000-0000000000c1
 --   object2   00000000-0000-4000-8000-0000000000c2
@@ -20,6 +22,19 @@ INSERT INTO bot.bots (
   created_at, execution_eligible_from, edit_sequence, updated_at)
 VALUES ('00000000-0000-4000-8000-0000000000b1', '00000000-0000-4000-8000-0000000000a1',
         'BASIC', 'integration-fixture-bot', 'RUNNING', '2026-01-01T00:00:00+00',
+        '2026-01-01T00:00:00+00', '2026-01-01T00:00:00+00', 0, '2026-01-01T00:00:00+00');
+
+-- B's own published bot id, from
+-- backend/modules/backend-messaging/.../strategy-bot/v1/official-backtest-request.valid.json.
+-- Card D91 requires that B's released message be accepted **verbatim**, and
+-- backtest.runs.bot_id is a foreign key into bot.bots, so B's bot has to exist for
+-- the real-infrastructure test to insert anything at all. Re-addressing the message
+-- to the fixture bot instead would test a message B does not publish.
+INSERT INTO bot.bots (
+  id, owner_account_id, mode, name, lifecycle_status, lifecycle_changed_at,
+  created_at, execution_eligible_from, edit_sequence, updated_at)
+VALUES ('00000000-0000-4000-8000-000000000201', '00000000-0000-4000-8000-0000000000a1',
+        'BASIC', 'b-published-release-bot', 'RUNNING', '2026-01-01T00:00:00+00',
         '2026-01-01T00:00:00+00', '2026-01-01T00:00:00+00', 0, '2026-01-01T00:00:00+00');
 
 INSERT INTO trading.fee_policy_versions (
@@ -56,6 +71,29 @@ VALUES ('00000000-0000-4000-8000-0000000000d1', '00000000-0000-4000-8000-0000000
         '00000000-0000-4000-8000-000000000093', 'VALIDATED', 'PT1M', 1, 'AVAILABLE',
         '2024-01-01T00:00:00+00', '2024-12-31T00:00:00+00', '1.0.0',
         'ds000000000000000000000000000000000000000000000000000000000000d1',
+        '2026-01-01T00:00:00+00', '2026-01-01T00:00:00+00');
+
+-- B's own published datasetManifestId, from the same
+-- strategy-bot/v1/official-backtest-request.valid.json as B's bot id above.
+-- Card D91 requires B's released message to be accepted **verbatim**, and
+-- `backtest.run_input_pins.dataset_manifest_id` is a foreign key into
+-- `market_data.dataset_manifests` -- the same reference the applied baseline already
+-- imposes on `backtest.input_datasets.dataset_manifest_id` -- so B's manifest has to
+-- exist for the acceptance transaction to insert anything at all. Re-addressing the
+-- message to the 2024-Q1 fixture manifest instead would test a message B does not
+-- publish.
+--
+-- The window is B's release quarter (2026-Q3), which is what `b_dataset_manifest()`
+-- declares in memory. `dataset_hash` here is a distinct placeholder: the column is
+-- globally UNIQUE, and the value the pins row actually stores is the runtime hash of
+-- the pinned Parquet bytes, which this row neither constrains nor is compared with.
+INSERT INTO market_data.dataset_manifests (
+  id, feed_id, instrument_id, data_layer, resolution, revision_number, status,
+  period_start, period_end, schema_version, dataset_hash, created_at, available_at)
+VALUES ('00000000-0000-4000-8000-000000000203', '00000000-0000-4000-8000-000000000092',
+        '00000000-0000-4000-8000-000000000093', 'VALIDATED', 'PT1M', 1, 'AVAILABLE',
+        '2026-07-01T04:00:00+00', '2026-10-01T04:00:00+00', '1.0.0',
+        'ds00000000000000000000000000000000000000000000000000000000000203',
         '2026-01-01T00:00:00+00', '2026-01-01T00:00:00+00');
 
 INSERT INTO strategy.element_catalog_versions (
