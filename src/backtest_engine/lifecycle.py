@@ -1,43 +1,191 @@
-"""Idempotent backtest acceptance, queue dispatch, and lifecycle transitions."""
+"""Acceptance, dispatch and result ingestion for one official backtest run.
+
+This is the half of D28 that sits behind the HTTP surface in `api.py`. It takes B's
+`strategy-bot.v1` `OFFICIAL_BACKTEST_REQUESTED` verbatim, turns it into a canonical
+`backtest.runs` row, dispatches the job, and applies the `backtest.v1` result events a
+worker publishes back.
+
+Three properties are load-bearing and each is enforced here rather than assumed:
+
+**Determinism of identity.** `run_id` is `uuid5` of B's own `metadata.idempotencyKey`.
+A redelivered request therefore addresses the same run without a database round trip,
+and two processes racing the same delivery converge on the same row rather than
+creating two runs.
+
+**At-least-once safety.** Every mutating entry point is keyed by a content-bound
+idempotency key. Replaying an identical message returns the first outcome; replaying a
+*different* payload under the same key is a conflict, never a silent overwrite. This is
+the difference between "safe to redeliver" and "last writer wins".
+
+**No hidden defaults.** Every input the canonical `backtest.runs` row needs that B's
+message does not carry - the owner account, the execution policy, the compiled plan's
+initial cash, the dataset's hash - is resolved through an explicit port. A port that
+cannot answer makes the request unsatisfiable; nothing is invented to fill the gap.
+
+The storage boundary is `RunGateway`. `PersistenceRunGateway` is the durable
+SQLAlchemy Core implementation over the canonical schema; `InMemoryRunGateway` is a
+faithful fake used where a test is exercising HTTP behaviour rather than SQL. The
+durable implementation is covered separately, against a real PostgreSQL 16 container,
+in `tests/persistence/`.
+"""
 
 from __future__ import annotations
 
 import copy
 import json
 import threading
-from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from typing import Any, Protocol
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from .contracts import validate_backtest_request, validate_backtest_result
+from .contracts import (
+    ContractValidationError,
+    build_backtest_result_event,
+    compute_input_bundle_fingerprint,
+    validate_backtest_result_event,
+    validate_official_backtest_request,
+)
+from .execution_policy import ExecutionPolicy, ExecutionPolicyCatalog, ExecutionPolicyUnavailable
+from .money import PRECISION_RULES_VERSION
+from .persistence.errors import IdempotencyConflict as PersistedIdempotencyConflict
+from .persistence.errors import InvalidStatusTransition as PersistedInvalidStatusTransition
+from .persistence.errors import RowNotFound
+from .persistence.rows import (
+    DetailManifestRow,
+    MonthlyJudgmentSummaryRow,
+    PerformanceSummaryRow,
+    RunAttemptRow,
+    RunRow,
+    RunStatus,
+)
 
 
-class IdempotencyConflict(ValueError):
-    """Raised when an idempotency key or run ID is reused for other input."""
+__all__ = [
+    "RUN_ID_NAMESPACE",
+    "AcceptedRun",
+    "BacktestJobQueue",
+    "BacktestLifecycleService",
+    "BacktestRun",
+    "BacktestRunNotFound",
+    "CompiledPlanSource",
+    "DatasetManifestSource",
+    "DeadLetterSink",
+    "DeadLetteredMessage",
+    "IdempotencyConflict",
+    "InMemoryBacktestJobQueue",
+    "InMemoryDeadLetterQueue",
+    "InMemoryRunGateway",
+    "InvalidStatusTransition",
+    "LifecycleError",
+    "NotRunOwner",
+    "OwnerDirectory",
+    "PersistenceRunGateway",
+    "PreconditionFailed",
+    "RequestNotSatisfiable",
+    "ResultIngestion",
+    "RunGateway",
+    "SqsBacktestJobQueue",
+    "StaticCompiledPlanSource",
+    "StaticDatasetManifestSource",
+    "StaticOwnerDirectory",
+    "run_id_for",
+]
 
 
-class BacktestRunNotFound(LookupError):
-    """Raised when a lifecycle result or query names an unknown run."""
+#: `uuid5` namespace for deriving a run id from B's idempotency key. Fixed forever:
+#: changing it would re-address every existing run.
+RUN_ID_NAMESPACE = uuid5(NAMESPACE_URL, "https://contracts.idea2strategy.io/backtest/v1/run")
 
 
-class InvalidStatusTransition(ValueError):
-    """Raised when a result attempts to skip or reverse lifecycle state."""
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+
+class LifecycleError(Exception):
+    """Base class for every lifecycle failure the API translates to a status code."""
+
+
+class IdempotencyConflict(LifecycleError):
+    """An idempotency key was reused for materially different content."""
+
+
+class BacktestRunNotFound(LifecycleError):
+    """No run with the given id exists."""
+
+
+class NotRunOwner(LifecycleError):
+    """The run exists but is owned by a different account."""
+
+
+class InvalidStatusTransition(LifecycleError):
+    """A result would move a run backwards, or out of a terminal status."""
+
+
+class PreconditionFailed(LifecycleError):
+    """An `If-Match` precondition did not match the run's current state.
+
+    Carries the current state so a worker that lost the response to its previous
+    write can reconcile without guessing.
+    """
+
+    def __init__(self, message: str, *, current: BacktestRun) -> None:
+        super().__init__(message)
+        self.current = current
+
+
+class RequestNotSatisfiable(LifecycleError):
+    """A required input could not be resolved, so no run can be created.
+
+    This is deliberately *not* an `UNAVAILABLE` run: `UNAVAILABLE` is a status a
+    persisted run reaches, and a run that cannot be constructed has nothing to persist.
+    A data gap discovered after acceptance is the worker's path, not this one.
+    """
+
+    def __init__(self, message: str, *, reason_code: str, missing: Sequence[str]) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.missing = tuple(missing)
+
+
+# ---------------------------------------------------------------------------
+# Ports - everything B's message does not carry
+# ---------------------------------------------------------------------------
+
+
+class OwnerDirectory(Protocol):
+    """Resolves a bot to its owning account.
+
+    B's `OFFICIAL_BACKTEST_REQUESTED` carries `botId` but no owner, while spec 2.2
+    identifies a run by `bot_id` + `owner_account_id`. The `bot` schema is read-only
+    for this repository, so ownership is resolved through this port rather than joined.
+    """
+
+    def owner_of(self, bot_id: UUID) -> UUID | None: ...
+
+
+class CompiledPlanSource(Protocol):
+    """Resolves B's `basic-compiled-plan` by its `planChecksum`."""
+
+    def by_checksum(self, checksum: str) -> Mapping[str, Any] | None: ...
+
+
+class DatasetManifestSource(Protocol):
+    """Resolves a `market-data.v1` dataset manifest by id."""
+
+    def by_id(self, manifest_id: UUID) -> Mapping[str, Any] | None: ...
 
 
 class BacktestJobQueue(Protocol):
-    def publish(self, request: Mapping[str, Any]) -> None: ...
+    def publish(self, message: Mapping[str, Any]) -> None: ...
 
 
-class BacktestRunStore(Protocol):
-    def accept(self, request: Mapping[str, Any]) -> tuple[BacktestRun, bool]: ...
-
-    def claim_dispatch(self, run_id: str) -> bool: ...
-
-    def release_dispatch(self, run_id: str) -> None: ...
-
-    def get(self, run_id: str) -> BacktestRun: ...
-
-    def apply_result(self, result: Mapping[str, Any]) -> BacktestRun: ...
+class DeadLetterSink(Protocol):
+    def dead_letter(self, message: DeadLetteredMessage) -> None: ...
 
 
 class SqsClient(Protocol):
@@ -45,28 +193,119 @@ class SqsClient(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class BacktestRun:
-    backtest_run_id: str
-    idempotency_key: str
-    status: str
-    request: dict[str, Any]
-    status_result: dict[str, Any] | None = None
-    version: int = 1
-    dispatch_pending: bool = True
+class StaticOwnerDirectory:
+    owners: Mapping[UUID, UUID]
+
+    def owner_of(self, bot_id: UUID) -> UUID | None:
+        return self.owners.get(bot_id)
+
+
+@dataclass(frozen=True, slots=True)
+class StaticCompiledPlanSource:
+    plans: Mapping[str, Mapping[str, Any]]
+
+    def by_checksum(self, checksum: str) -> Mapping[str, Any] | None:
+        return self.plans.get(checksum)
+
+
+@dataclass(frozen=True, slots=True)
+class StaticDatasetManifestSource:
+    manifests: Mapping[UUID, Mapping[str, Any]]
+
+    def by_id(self, manifest_id: UUID) -> Mapping[str, Any] | None:
+        return self.manifests.get(manifest_id)
+
+
+# ---------------------------------------------------------------------------
+# Aggregates
+# ---------------------------------------------------------------------------
 
 
 def _canonical(document: Mapping[str, Any]) -> str:
-    return json.dumps(
-        document,
-        sort_keys=True,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+    return json.dumps(document, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def run_id_for(idempotency_key: str) -> UUID:
+    """Deterministic run id for one accepted request.
+
+    Two deliveries of the same message address the same run without consulting the
+    database, so a duplicate cannot create a second run even under a race.
+    """
+    if not idempotency_key:
+        raise ValueError("idempotency_key must not be empty")
+    return uuid5(RUN_ID_NAMESPACE, idempotency_key)
+
+
+@dataclass(frozen=True, slots=True)
+class BacktestRun:
+    """The run aggregate as the API reports it."""
+
+    run: RunRow
+    attempts: tuple[RunAttemptRow, ...] = ()
+    last_event: Mapping[str, Any] | None = None
+
+    @property
+    def backtest_run_id(self) -> UUID:
+        return self.run.id
+
+    @property
+    def status(self) -> RunStatus:
+        return self.run.status
+
+    @property
+    def owner_account_id(self) -> UUID:
+        return self.run.owner_account_id
+
+    @property
+    def etag(self) -> str:
+        """Concurrency token: status plus the number of applied attempts.
+
+        Both move on every meaningful state change, so a stale `If-Match` from a
+        worker whose previous response was lost is detected rather than replayed.
+        """
+        return f'"{self.run.status.value}.{len(self.attempts)}"'
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedRun:
+    run: BacktestRun
+    created: bool
+    dispatched: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ResultIngestion:
+    run: BacktestRun
+    applied: bool
+    """`False` when this was a redelivery of an event that had already been applied."""
+
+
+@dataclass(frozen=True, slots=True)
+class DeadLetteredMessage:
+    payload: Mapping[str, Any]
+    reason: str
+    failure_kind: str
+    delivery_attempt: int
+
+
+class InMemoryDeadLetterQueue:
+    """Collects messages that must not be redelivered again."""
+
+    def __init__(self) -> None:
+        self._messages: list[DeadLetteredMessage] = []
+        self._lock = threading.Lock()
+
+    @property
+    def messages(self) -> tuple[DeadLetteredMessage, ...]:
+        with self._lock:
+            return tuple(self._messages)
+
+    def dead_letter(self, message: DeadLetteredMessage) -> None:
+        with self._lock:
+            self._messages.append(message)
 
 
 class InMemoryBacktestJobQueue:
-    """Thread-safe local queue fake implementing the production queue boundary."""
-
     def __init__(self) -> None:
         self._messages: list[dict[str, Any]] = []
         self._lock = threading.Lock()
@@ -76,13 +315,13 @@ class InMemoryBacktestJobQueue:
         with self._lock:
             return copy.deepcopy(self._messages)
 
-    def publish(self, request: Mapping[str, Any]) -> None:
+    def publish(self, message: Mapping[str, Any]) -> None:
         with self._lock:
-            self._messages.append(copy.deepcopy(dict(request)))
+            self._messages.append(copy.deepcopy(dict(message)))
 
 
 class SqsBacktestJobQueue:
-    """SQS Standard publisher; consumers must remain idempotent at least once."""
+    """SQS Standard publisher. Consumers must stay idempotent; delivery is at-least-once."""
 
     def __init__(self, client: SqsClient, queue_url: str) -> None:
         if not queue_url:
@@ -90,157 +329,529 @@ class SqsBacktestJobQueue:
         self._client = client
         self._queue_url = queue_url
 
-    def publish(self, request: Mapping[str, Any]) -> None:
+    def publish(self, message: Mapping[str, Any]) -> None:
         self._client.send_message(
             QueueUrl=self._queue_url,
-            MessageBody=_canonical(request),
+            MessageBody=_canonical(message),
             MessageAttributes={
-                "BacktestRunId": {
-                    "DataType": "String",
-                    "StringValue": str(request["backtest_run_id"]),
-                },
-                "IdempotencyKey": {
-                    "DataType": "String",
-                    "StringValue": str(request["idempotency_key"]),
-                },
+                "BacktestRunId": {"DataType": "String", "StringValue": str(message["backtestRunId"])},
+                "IdempotencyKey": {"DataType": "String", "StringValue": str(message["idempotencyKey"])},
             },
         )
 
 
-class InMemoryBacktestRunStore:
-    """Atomic local store fake for the future durable persistence adapter."""
+# ---------------------------------------------------------------------------
+# Storage boundary
+# ---------------------------------------------------------------------------
 
-    _TRANSITIONS = {
-        "QUEUED": frozenset({"RUNNING", "FAILED", "UNAVAILABLE"}),
-        "RUNNING": frozenset({"COMPLETE", "FAILED", "UNAVAILABLE"}),
-        "COMPLETE": frozenset(),
-        "FAILED": frozenset(),
-        "UNAVAILABLE": frozenset(),
-    }
+
+class RunGateway(Protocol):
+    """Everything the lifecycle needs from durable storage, in one transaction each."""
+
+    def accept(self, row: RunRow) -> tuple[RunRow, bool]: ...
+
+    def get(self, run_id: UUID) -> RunRow: ...
+
+    def list_by_owner(self, owner_account_id: UUID, *, limit: int, offset: int) -> tuple[RunRow, ...]: ...
+
+    def attempts(self, run_id: UUID) -> tuple[RunAttemptRow, ...]: ...
+
+    def performance(self, run_id: UUID) -> PerformanceSummaryRow | None: ...
+
+    def monthly(self, run_id: UUID) -> tuple[MonthlyJudgmentSummaryRow, ...]: ...
+
+    def manifests(self, run_id: UUID) -> tuple[DetailManifestRow, ...]: ...
+
+    def transition(self, run_id: UUID, target: RunStatus, **values: Any) -> RunRow: ...
+
+
+class PersistenceRunGateway:
+    """Durable `RunGateway` over the canonical schema, in SQLAlchemy Core."""
+
+    def __init__(self, persistence: Any) -> None:
+        self._persistence = persistence
+
+    @contextmanager
+    def _write(self) -> Iterator[Any]:
+        with self._persistence.unit_of_work() as uow:
+            yield uow
+
+    @contextmanager
+    def _read(self) -> Iterator[Any]:
+        with self._persistence.read_only() as uow:
+            yield uow
+
+    def accept(self, row: RunRow) -> tuple[RunRow, bool]:
+        try:
+            with self._write() as uow:
+                return uow.runs.accept(row)
+        except PersistedIdempotencyConflict as exc:
+            raise IdempotencyConflict(str(exc)) from exc
+
+    def get(self, run_id: UUID) -> RunRow:
+        try:
+            with self._read() as uow:
+                return uow.runs.get(run_id)
+        except RowNotFound as exc:
+            raise BacktestRunNotFound(str(exc)) from exc
+
+    def list_by_owner(self, owner_account_id: UUID, *, limit: int, offset: int) -> tuple[RunRow, ...]:
+        with self._read() as uow:
+            return uow.runs.list_by_owner(owner_account_id, limit=limit, offset=offset)
+
+    def attempts(self, run_id: UUID) -> tuple[RunAttemptRow, ...]:
+        with self._read() as uow:
+            return uow.attempts.list_for_run(run_id)
+
+    def performance(self, run_id: UUID) -> PerformanceSummaryRow | None:
+        with self._read() as uow:
+            return uow.performance.find(run_id)
+
+    def monthly(self, run_id: UUID) -> tuple[MonthlyJudgmentSummaryRow, ...]:
+        with self._read() as uow:
+            return uow.monthly.list_for_run(run_id)
+
+    def manifests(self, run_id: UUID) -> tuple[DetailManifestRow, ...]:
+        with self._read() as uow:
+            return uow.manifests.list_for_run(run_id)
+
+    def transition(self, run_id: UUID, target: RunStatus, **values: Any) -> RunRow:
+        try:
+            with self._write() as uow:
+                if target is RunStatus.RUNNING:
+                    return uow.runs.mark_running(run_id, values["started_at"])
+                if target is RunStatus.COMPLETED:
+                    return uow.runs.mark_completed(run_id, values["completed_at"], values["result_hash"])
+                if target is RunStatus.FAILED:
+                    return uow.runs.mark_failed(run_id, values["completed_at"], values["failure_code"])
+                if target is RunStatus.UNAVAILABLE:
+                    return uow.runs.mark_unavailable(run_id, values["completed_at"], values["failure_code"])
+                raise InvalidStatusTransition(f"{target.value} is not a reachable result status")
+        except PersistedInvalidStatusTransition as exc:
+            raise InvalidStatusTransition(str(exc)) from exc
+        except RowNotFound as exc:
+            raise BacktestRunNotFound(str(exc)) from exc
+
+
+class InMemoryRunGateway:
+    """Faithful in-process `RunGateway`, for tests about HTTP rather than SQL.
+
+    It reproduces the two behaviours the canonical schema's constraints give the
+    durable gateway - unique `idempotency_key` and the `run_status` transition table -
+    because those are the behaviours the lifecycle depends on. It is never used in
+    production; `create_app` requires a gateway to be supplied.
+    """
 
     def __init__(self) -> None:
-        self._by_run_id: dict[str, BacktestRun] = {}
-        self._run_id_by_request_key: dict[str, str] = {}
-        self._result_payloads: dict[str, str] = {}
+        self._runs: dict[UUID, RunRow] = {}
+        self._by_key: dict[str, UUID] = {}
+        self._attempts: dict[UUID, list[RunAttemptRow]] = {}
         self._lock = threading.RLock()
 
-    def accept(self, request: Mapping[str, Any]) -> tuple[BacktestRun, bool]:
-        payload = copy.deepcopy(dict(request))
-        run_id = str(payload["backtest_run_id"])
-        request_key = str(payload["idempotency_key"])
-        canonical_payload = _canonical(payload)
+    def accept(self, row: RunRow) -> tuple[RunRow, bool]:
         with self._lock:
-            existing_run_id = self._run_id_by_request_key.get(request_key)
-            if existing_run_id is not None:
-                existing = self._by_run_id[existing_run_id]
-                if _canonical(existing.request) != canonical_payload:
-                    raise IdempotencyConflict(
-                        "idempotency_key was already used for another request"
+            existing_id = self._by_key.get(row.idempotency_key)
+            if existing_id is not None:
+                existing = self._runs[existing_id]
+                differing = [
+                    name
+                    for name in (
+                        "bot_id",
+                        "owner_account_id",
+                        "configuration_hash",
+                        "evaluation_start",
+                        "evaluation_end",
+                        "initial_cash_amount",
+                        "market_rules_version",
+                        "accounting_rules_version",
+                        "precision_rules_version",
+                        "fee_policy_id",
+                        "slippage_rate_bps",
+                        "buying_power_buffer_policy_id",
                     )
-                return copy.deepcopy(existing), False
-
-            existing = self._by_run_id.get(run_id)
-            if existing is not None:
-                raise IdempotencyConflict(
-                    "backtest_run_id was already used with another idempotency_key"
-                )
-
-            run = BacktestRun(
-                backtest_run_id=run_id,
-                idempotency_key=request_key,
-                status="QUEUED",
-                request=payload,
-            )
-            self._by_run_id[run_id] = run
-            self._run_id_by_request_key[request_key] = run_id
-            return copy.deepcopy(run), True
-
-    def claim_dispatch(self, run_id: str) -> bool:
-        with self._lock:
-            run = self._require(run_id)
-            if not run.dispatch_pending:
-                return False
-            self._by_run_id[run_id] = replace(run, dispatch_pending=False)
-            return True
-
-    def release_dispatch(self, run_id: str) -> None:
-        with self._lock:
-            run = self._require(run_id)
-            if not run.dispatch_pending:
-                self._by_run_id[run_id] = replace(run, dispatch_pending=True)
-
-    def get(self, run_id: str) -> BacktestRun:
-        with self._lock:
-            return copy.deepcopy(self._require(run_id))
-
-    def apply_result(self, result: Mapping[str, Any]) -> BacktestRun:
-        payload = copy.deepcopy(dict(result))
-        run_id = str(payload["backtest_run_id"])
-        result_key = str(payload["idempotency_key"])
-        canonical_payload = _canonical(payload)
-        with self._lock:
-            run = self._require(run_id)
-            existing_payload = self._result_payloads.get(result_key)
-            if existing_payload is not None:
-                if existing_payload != canonical_payload:
+                    if getattr(existing, name) != getattr(row, name)
+                ]
+                if differing:
                     raise IdempotencyConflict(
-                        "result idempotency_key was already used for another payload"
+                        f"idempotency_key {row.idempotency_key!r} was already used for a "
+                        f"different request; differing fields: {differing}"
                     )
-                return copy.deepcopy(run)
+                return existing, False
+            if row.id in self._runs:
+                raise IdempotencyConflict(f"run id {row.id} is already used by a different idempotency key")
+            self._runs[row.id] = row
+            self._by_key[row.idempotency_key] = row.id
+            return row, True
 
-            target = str(payload["status"])
-            records_initial_queued_result = (
-                run.status == "QUEUED"
-                and target == "QUEUED"
-                and run.status_result is None
-            )
-            if not records_initial_queued_result and target not in self._TRANSITIONS[
-                run.status
-            ]:
-                raise InvalidStatusTransition(
-                    f"{run.status} cannot transition to {target}"
-                )
-
-            updated = replace(
-                run,
-                status=target,
-                status_result=payload,
-                version=run.version + 1,
-            )
-            self._by_run_id[run_id] = updated
-            self._result_payloads[result_key] = canonical_payload
-            return copy.deepcopy(updated)
-
-    def _require(self, run_id: str) -> BacktestRun:
-        try:
-            return self._by_run_id[run_id]
-        except KeyError as exc:
-            raise BacktestRunNotFound(f"backtest run not found: {run_id}") from exc
-
-
-class BacktestLifecycleService:
-    def __init__(
-        self,
-        store: BacktestRunStore,
-        queue: BacktestJobQueue,
-    ) -> None:
-        self._store = store
-        self._queue = queue
-
-    def accept(self, request: Mapping[str, Any]) -> BacktestRun:
-        validate_backtest_request(request)
-        run, _ = self._store.accept(request)
-        if self._store.claim_dispatch(run.backtest_run_id):
+    def get(self, run_id: UUID) -> RunRow:
+        with self._lock:
             try:
-                self._queue.publish(request)
-            except Exception:
-                self._store.release_dispatch(run.backtest_run_id)
+                return self._runs[run_id]
+            except KeyError as exc:
+                raise BacktestRunNotFound(f"backtest run not found: {run_id}") from exc
+
+    def list_by_owner(self, owner_account_id: UUID, *, limit: int, offset: int) -> tuple[RunRow, ...]:
+        with self._lock:
+            owned = [row for row in self._runs.values() if row.owner_account_id == owner_account_id]
+        owned.sort(key=lambda row: (row.queued_at, row.id), reverse=True)
+        return tuple(owned[offset : offset + limit])
+
+    def attempts(self, run_id: UUID) -> tuple[RunAttemptRow, ...]:
+        with self._lock:
+            return tuple(self._attempts.get(run_id, ()))
+
+    def record_attempt(self, row: RunAttemptRow) -> None:
+        """Test seam for arranging attempt history; production writes go through BT-d."""
+        with self._lock:
+            self._attempts.setdefault(row.run_id, []).append(row)
+
+    def performance(self, run_id: UUID) -> PerformanceSummaryRow | None:
+        return None
+
+    def monthly(self, run_id: UUID) -> tuple[MonthlyJudgmentSummaryRow, ...]:
+        return ()
+
+    def manifests(self, run_id: UUID) -> tuple[DetailManifestRow, ...]:
+        return ()
+
+    def transition(self, run_id: UUID, target: RunStatus, **values: Any) -> RunRow:
+        from .persistence.rows import RUN_STATUS_TRANSITIONS
+
+        with self._lock:
+            current = self.get(run_id)
+            if current.status is target:
+                return current
+            if target not in RUN_STATUS_TRANSITIONS[current.status]:
+                raise InvalidStatusTransition(
+                    f"backtest run {run_id} is {current.status.value}; it cannot move to {target.value}"
+                )
+            updated = replace(current, status=target, **values)
+            self._runs[run_id] = updated
+            return updated
+
+
+# ---------------------------------------------------------------------------
+# The service
+# ---------------------------------------------------------------------------
+
+
+_TERMINAL_FAILURE_KIND = "CONTRACT_VIOLATION"
+_TRANSIENT_FAILURE_KIND = "TRANSIENT"
+
+
+@dataclass
+class BacktestLifecycleService:
+    """Accepts requests, dispatches jobs, and applies result events."""
+
+    gateway: RunGateway
+    queue: BacktestJobQueue
+    owners: OwnerDirectory
+    plans: CompiledPlanSource
+    manifests: DatasetManifestSource
+    policies: ExecutionPolicyCatalog
+    dead_letters: DeadLetterSink | None = None
+    max_delivery_attempts: int = 3
+    _applied_events: dict[str, str] = field(default_factory=dict, init=False)
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False)
+
+    # -- acceptance -------------------------------------------------------
+
+    def accept(
+        self,
+        request: Mapping[str, Any],
+        *,
+        compiled_plan: Mapping[str, Any] | None = None,
+    ) -> AcceptedRun:
+        """Accept B's `OFFICIAL_BACKTEST_REQUESTED` and queue the job.
+
+        Every digest in the message is verified, not trusted. Re-accepting the same
+        message returns the existing run and does not enqueue a second job.
+        """
+        validated = validate_official_backtest_request(request, compiled_plan=compiled_plan)
+        row, message = self._build_run(validated, compiled_plan=compiled_plan)
+
+        run_row, created = self.gateway.accept(row)
+        dispatched = False
+        if created:
+            self.queue.publish(message)
+            dispatched = True
+        return AcceptedRun(run=self._load(run_row), created=created, dispatched=dispatched)
+
+    def _build_run(
+        self,
+        request: Mapping[str, Any],
+        *,
+        compiled_plan: Mapping[str, Any] | None,
+    ) -> tuple[RunRow, dict[str, Any]]:
+        missing: list[str] = []
+
+        bot_id = UUID(request["botId"])
+        owner_account_id = self.owners.owner_of(bot_id)
+        if owner_account_id is None:
+            missing.append(f"owner:bot={bot_id}")
+
+        checksum = request["compiledPlanChecksum"]
+        plan = compiled_plan if compiled_plan is not None else self.plans.by_checksum(checksum)
+        if plan is None:
+            missing.append(f"compiledPlan:{checksum}")
+
+        manifest_id = UUID(request["datasetManifestId"])
+        manifest = self.manifests.by_id(manifest_id)
+        if manifest is None:
+            missing.append(f"datasetManifest:{manifest_id}")
+
+        occurred_at = _parse_timestamp(request["metadata"]["occurredAt"])
+        policy: ExecutionPolicy | None
+        try:
+            policy = self.policies.select(occurred_at)
+        except ExecutionPolicyUnavailable as exc:
+            policy = None
+            missing.append(f"executionPolicy:{exc}")
+
+        if missing or policy is None:
+            raise RequestNotSatisfiable(
+                "the request cannot be turned into a run because required inputs are "
+                f"unresolved: {missing}",
+                reason_code="REQUIRED_INPUT_UNAVAILABLE",
+                missing=missing,
+            )
+
+        assert plan is not None and manifest is not None and owner_account_id is not None
+
+        bundle = {
+            "botId": str(bot_id),
+            "ownerAccountId": str(owner_account_id),
+            "expectedSnapshotHash": request["expectedSnapshotHash"],
+            "compiledPlanChecksum": checksum,
+            "datasetManifestId": str(manifest_id),
+            "datasetHash": _prefixed(manifest["dataset_hash"]),
+            "featureMaterializationVersion": str(manifest["schema_id"]),
+            "executionPolicyVersion": policy.version,
+            "precisionRulesVersion": policy.precision_rules_version,
+        }
+        configuration_hash = compute_input_bundle_fingerprint(bundle)
+        idempotency_key = request["metadata"]["idempotencyKey"]
+        run_id = run_id_for(idempotency_key)
+
+        row = RunRow(
+            id=run_id,
+            bot_id=bot_id,
+            owner_account_id=owner_account_id,
+            configuration_hash=configuration_hash,
+            status=RunStatus.QUEUED,
+            evaluation_start=_et_date(policy.period_start, policy),
+            evaluation_end=_et_date(policy.period_end, policy),
+            initial_cash_amount=Decimal(plan["executionSnapshot"]["initialCashAmount"]),
+            market_rules_version=policy.market_rules_version,
+            accounting_rules_version=policy.accounting_rules_version,
+            precision_rules_version=policy.precision_rules_version,
+            fee_policy_id=UUID(policy.fee_policy_id),
+            slippage_rate_bps=policy.slippage_rate_bps,
+            buying_power_buffer_policy_id=UUID(policy.buying_power_buffer_policy_id),
+            idempotency_key=idempotency_key,
+            queued_at=occurred_at,
+        )
+        message = {
+            "backtestRunId": str(run_id),
+            "botId": str(bot_id),
+            "ownerAccountId": str(owner_account_id),
+            "idempotencyKey": idempotency_key,
+            "inputBundleFingerprint": configuration_hash,
+            "executionPolicyVersion": policy.version,
+            "compiledPlanChecksum": checksum,
+            "datasetManifestId": str(manifest_id),
+            "expectedSnapshotHash": request["expectedSnapshotHash"],
+        }
+        return row, message
+
+    # -- queries ----------------------------------------------------------
+
+    def get(self, run_id: UUID, *, owner_account_id: UUID) -> BacktestRun:
+        run = self._load(self.gateway.get(run_id))
+        self._require_owner(run, owner_account_id)
+        return run
+
+    def list_runs(self, owner_account_id: UUID, *, limit: int = 50, offset: int = 0) -> tuple[BacktestRun, ...]:
+        rows = self.gateway.list_by_owner(owner_account_id, limit=limit, offset=offset)
+        return tuple(BacktestRun(run=row) for row in rows)
+
+    def attempts_of(self, run_id: UUID, *, owner_account_id: UUID) -> tuple[RunAttemptRow, ...]:
+        self.get(run_id, owner_account_id=owner_account_id)
+        return self.gateway.attempts(run_id)
+
+    def performance_of(self, run_id: UUID, *, owner_account_id: UUID) -> PerformanceSummaryRow | None:
+        self.get(run_id, owner_account_id=owner_account_id)
+        return self.gateway.performance(run_id)
+
+    def monthly_of(self, run_id: UUID, *, owner_account_id: UUID) -> tuple[MonthlyJudgmentSummaryRow, ...]:
+        self.get(run_id, owner_account_id=owner_account_id)
+        return self.gateway.monthly(run_id)
+
+    def manifests_of(self, run_id: UUID, *, owner_account_id: UUID) -> tuple[DetailManifestRow, ...]:
+        self.get(run_id, owner_account_id=owner_account_id)
+        return self.gateway.manifests(run_id)
+
+    def _require_owner(self, run: BacktestRun, owner_account_id: UUID) -> None:
+        if run.owner_account_id != owner_account_id:
+            raise NotRunOwner(
+                f"backtest run {run.backtest_run_id} belongs to another account"
+            )
+
+    def _load(self, row: RunRow) -> BacktestRun:
+        return BacktestRun(run=row, attempts=self.gateway.attempts(row.id))
+
+    # -- result ingestion --------------------------------------------------
+
+    def ingest_result(
+        self,
+        event: Mapping[str, Any],
+        *,
+        if_match: str | None = None,
+        delivery_attempt: int = 1,
+    ) -> ResultIngestion:
+        """Apply a `backtest.v1` result event.
+
+        A redelivery of an event that was already applied returns the same outcome with
+        `applied=False`, so a worker whose response was lost can retry safely. A
+        *different* event under the same idempotency key is a conflict. A structurally
+        invalid event is poison: retrying it can never succeed, so it goes straight to
+        the dead-letter sink instead of consuming the redelivery budget.
+        """
+        try:
+            validated = validate_backtest_result_event(event)
+        except ContractValidationError as exc:
+            self._dead_letter(event, str(exc), _TERMINAL_FAILURE_KIND, delivery_attempt)
+            raise
+
+        key = validated["metadata"]["idempotencyKey"]
+        payload = _canonical(validated)
+        run_id = UUID(validated["backtestRunId"])
+
+        with self._lock:
+            seen = self._applied_events.get(key)
+            if seen is not None:
+                if seen != payload:
+                    raise IdempotencyConflict(
+                        f"result idempotency key {key} was already applied to different content"
+                    )
+                return ResultIngestion(run=self._load(self.gateway.get(run_id)), applied=False)
+
+            current = self._load(self.gateway.get(run_id))
+            if if_match is not None and if_match != current.etag:
+                raise PreconditionFailed(
+                    f"If-Match {if_match} does not match the run's current state "
+                    f"{current.etag}; re-read the run before retrying",
+                    current=current,
+                )
+
+            try:
+                updated = self._apply(validated, run_id)
+            except InvalidStatusTransition:
                 raise
-        return self._store.get(run.backtest_run_id)
+            except LifecycleError as exc:
+                self._maybe_dead_letter(event, str(exc), delivery_attempt)
+                raise
 
-    def get(self, run_id: str) -> BacktestRun:
-        return self._store.get(run_id)
+            self._applied_events[key] = payload
+            return ResultIngestion(run=self._load(updated), applied=True)
 
-    def apply_result(self, result: Mapping[str, Any]) -> BacktestRun:
-        validate_backtest_result(result)
-        return self._store.apply_result(result)
+    def _apply(self, event: Mapping[str, Any], run_id: UUID) -> RunRow:
+        status = RunStatus(event["status"])
+        if status is RunStatus.QUEUED:
+            return self.gateway.get(run_id)
+        if status is RunStatus.RUNNING:
+            return self.gateway.transition(
+                run_id, RunStatus.RUNNING, started_at=_parse_timestamp(event["startedAt"])
+            )
+        if status is RunStatus.COMPLETED:
+            return self.gateway.transition(
+                run_id,
+                RunStatus.COMPLETED,
+                completed_at=_parse_timestamp(event["completedAt"]),
+                result_hash=event["resultHash"],
+                failure_code=None,
+            )
+        if status is RunStatus.FAILED:
+            return self.gateway.transition(
+                run_id,
+                RunStatus.FAILED,
+                completed_at=_parse_timestamp(event["failedAt"]),
+                failure_code=event["failureCode"],
+            )
+        return self.gateway.transition(
+            run_id,
+            RunStatus.UNAVAILABLE,
+            completed_at=_parse_timestamp(event["decidedAt"]),
+            failure_code=event["reasonCode"],
+        )
+
+    def _maybe_dead_letter(self, event: Mapping[str, Any], reason: str, delivery_attempt: int) -> None:
+        if delivery_attempt >= self.max_delivery_attempts:
+            self._dead_letter(event, reason, _TRANSIENT_FAILURE_KIND, delivery_attempt)
+
+    def _dead_letter(
+        self, event: Mapping[str, Any], reason: str, failure_kind: str, delivery_attempt: int
+    ) -> None:
+        if self.dead_letters is None:
+            return
+        self.dead_letters.dead_letter(
+            DeadLetteredMessage(
+                payload=copy.deepcopy(dict(event)),
+                reason=reason,
+                failure_kind=failure_kind,
+                delivery_attempt=delivery_attempt,
+            )
+        )
+
+    # -- outbound events ---------------------------------------------------
+
+    def result_event_for(
+        self,
+        run: BacktestRun,
+        *,
+        status: str,
+        correlation_id: str,
+        message_id: str | None = None,
+        expected_snapshot_hash: str,
+        execution_policy_version: str,
+        **detail: Any,
+    ) -> dict[str, Any]:
+        """Build the `backtest.v1` event this service would publish for `run`."""
+        return build_backtest_result_event(
+            status=status,
+            backtest_run_id=str(run.backtest_run_id),
+            bot_id=str(run.run.bot_id),
+            owner_account_id=str(run.owner_account_id),
+            expected_snapshot_hash=expected_snapshot_hash,
+            input_bundle_fingerprint=run.run.configuration_hash,
+            execution_policy_version=execution_policy_version,
+            precision_rules_version=run.run.precision_rules_version or PRECISION_RULES_VERSION,
+            message_id=message_id or str(uuid4()),
+            occurred_at=_format_timestamp(datetime.now(tz=timezone.utc)),
+            correlation_id=correlation_id,
+            **detail,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_timestamp(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _format_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _et_date(moment: datetime, policy: ExecutionPolicy) -> date:
+    from zoneinfo import ZoneInfo
+
+    return moment.astimezone(ZoneInfo(policy.timezone)).date()
+
+
+def _prefixed(digest: str) -> str:
+    """Producer manifests carry bare hex; the fingerprint material uses B's prefix."""
+    return digest if digest.startswith("sha256:") else f"sha256:{digest}"

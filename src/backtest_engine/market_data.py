@@ -1,9 +1,25 @@
-"""Immutable manifest-backed Parquet input for reproducible backtests."""
+"""Immutable manifest-backed Parquet input for reproducible backtests.
+
+Contract validation of the manifest -- including the ``dataset_hash``
+recomputation -- belongs to :mod:`backtest_engine.contracts`, which owns the
+single canonical implementation. This module adds only what a *consumer* needs
+on top of a valid manifest:
+
+* the manifest must be ``AVAILABLE``. The contract schema also admits
+  ``STAGED``, ``QUARANTINED``, ``SUPERSEDED`` and ``DELETED``, which are
+  legitimate producer states but are not readable inputs to an official run;
+* every object's bytes must re-hash to its declared ``content_hash``;
+* the Parquet schema, row count, ordering and ET session dates must match the
+  pinned execution policy.
+
+``ParquetMarketDataReader(..., manifest_validator=...)`` is the seam where a
+stricter producer-side validator can be injected during integration.
+"""
 
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -16,8 +32,19 @@ from .contracts import ContractValidationError, validate_dataset_manifest
 from .execution_policy import ExecutionPolicy
 
 
+__all__ = [
+    "READABLE_MANIFEST_STATUS",
+    "MarketDataValidationError",
+    "ParquetMarketDataReader",
+]
+
+
 class MarketDataValidationError(ValueError):
     """Raised when pinned market data cannot be consumed without substitution."""
+
+
+#: The only ``storage.objects`` / manifest state an official run may read.
+READABLE_MANIFEST_STATUS = "AVAILABLE"
 
 
 def _utc_timestamp(value: object, label: str) -> datetime:
@@ -27,7 +54,8 @@ def _utc_timestamp(value: object, label: str) -> datetime:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
         raise MarketDataValidationError(f"{label} must be ISO-8601") from exc
-    if parsed.utcoffset() is None or parsed.utcoffset().total_seconds() != 0:
+    offset = parsed.utcoffset()
+    if offset is None or offset.total_seconds() != 0:
         raise MarketDataValidationError(f"{label} must be UTC")
     return parsed
 
@@ -47,8 +75,14 @@ class ParquetMarketDataReader:
         "volume": pa.int64(),
     }
 
-    def __init__(self, object_root: Path) -> None:
+    def __init__(
+        self,
+        object_root: Path,
+        *,
+        manifest_validator: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> None:
         self.object_root = object_root.expanduser().resolve()
+        self._manifest_validator = manifest_validator
 
     def _object_path(self, object_key: object) -> Path:
         if not isinstance(object_key, str) or not object_key:
@@ -132,6 +166,20 @@ class ParquetMarketDataReader:
             validate_dataset_manifest(manifest)
         except ContractValidationError as exc:
             raise MarketDataValidationError(str(exc)) from exc
+        if self._manifest_validator is not None:
+            try:
+                self._manifest_validator(manifest)
+            except MarketDataValidationError:
+                raise
+            except Exception as exc:
+                raise MarketDataValidationError(str(exc)) from exc
+
+        status = manifest.get("status")
+        if status != READABLE_MANIFEST_STATUS:
+            raise MarketDataValidationError(
+                f"dataset_manifest.status must be {READABLE_MANIFEST_STATUS} to be "
+                f"consumed by an official run, got {status!r}"
+            )
         if manifest.get("schema_id") != policy.market_data_schema_version:
             raise MarketDataValidationError("manifest schema_id does not match policy")
         if (
