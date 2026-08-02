@@ -256,7 +256,11 @@ jobs:
           path: ./
           base: ""
           head: HEAD
-          extra_args: --results=verified --fail
+          # No `--fail` here: the action already passes it, and trufflehog
+          # rejects the repeated flag with
+          # "flag 'fail' cannot be repeated", which fails the gate on argument
+          # parsing before it scans anything.
+          extra_args: --results=verified
       - name: No committed .env or credential files
         run: |
           set -euo pipefail
@@ -272,9 +276,26 @@ jobs:
 
   # ---------------------------------------------------------------- gate 8
   gate8-db-integration:
-    name: gate8-db-integration (PostgreSQL 16, Testcontainers)
+    name: gate8-db-integration (PostgreSQL 16 + LocalStack)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # LocalStack as well as PostgreSQL, because `-m docker` is a single set that
+    # spans both: the worker's SQS tests and the end-to-end test need a queue and
+    # an object store, not just a database. Without this the queue tests skipped
+    # here - and their default endpoint is a developer's local container port, so
+    # they passed on that machine and covered nothing in CI.
+    services:
+      localstack:
+        image: localstack/localstack:4.7.0
+        env:
+          SERVICES: s3,sqs
+          EAGER_SERVICE_LOADING: "1"
+          AWS_DEFAULT_REGION: us-east-1
+        ports:
+          - 4566:4566
+        options: >-
+          --health-cmd "curl -sf http://localhost:4566/_localstack/health || exit 1"
+          --health-interval 10s --health-timeout 5s --health-retries 12
     # `tests/conftest.py` starts its own PostgreSQL 16 container through
     # Testcontainers and applies the CENTRAL Flyway bundle to it, so there is no
     # `services:` block here: a second, differently-migrated server would only
@@ -303,7 +324,16 @@ jobs:
       # The container is migrated with the vendored byte-for-byte copy of the
       # applied central Flyway bundle, so this proves the persistence layer
       # against the canonical schema and not against a restatement of it.
-      - name: Integration tests (PostgreSQL 16 via Testcontainers)
+      - name: Integration tests (PostgreSQL 16 via Testcontainers, queue via LocalStack)
+        env:
+          # tests/test_worker.py defaults to a developer's local LocalStack port
+          # and skips when it is absent. Point it at the service container so the
+          # real SQS coverage actually executes here.
+          BACKTEST_TEST_SQS_ENDPOINT: http://localhost:4566
+          LOCALSTACK_ENDPOINT_URL: http://localhost:4566
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
         run: >-
           python -m pytest -m docker -p no:cacheprovider -rs
           --junitxml=integration-results.xml
