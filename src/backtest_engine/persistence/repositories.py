@@ -664,9 +664,7 @@ class StorageObjectRepository(StorageObjectReader):
                 "mark_available() once the bytes have been verified"
             )
         if row.verified_at is not None:
-            raise PublishConflict(
-                f"storage object {row.id} cannot be registered as already verified"
-            )
+            raise PublishConflict(f"storage object {row.id} cannot be registered as already verified")
 
         # No `index_elements`: `storage.objects` also carries a unique index on
         # (storage_provider, bucket_name, object_key, provider_version_id). Naming only
@@ -695,15 +693,10 @@ class StorageObjectRepository(StorageObjectReader):
                 f"object key {row.object_key!r} is already registered as {existing.id}, "
                 f"not {row.id}; one stored object has exactly one row"
             )
-        differing = [
-            field
-            for field in _OBJECT_IDENTITY_FIELDS
-            if getattr(existing, field) != getattr(row, field)
-        ]
+        differing = [field for field in _OBJECT_IDENTITY_FIELDS if getattr(existing, field) != getattr(row, field)]
         if differing:
             raise PublishConflict(
-                f"storage object id {row.id} is already registered for different bytes; "
-                f"differing fields: {differing}"
+                f"storage object id {row.id} is already registered for different bytes; differing fields: {differing}"
             )
         return existing, False
 
