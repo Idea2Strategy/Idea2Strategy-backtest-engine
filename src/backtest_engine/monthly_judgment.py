@@ -1,4 +1,34 @@
-"""ET-month judgment summaries without raw non-trade evaluation storage."""
+"""ET-month judgment summaries without raw non-trade evaluation storage.
+
+A run can evaluate its conditions on every one-minute bar of a quarter. Storing
+those evaluations is neither useful nor permitted, so each ET month is reduced
+to one ``backtest.monthly_judgment_summaries`` row: six counters that say what
+the month *did*, plus the first-failure histogram that says why it did not
+trade. No evaluation identity and no non-first condition outcome survives the
+reduction.
+
+The six canonical counters (spec 2.2) are independent populations, not slices
+of one total:
+
+``evaluation_count``
+    Every evaluation in the month, data gaps included. The denominator.
+``active_branch_count``
+    Pro branches that were actually active across those evaluations. An
+    inactive branch was never evaluated and is never counted.
+``trade_event_count``
+    Trade-detail records in the month, of any kind.
+``data_gap_count``
+    Evaluations that could not run because required market data was missing.
+    Distinct from "ran and every condition passed".
+``triggered_count``
+    Evaluations that emitted a trade.
+``rejected_count``
+    Trade-detail records the execution model rejected.
+
+``summary_document`` is the jsonb payload of that row and ``summary_hash`` is
+its content address, so two runs of the same month either agree exactly or
+report different hashes.
+"""
 
 from __future__ import annotations
 
@@ -7,18 +37,32 @@ import json
 import re
 import uuid
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from types import MappingProxyType
+from typing import Any
 from zoneinfo import ZoneInfo
 
-from backtest_engine.result_snapshot import ResultRecord
+from backtest_engine.result_snapshot import ResultRecord, ResultRecordKind
 
 
 ET_TIMEZONE_ID = "America/New_York"
 ET = ZoneInfo(ET_TIMEZONE_ID)
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+SUMMARY_SCHEMA_VERSION = 1
+
+#: The six counters `backtest.monthly_judgment_summaries` requires, in the
+#: canonical order used by the summary document and `counters()`.
+CANONICAL_COUNTERS = (
+    "evaluation_count",
+    "active_branch_count",
+    "trade_event_count",
+    "data_gap_count",
+    "triggered_count",
+    "rejected_count",
+)
 
 
 class MonthlyJudgmentValidationError(ValueError):
@@ -128,11 +172,20 @@ class BranchEvaluation:
 
 @dataclass(frozen=True, slots=True)
 class JudgmentEvaluation:
+    """One condition evaluation. Transient: only its aggregate survives.
+
+    ``data_gap`` has no default. "The data was there and every condition
+    passed" and "there was no data to evaluate" produce the same empty failure
+    set, so the caller has to say which happened; inferring it would be a
+    hidden default.
+    """
+
     evaluation_id: str
     run_snapshot_id: str
     evaluated_at: datetime
     mode: StrategyMode
     trade_occurred: bool
+    data_gap: bool
     basic_outcomes: tuple[ConditionOutcome, ...] = ()
     pro_branches: tuple[BranchEvaluation, ...] = ()
 
@@ -152,6 +205,8 @@ class JudgmentEvaluation:
             raise MonthlyJudgmentValidationError("mode is unsupported")
         if not isinstance(self.trade_occurred, bool):
             raise MonthlyJudgmentValidationError("trade_occurred must be a bool")
+        if not isinstance(self.data_gap, bool):
+            raise MonthlyJudgmentValidationError("data_gap must be a bool")
 
         basic = _outcomes(self.basic_outcomes, "basic_outcomes")
         branches = tuple(self.pro_branches)
@@ -172,8 +227,21 @@ class JudgmentEvaluation:
             raise MonthlyJudgmentValidationError(
                 "Pro evaluations must not contain Basic outcomes"
             )
+        if self.data_gap and (basic or branches):
+            raise MonthlyJudgmentValidationError(
+                "a data gap evaluation has no condition outcomes to report"
+            )
+        if self.data_gap and self.trade_occurred:
+            raise MonthlyJudgmentValidationError(
+                "a data gap evaluation cannot have produced a trade"
+            )
         object.__setattr__(self, "basic_outcomes", basic)
         object.__setattr__(self, "pro_branches", branches)
+
+    @property
+    def active_branch_count(self) -> int:
+        """Pro branches actually evaluated. Always 0 for a Basic evaluation."""
+        return sum(1 for branch in self.pro_branches if branch.active)
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,12 +264,22 @@ class FirstFailureCount:
 
 @dataclass(frozen=True, slots=True)
 class MonthlyJudgmentSummary:
+    """One ``backtest.monthly_judgment_summaries`` row in domain form."""
+
     summary_id: str
     run_snapshot_id: str
     result_manifest_id: str
     et_month: EtMonth
+    evaluation_count: int
+    active_branch_count: int
+    trade_event_count: int
+    data_gap_count: int
+    triggered_count: int
+    rejected_count: int
     failure_counts: tuple[FirstFailureCount, ...]
     trade_record_ids: tuple[str, ...]
+    summary_document: Mapping[str, Any]
+    summary_hash: str
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -243,6 +321,42 @@ class MonthlyJudgmentSummary:
         object.__setattr__(self, "failure_counts", counts)
         object.__setattr__(self, "trade_record_ids", trade_ids)
 
+        for name in CANONICAL_COUNTERS:
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise MonthlyJudgmentValidationError(
+                    f"summary.{name} must be a non-negative integer"
+                )
+        if self.trade_event_count != len(trade_ids):
+            raise MonthlyJudgmentValidationError(
+                "trade_event_count must equal the number of linked trade records"
+            )
+        if self.rejected_count > self.trade_event_count:
+            raise MonthlyJudgmentValidationError(
+                "rejected_count cannot exceed trade_event_count"
+            )
+        for name in ("data_gap_count", "triggered_count"):
+            if getattr(self, name) > self.evaluation_count:
+                raise MonthlyJudgmentValidationError(
+                    f"{name} cannot exceed evaluation_count"
+                )
+        if self.data_gap_count + self.triggered_count > self.evaluation_count:
+            raise MonthlyJudgmentValidationError(
+                "a data gap evaluation can never also be a triggered evaluation"
+            )
+        if not isinstance(self.summary_document, Mapping):
+            raise MonthlyJudgmentValidationError(
+                "summary_document must be a mapping"
+            )
+        object.__setattr__(
+            self, "summary_document", MappingProxyType(dict(self.summary_document))
+        )
+        _hash(self.summary_hash, "summary_hash")
+
+    def counters(self) -> dict[str, int]:
+        """The six canonical counters, in canonical order."""
+        return {name: getattr(self, name) for name in CANONICAL_COUNTERS}
+
     def as_record(self) -> dict[str, object]:
         """Return the aggregate relational record, never raw evaluations."""
         return {
@@ -251,6 +365,7 @@ class MonthlyJudgmentSummary:
             "result_manifest_id": self.result_manifest_id,
             "et_month": self.et_month.key,
             "timezone_id": ET_TIMEZONE_ID,
+            **self.counters(),
             "failure_counts": [
                 {
                     "mode": item.mode.value,
@@ -261,6 +376,7 @@ class MonthlyJudgmentSummary:
                 for item in self.failure_counts
             ],
             "trade_record_ids": list(self.trade_record_ids),
+            "summary_hash": self.summary_hash,
         }
 
 
@@ -313,11 +429,20 @@ class MonthlyJudgmentBuilder:
 
         failures: dict[EtMonth, Counter[tuple[StrategyMode, str, str]]] = {}
         records: dict[EtMonth, list[tuple[datetime, str]]] = {}
+        counters: dict[EtMonth, Counter[str]] = {}
 
         for evaluation in supplied_evaluations:
-            if evaluation.trade_occurred:
-                continue
             month = EtMonth.from_instant(evaluation.evaluated_at)
+            tally = counters.setdefault(month, Counter())
+            tally["evaluation_count"] += 1
+            tally["active_branch_count"] += evaluation.active_branch_count
+            if evaluation.data_gap:
+                tally["data_gap_count"] += 1
+            if evaluation.trade_occurred:
+                tally["triggered_count"] += 1
+                # A triggered evaluation reached its trade; its condition
+                # outcomes are not a "why it did not trade" explanation.
+                continue
             for key in _first_failures(evaluation):
                 failures.setdefault(month, Counter())[key] += 1
 
@@ -326,9 +451,13 @@ class MonthlyJudgmentBuilder:
             records.setdefault(month, []).append(
                 (record.occurred_at, record.record_id)
             )
+            tally = counters.setdefault(month, Counter())
+            tally["trade_event_count"] += 1
+            if record.kind is ResultRecordKind.REJECTION:
+                tally["rejected_count"] += 1
 
         summaries = []
-        for month in sorted(set(failures) | set(records)):
+        for month in sorted(set(counters) | set(records)):
             counts = tuple(
                 FirstFailureCount(mode, scope_id, condition_id, count)
                 for (mode, scope_id, condition_id), count in sorted(
@@ -344,21 +473,32 @@ class MonthlyJudgmentBuilder:
                 record_id
                 for _, record_id in sorted(records.get(month, []))
             )
-            summary_id = _summary_id(
+            tally = counters.get(month, Counter())
+            document = _summary_document(
                 run_snapshot_id,
                 result_manifest_id,
                 month,
+                tally,
                 counts,
                 trade_ids,
             )
+            summary_hash = _document_hash(document)
             summaries.append(
                 MonthlyJudgmentSummary(
-                    summary_id=summary_id,
+                    summary_id=_summary_id(summary_hash),
                     run_snapshot_id=run_snapshot_id,
                     result_manifest_id=result_manifest_id,
                     et_month=month,
+                    evaluation_count=tally["evaluation_count"],
+                    active_branch_count=tally["active_branch_count"],
+                    trade_event_count=tally["trade_event_count"],
+                    data_gap_count=tally["data_gap_count"],
+                    triggered_count=tally["triggered_count"],
+                    rejected_count=tally["rejected_count"],
                     failure_counts=counts,
                     trade_record_ids=trade_ids,
+                    summary_document=document,
+                    summary_hash=summary_hash,
                 )
             )
         return tuple(summaries)
@@ -391,23 +531,49 @@ def _first_failures(
     return tuple(result)
 
 
-def _summary_id(
+def _summary_document(
     run_snapshot_id: str,
     result_manifest_id: str,
     month: EtMonth,
+    tally: Counter[str],
     counts: tuple[FirstFailureCount, ...],
     trade_ids: tuple[str, ...],
-) -> str:
-    payload = {
+) -> dict[str, Any]:
+    """The ``monthly_judgment_summaries.summary_document`` jsonb payload.
+
+    Field names inside ``failure_counts`` are the
+    ``backtest.failure_condition_counts`` column names, so the document and the
+    child rows cannot drift apart.
+    """
+
+    document: dict[str, Any] = {
+        "schema_version": SUMMARY_SCHEMA_VERSION,
         "run_snapshot_id": run_snapshot_id,
         "result_manifest_id": result_manifest_id,
-        "et_month": month.key,
-        "failure_counts": [
-            [item.mode.value, item.scope_id, item.condition_id, item.count]
-            for item in counts
-        ],
-        "trade_record_ids": list(trade_ids),
+        "et_year_month": month.key,
+        "timezone_id": ET_TIMEZONE_ID,
     }
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"idea2strategy:d26:{digest}"))
+    document.update({name: tally[name] for name in CANONICAL_COUNTERS})
+    document["failure_counts"] = [
+        {
+            "mode": item.mode.value,
+            "flow_or_branch_key": item.scope_id,
+            "first_failure_condition_key": item.condition_id,
+            "occurrence_count": item.count,
+        }
+        for item in counts
+    ]
+    document["trade_record_ids"] = list(trade_ids)
+    return document
+
+
+def _document_hash(document: Mapping[str, Any]) -> str:
+    canonical = json.dumps(
+        dict(document), sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _summary_id(summary_hash: str) -> str:
+    """Content-addressed row id: the same month content always gets the same id."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"idea2strategy:d26:{summary_hash}"))

@@ -1,0 +1,103 @@
+"""D25 performance metrics: the equity curve and the versioned metric catalogue.
+
+`catalog` declares *what* is measured and under which rule version, `equity_curve`
+builds the mark-to-market series everything is measured on, and `metrics`
+implements one function per rule.
+"""
+
+from __future__ import annotations
+
+from .catalog import (
+    ANNUALIZATION_RULE_ID,
+    CALCULATION_RULES_VERSION,
+    METRIC_CATALOG_VERSION,
+    METRIC_RULES,
+    PERCENT_SCALE,
+    PERIODIC_RETURN_RULE_ID,
+    RATIO_SCALE,
+    RETURN_SCALE,
+    RISK_FREE_ANNUAL_RATE,
+    RISK_FREE_RULE_ID,
+    SAMPLE_STDEV_RULE_ID,
+    TRADING_DAYS_PER_YEAR,
+    WORKING_PRECISION,
+    Metric,
+    MetricRule,
+    MetricUnit,
+    PerformanceCalculationError,
+)
+from .equity_curve import (
+    COST_BASIS_RULE_ID,
+    MARK_TO_MARKET_RULE_ID,
+    EquityCurve,
+    EquityPoint,
+    Holding,
+    LedgerEvent,
+    MarkPrice,
+    PositionState,
+    ValuationBasis,
+    ValuationInstant,
+    ValuationPeriodicity,
+    ValuationSeries,
+    build_equity_curve,
+)
+from .metrics import (
+    MetricSet,
+    TradeStatistics,
+    annualized_volatility_pct,
+    build_metrics,
+    max_drawdown_pct,
+    metric_rule_index,
+    metrics_document,
+    metrics_hash_material,
+    periodic_returns,
+    sharpe_ratio,
+    total_return_pct,
+    win_rate_pct,
+)
+
+
+__all__ = [
+    "ANNUALIZATION_RULE_ID",
+    "CALCULATION_RULES_VERSION",
+    "COST_BASIS_RULE_ID",
+    "MARK_TO_MARKET_RULE_ID",
+    "METRIC_CATALOG_VERSION",
+    "METRIC_RULES",
+    "PERCENT_SCALE",
+    "PERIODIC_RETURN_RULE_ID",
+    "RATIO_SCALE",
+    "RETURN_SCALE",
+    "RISK_FREE_ANNUAL_RATE",
+    "RISK_FREE_RULE_ID",
+    "SAMPLE_STDEV_RULE_ID",
+    "TRADING_DAYS_PER_YEAR",
+    "WORKING_PRECISION",
+    "EquityCurve",
+    "EquityPoint",
+    "Holding",
+    "LedgerEvent",
+    "MarkPrice",
+    "Metric",
+    "MetricRule",
+    "MetricSet",
+    "MetricUnit",
+    "PerformanceCalculationError",
+    "PositionState",
+    "TradeStatistics",
+    "ValuationBasis",
+    "ValuationInstant",
+    "ValuationPeriodicity",
+    "ValuationSeries",
+    "annualized_volatility_pct",
+    "build_equity_curve",
+    "build_metrics",
+    "max_drawdown_pct",
+    "metric_rule_index",
+    "metrics_document",
+    "metrics_hash_material",
+    "periodic_returns",
+    "sharpe_ratio",
+    "total_return_pct",
+    "win_rate_pct",
+]
