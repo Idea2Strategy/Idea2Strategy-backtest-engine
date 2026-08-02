@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import importlib
+import multiprocessing
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from threading import Barrier
+from typing import Any
 
 import pytest
 
@@ -387,18 +390,60 @@ def test_monitor_cpu_time_is_measured_from_its_own_baseline() -> None:
     assert first.sample().cpu_time > second.sample().cpu_time
 
 
-def test_monitor_names_the_enforcement_mechanism_actually_in_force() -> None:
-    monitor = ProcessResourceMonitor()
+def _apply_hard_limits_in_child() -> tuple[str, ...]:
+    """Run ``apply_hard_limits`` in a forked child and return what it applied.
 
-    applied = monitor.apply_hard_limits(_policy())
+    ``setrlimit`` with equal soft and hard values is irreversible for an
+    unprivileged process, and it applies to the *whole* process, so calling it
+    inline caps the pytest process itself for the rest of the session. On Linux
+    that meant ``RLIMIT_AS`` of 512 MiB against an interpreter whose pyarrow and
+    coverage mappings already reserve more address space than that: every later
+    allocation died with ``MemoryError`` and the CI job was killed with no test
+    named. Forking keeps the ceiling inside a process we are willing to lose.
+    """
+    ctx = multiprocessing.get_context("fork")
+    parent, child = ctx.Pipe(duplex=False)
+
+    def _run(conn: Any) -> None:
+        conn.send(ProcessResourceMonitor().apply_hard_limits(_policy()))
+        conn.close()
+
+    process = ctx.Process(target=_run, args=(child,))
+    process.start()
+    child.close()
+    applied: tuple[str, ...] = parent.recv()
+    process.join(30)
+    assert process.exitcode == 0
+    return applied
+
+
+def test_monitor_names_the_enforcement_mechanism_actually_in_force() -> None:
+    if sys.platform == "win32":
+        # Windows has no POSIX rlimit, so the call is a no-op on this process
+        # and the sampler is the only enforcement.
+        assert ProcessResourceMonitor().apply_hard_limits(_policy()) == (
+            "psutil-sampling",
+        )
+        return
+
+    applied = _apply_hard_limits_in_child()
 
     assert "psutil-sampling" in applied
-    if sys.platform == "win32":
-        # Windows has no POSIX rlimit; the sampler is the only enforcement.
-        assert applied == ("psutil-sampling",)
-    else:  # pragma: no cover - exercised on the Linux CI runner
-        assert "rlimit-cpu" in applied
-        assert "rlimit-as" in applied
+    assert "rlimit-cpu" in applied
+    assert "rlimit-as" in applied
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX rlimit only")
+def test_hard_limits_are_not_installed_on_the_calling_process_by_a_test() -> None:
+    """The suite must not be capped by the ceiling the test above installs.
+
+    Without this, a single inline ``apply_hard_limits`` silently poisons every
+    subsequent test in the session.
+    """
+    posix_resource = importlib.import_module("resource")
+    soft, _ = posix_resource.getrlimit(posix_resource.RLIMIT_AS)
+
+    assert soft == posix_resource.RLIM_INFINITY or soft > 512 * 1024 * 1024
 
 
 def test_monitor_sample_drives_the_coordinator_limit_to_a_real_failure() -> None:

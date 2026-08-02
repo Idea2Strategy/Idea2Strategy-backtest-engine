@@ -560,7 +560,22 @@ class ProcessResourceMonitor:
         )
 
     def apply_hard_limits(self, policy: AttemptPolicy) -> tuple[str, ...]:
-        """Install every ceiling this platform supports; report which are live."""
+        """Install every ceiling this platform supports; report which are live.
+
+        .. warning::
+
+           On POSIX this caps the **entire calling process**, and because soft
+           and hard are set to the same value an unprivileged process can never
+           raise them again. Call it only from a dedicated child process that
+           runs exactly one attempt and then exits.
+
+           Calling it in a long-lived worker is a defect twice over: the first
+           attempt's policy would cap every later attempt, and ``RLIMIT_AS``
+           would kill the worker rather than fail the attempt. It is also why a
+           test that called this inline capped the whole pytest session at
+           512 MiB of address space and every later allocation raised
+           ``MemoryError``.
+        """
         _validate_policy(policy)
         applied = ["psutil-sampling"]
         if _posix_resource is not None:  # pragma: no cover - POSIX only
