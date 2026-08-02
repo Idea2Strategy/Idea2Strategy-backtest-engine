@@ -168,6 +168,15 @@ def test_loads_bs_published_plan_unmodified() -> None:
 
 
 def test_the_vendored_fixture_is_byte_identical_to_bs_authoritative_copy() -> None:
+    """The vendored copy must not have drifted from B's own.
+
+    Compared after normalising line endings, not on the raw bytes. The superproject
+    declares `* text=auto eol=lf`, but a Windows working tree can still hold the
+    file with CRLF while git's content is unchanged, and this assertion then failed
+    on a checkout artefact rather than on drift -- which is the one thing it must
+    not do, because the noise trains a reader to ignore it. Any difference in the
+    document's actual content still fails.
+    """
     authoritative = (
         Path(__file__).resolve().parents[3]
         / "Idea2Strategy/backend/modules/backend-messaging/src/main/resources"
@@ -176,7 +185,10 @@ def test_the_vendored_fixture_is_byte_identical_to_bs_authoritative_copy() -> No
     if not authoritative.is_file():
         pytest.skip("the backend submodule is not checked out beside this worktree")
 
-    assert VALID_PLAN.read_bytes() == authoritative.read_bytes()
+    def normalised(path: Path) -> bytes:
+        return path.read_bytes().replace(b"\r\n", b"\n")
+
+    assert normalised(VALID_PLAN) == normalised(authoritative)
 
 
 def test_rejects_the_unsupported_version_fixture_without_substitution() -> None:

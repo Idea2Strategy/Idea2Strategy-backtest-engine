@@ -196,20 +196,62 @@ class RunRepository(_Repository):
     def mark_running(self, run_id: UUID, started_at: datetime) -> RunRow:
         return self._transition(run_id, RunStatus.RUNNING, started_at=started_at)
 
-    def mark_completed(self, run_id: UUID, completed_at: datetime, result_hash: str) -> RunRow:
+    def mark_completed(
+        self,
+        run_id: UUID,
+        completed_at: datetime,
+        result_hash: str,
+        *,
+        result_manifest_id: UUID | None = None,
+    ) -> RunRow:
+        """`result_manifest_id` is the contract's `resultManifestId`.
+
+        Keyword-only and defaulted to `None` so the two existing callers that predate
+        the column keep compiling, but the production ingestion path always supplies
+        it: `backtest.v1` lists it in COMPLETED's `required`, so an event without one
+        never reaches here.
+        """
+
         return self._transition(
             run_id,
             RunStatus.COMPLETED,
             completed_at=completed_at,
             result_hash=result_hash,
             failure_code=None,
+            result_manifest_id=result_manifest_id,
         )
 
-    def mark_failed(self, run_id: UUID, completed_at: datetime, failure_code: str) -> RunRow:
-        return self._transition(run_id, RunStatus.FAILED, completed_at=completed_at, failure_code=failure_code)
+    def mark_failed(
+        self,
+        run_id: UUID,
+        completed_at: datetime,
+        failure_code: str,
+        *,
+        retryable: bool | None = None,
+    ) -> RunRow:
+        return self._transition(
+            run_id,
+            RunStatus.FAILED,
+            completed_at=completed_at,
+            failure_code=failure_code,
+            retryable=retryable,
+        )
 
-    def mark_unavailable(self, run_id: UUID, completed_at: datetime, failure_code: str) -> RunRow:
-        return self._transition(run_id, RunStatus.UNAVAILABLE, completed_at=completed_at, failure_code=failure_code)
+    def mark_unavailable(
+        self,
+        run_id: UUID,
+        completed_at: datetime,
+        failure_code: str,
+        *,
+        missing_requirements: Sequence[str] | None = None,
+    ) -> RunRow:
+        return self._transition(
+            run_id,
+            RunStatus.UNAVAILABLE,
+            completed_at=completed_at,
+            failure_code=failure_code,
+            missing_requirements=None if missing_requirements is None else list(missing_requirements),
+        )
 
     def _transition(self, run_id: UUID, target: RunStatus, **values: Any) -> RunRow:
         sources = sorted(source.value for source, allowed in RUN_STATUS_TRANSITIONS.items() if target in allowed)
@@ -327,6 +369,29 @@ class RunAttemptRepository(_Repository):
             select(run_attempts).where(run_attempts.c.run_id == run_id).order_by(run_attempts.c.attempt_number),
             RunAttemptRow,
         )
+
+    def list_for_runs(self, run_ids: Sequence[UUID]) -> dict[UUID, tuple[RunAttemptRow, ...]]:
+        """Attempts for a whole page of runs, in one query.
+
+        The list endpoint reports an attempt count per row. Reading them with
+        `list_for_run` in a loop would be one round trip per row, so the page cost
+        would grow with the page size for a number that is a `count(*)` away.
+        Runs with no attempts are simply absent from the result; the caller
+        supplies the empty tuple, because "no attempts yet" is not "unknown".
+        """
+
+        if not run_ids:
+            return {}
+        rows = self._fetch_all(
+            select(run_attempts)
+            .where(run_attempts.c.run_id.in_(list(run_ids)))
+            .order_by(run_attempts.c.run_id, run_attempts.c.attempt_number),
+            RunAttemptRow,
+        )
+        grouped: dict[UUID, list[RunAttemptRow]] = {}
+        for row in rows:
+            grouped.setdefault(row.run_id, []).append(row)
+        return {run_id: tuple(items) for run_id, items in grouped.items()}
 
     def next_attempt_number(self, run_id: UUID) -> int:
         """Advisory only. `(run_id, attempt_number)` is the real arbiter."""

@@ -4,6 +4,7 @@
 -- Fixed UUIDs so integration assertions can be literal.
 --   account   00000000-0000-4000-8000-0000000000a1
 --   bot       00000000-0000-4000-8000-0000000000b1
+--   b's bot   00000000-0000-4000-8000-000000000201  (B's published fixture, card D91)
 --   fee       00000000-0000-4000-8000-0000000000f1
 --   buffer    00000000-0000-4000-8000-0000000000f2
 --   dataset   00000000-0000-4000-8000-0000000000d1
@@ -20,6 +21,19 @@ INSERT INTO bot.bots (
   created_at, execution_eligible_from, edit_sequence, updated_at)
 VALUES ('00000000-0000-4000-8000-0000000000b1', '00000000-0000-4000-8000-0000000000a1',
         'BASIC', 'integration-fixture-bot', 'RUNNING', '2026-01-01T00:00:00+00',
+        '2026-01-01T00:00:00+00', '2026-01-01T00:00:00+00', 0, '2026-01-01T00:00:00+00');
+
+-- B's own published bot id, from
+-- backend/modules/backend-messaging/.../strategy-bot/v1/official-backtest-request.valid.json.
+-- Card D91 requires that B's released message be accepted **verbatim**, and
+-- backtest.runs.bot_id is a foreign key into bot.bots, so B's bot has to exist for
+-- the real-infrastructure test to insert anything at all. Re-addressing the message
+-- to the fixture bot instead would test a message B does not publish.
+INSERT INTO bot.bots (
+  id, owner_account_id, mode, name, lifecycle_status, lifecycle_changed_at,
+  created_at, execution_eligible_from, edit_sequence, updated_at)
+VALUES ('00000000-0000-4000-8000-000000000201', '00000000-0000-4000-8000-0000000000a1',
+        'BASIC', 'b-published-release-bot', 'RUNNING', '2026-01-01T00:00:00+00',
         '2026-01-01T00:00:00+00', '2026-01-01T00:00:00+00', 0, '2026-01-01T00:00:00+00');
 
 INSERT INTO trading.fee_policy_versions (

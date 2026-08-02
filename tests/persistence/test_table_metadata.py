@@ -34,14 +34,17 @@ from backtest_engine.persistence.tables import (
 )
 
 
-CENTRAL_BASELINE = (
-    Path(__file__).resolve().parents[2]
-    / "db"
-    / "migration-contributions"
-    / "fixtures"
-    / "central-migration"
-    / "V1__initial_schema.sql.fixture"
-)
+CONTRIBUTION_ROOT = Path(__file__).resolve().parents[2] / "db" / "migration-contributions"
+
+CENTRAL_BASELINE = CONTRIBUTION_ROOT / "fixtures" / "central-migration" / "V1__initial_schema.sql.fixture"
+
+#: This repository's own contributed migrations. The canonical schema this metadata
+#: must restate is *baseline plus contributions*, not the baseline alone: a column
+#: this repository legally added is as canonical as one the baseline declared, and
+#: comparing against the baseline alone would make every legal contribution look
+#: like an invention. `tests/conftest.py` applies exactly these files to the
+#: container after the bundle, so the two halves cannot drift apart.
+CONTRIBUTED_MIGRATIONS = CONTRIBUTION_ROOT / "migrations"
 
 EXPECTED_TABLES = {
     "backtest.runs",
@@ -162,12 +165,80 @@ def _parse_baseline(sql: str) -> dict[str, _DdlTable]:
     return tables
 
 
+_ADD_COLUMN = re.compile(
+    r'ALTER TABLE\s+"(?P<schema>[a-z_]+)"\."(?P<name>[a-z_]+)"\s+(?P<body>.*?);',
+    re.S | re.I,
+)
+
+_ADDED_COLUMN_CLAUSE = re.compile(
+    r'ADD COLUMN\s+"(?P<name>[a-z0-9_]+)"\s+'
+    r"(?P<type>[a-z_]+(?:\.[a-z_]+)?(?:\s*\(\s*[0-9]+(?:\s*,\s*[0-9]+)?\s*\))?)"
+    r"(?P<rest>[^,]*)",
+    re.I,
+)
+
+
+def _apply_contributions(tables: dict[str, _DdlTable], sql: str) -> None:
+    """Fold this repository's `ADD COLUMN` clauses into the parsed baseline.
+
+    Only `ADD COLUMN` is interpreted. An `ALTER TABLE` that does anything else --
+    drops a column, retypes one, adds a constraint -- is left alone deliberately:
+    silently ignoring a statement this parser does not model would let a real
+    schema change pass unnoticed, so anything unmodelled must show up as a
+    difference between the metadata and the live container in
+    `tests/persistence/test_schema_drift.py` instead of being absorbed here.
+    """
+
+    for statement in _ADD_COLUMN.finditer(sql):
+        key = f"{statement.group('schema')}.{statement.group('name')}"
+        table = tables.get(key)
+        if table is None:
+            continue
+        for clause in _ADDED_COLUMN_CLAUSE.finditer(statement.group("body")):
+            rest = clause.group("rest").upper()
+            default = re.search(r"DEFAULT\s+(.*?)$", clause.group("rest"), re.I)
+            table.columns[clause.group("name")] = {
+                "type": _normalise_type(clause.group("type")),
+                "nullable": "NOT NULL" not in rest,
+                "default": _normalise_default(default.group(1)) if default else None,
+            }
+            if "UNIQUE" in rest:
+                table.uniques.add((clause.group("name"),))
+
+
 @pytest.fixture(scope="module")
 def baseline() -> dict[str, _DdlTable]:
     parsed = _parse_baseline(CENTRAL_BASELINE.read_text(encoding="utf-8"))
     missing = EXPECTED_TABLES - set(parsed)
     assert missing == set(), f"canonical baseline does not declare {sorted(missing)}"
+    for path in sorted(CONTRIBUTED_MIGRATIONS.glob("V*.sql")):
+        _apply_contributions(parsed, path.read_text(encoding="utf-8"))
     return parsed
+
+
+def test_the_contributed_migrations_really_add_the_columns_this_module_folds_in() -> None:
+    """The folding step must not be a no-op that quietly accepts anything.
+
+    If `_apply_contributions` stopped matching -- a changed quoting style, a
+    renamed clause -- every contributed column would silently disappear from the
+    expected set and the metadata comparison would start passing for a schema the
+    container does not have.
+    """
+    parsed = _parse_baseline(CENTRAL_BASELINE.read_text(encoding="utf-8"))
+    before = set(parsed["backtest.runs"].columns)
+    for path in sorted(CONTRIBUTED_MIGRATIONS.glob("V*.sql")):
+        _apply_contributions(parsed, path.read_text(encoding="utf-8"))
+
+    assert set(parsed["backtest.runs"].columns) - before == {
+        "result_manifest_id",
+        "retryable",
+        "missing_requirements",
+    }
+    assert parsed["backtest.runs"].columns["retryable"] == {
+        "type": "boolean",
+        "nullable": True,
+        "default": None,
+    }
 
 
 ALL_TABLES = [

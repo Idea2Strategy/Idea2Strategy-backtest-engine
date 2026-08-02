@@ -56,8 +56,12 @@ from .money import PRECISION_RULES_VERSION
 
 __all__ = [
     "BACKTEST_CONTRACT_VERSION",
+    "BACKTEST_RESULT_EVENT_TYPE",
     "BACKTEST_RESULT_MESSAGE_TYPES",
+    "BACKTEST_RESULT_ORIGIN_FIELDS",
+    "BACKTEST_RESULT_SOURCE",
     "INPUT_BUNDLE_FIELDS",
+    "LIVE_PERFORMANCE_ELIGIBLE",
     "OFFICIAL_BACKTEST_MESSAGE_TYPE",
     "SCHEMA_ROOT",
     "SCHEMA_VERSION",
@@ -73,6 +77,7 @@ __all__ = [
     "compute_compiled_plan_checksum",
     "compute_input_bundle_fingerprint",
     "compute_message_idempotency_key",
+    "cross_check_request_against_plan",
     "input_bundle_material",
     "message_idempotency_material",
     "official_backtest_operation_key",
@@ -110,6 +115,34 @@ OFFICIAL_BACKTEST_MESSAGE_TYPE = "OFFICIAL_BACKTEST_REQUESTED"
 #: the two agree, so widening one without the other is a test failure.
 SUPPORTED_PLAN_OPERATIONS: frozenset[str] = frozenset(
     {"LOAD_FEATURE", "COMPARE", "EMIT_ORDER_CANDIDATE"}
+)
+
+#: Card D93. Every ``backtest.v1`` result event states its own origin, as a
+#: constant the producer cannot vary and the schema pins with ``const``.
+#:
+#: The three values are not decoration. E owns live room ranking, winner
+#: determination and official performance, and its ``room-performance.v1``
+#: fixture ``live-performance-input.backtest-rejected.json`` refuses an input
+#: whose ``source`` is ``BACKTEST`` and whose ``eventType`` is
+#: ``BACKTEST_RESULT``, with ``expectedDecision =
+#: BACKTEST_SOURCE_NOT_ALLOWED``. Carrying exactly those two values means D's
+#: output is, field for field, the input E has already declared it rejects: a
+#: consumer that forwarded a backtest result into live scoring would be handing
+#: E the document E refuses, rather than one E cannot tell apart.
+#:
+#: ``livePerformanceEligible`` states the same fact positively, so a reader that
+#: does not know the ``source`` vocabulary still cannot conclude "eligible" from
+#: an unrecognised token.
+#:
+#: These are *not* addressing dimensions: they are constants, so they do not
+#: enter ``metadata.idempotencyKey`` and adding them re-addressed nothing.
+BACKTEST_RESULT_SOURCE = "BACKTEST"
+BACKTEST_RESULT_EVENT_TYPE = "BACKTEST_RESULT"
+LIVE_PERFORMANCE_ELIGIBLE = False
+
+#: The fields above, by name. A caller may not supply any of them.
+BACKTEST_RESULT_ORIGIN_FIELDS: frozenset[str] = frozenset(
+    {"source", "eventType", "livePerformanceEligible"}
 )
 
 BACKTEST_RESULT_MESSAGE_TYPES = {
@@ -484,23 +517,42 @@ def validate_official_backtest_request(
         )
 
     if compiled_plan is not None:
-        plan = validate_basic_compiled_plan(compiled_plan)
-        if request["compiledPlanChecksum"] != plan["planChecksum"]:
-            raise ContractValidationError(
-                "official_backtest_request.compiledPlanChecksum does not match the "
-                f"supplied plan: {request['compiledPlanChecksum']} != "
-                f"{plan['planChecksum']}"
-            )
-        plan_snapshot_hash = plan["executionSnapshot"]["immutableStrategyVersion"][
-            "snapshotHash"
-        ]
-        if request["expectedSnapshotHash"] != plan_snapshot_hash:
-            raise ContractValidationError(
-                "official_backtest_request.expectedSnapshotHash does not match the "
-                f"supplied plan: {request['expectedSnapshotHash']} != "
-                f"{plan_snapshot_hash}"
-            )
+        cross_check_request_against_plan(request, validate_basic_compiled_plan(compiled_plan))
     return request
+
+
+def cross_check_request_against_plan(
+    request: Mapping[str, Any], plan: Mapping[str, Any]
+) -> None:
+    """Verify that a request's digests really identify ``plan``.
+
+    Separated from :func:`validate_official_backtest_request` because the plan is
+    not always in the caller's hand at validation time. On the production intake
+    path the message names a ``compiledPlanChecksum`` and the plan is fetched
+    afterwards, so the cross-check has to be callable at the point the plan
+    becomes available -- otherwise a request whose ``expectedSnapshotHash``
+    points at one strategy while its checksum resolves another would be accepted
+    with an internally consistent idempotency key and run the wrong strategy
+    under the right release's identity.
+
+    ``plan`` must already have passed :func:`validate_basic_compiled_plan`; this
+    function checks the *relationship* between the two documents, not the plan.
+    """
+    if request["compiledPlanChecksum"] != plan["planChecksum"]:
+        raise ContractValidationError(
+            "official_backtest_request.compiledPlanChecksum does not match the "
+            f"supplied plan: {request['compiledPlanChecksum']} != "
+            f"{plan['planChecksum']}"
+        )
+    plan_snapshot_hash = plan["executionSnapshot"]["immutableStrategyVersion"][
+        "snapshotHash"
+    ]
+    if request["expectedSnapshotHash"] != plan_snapshot_hash:
+        raise ContractValidationError(
+            "official_backtest_request.expectedSnapshotHash does not match the "
+            f"supplied plan: {request['expectedSnapshotHash']} != "
+            f"{plan_snapshot_hash}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +624,17 @@ def build_backtest_result_event(
             f"backtest_result_event.status is unsupported: {status!r}"
         ) from exc
 
+    supplied_origin = sorted(BACKTEST_RESULT_ORIGIN_FIELDS & set(detail))
+    if supplied_origin:
+        # Refused rather than overwritten: a caller that passed `source` believed
+        # it was choosing one, and silently substituting the right answer would
+        # leave that belief intact for the next caller.
+        raise ContractValidationError(
+            "backtest_result_event.source, .eventType and .livePerformanceEligible "
+            "are fixed by the contract and must not be supplied by the caller; "
+            f"got {supplied_origin}"
+        )
+
     document: dict[str, Any] = {
         "metadata": {
             "contractVersion": BACKTEST_CONTRACT_VERSION,
@@ -596,6 +659,11 @@ def build_backtest_result_event(
         "precisionRulesVersion": precision_rules_version,
         "status": status,
         **detail,
+        # Last, so no per-status detail can shadow them even if the guard above
+        # were ever weakened.
+        "source": BACKTEST_RESULT_SOURCE,
+        "eventType": BACKTEST_RESULT_EVENT_TYPE,
+        "livePerformanceEligible": LIVE_PERFORMANCE_ELIGIBLE,
     }
     validate_backtest_result_event(document)
     return document

@@ -356,6 +356,8 @@ class RunGateway(Protocol):
 
     def attempts(self, run_id: UUID) -> tuple[RunAttemptRow, ...]: ...
 
+    def attempts_for_runs(self, run_ids: Sequence[UUID]) -> Mapping[UUID, tuple[RunAttemptRow, ...]]: ...
+
     def performance(self, run_id: UUID) -> PerformanceSummaryRow | None: ...
 
     def monthly(self, run_id: UUID) -> tuple[MonthlyJudgmentSummaryRow, ...]: ...
@@ -403,6 +405,12 @@ class PersistenceRunGateway:
         with self._read() as uow:
             return uow.attempts.list_for_run(run_id)
 
+    def attempts_for_runs(self, run_ids: Sequence[UUID]) -> Mapping[UUID, tuple[RunAttemptRow, ...]]:
+        if not run_ids:
+            return {}
+        with self._read() as uow:
+            return uow.attempts.list_for_runs(list(run_ids))
+
     def performance(self, run_id: UUID) -> PerformanceSummaryRow | None:
         with self._read() as uow:
             return uow.performance.find(run_id)
@@ -421,11 +429,26 @@ class PersistenceRunGateway:
                 if target is RunStatus.RUNNING:
                     return uow.runs.mark_running(run_id, values["started_at"])
                 if target is RunStatus.COMPLETED:
-                    return uow.runs.mark_completed(run_id, values["completed_at"], values["result_hash"])
+                    return uow.runs.mark_completed(
+                        run_id,
+                        values["completed_at"],
+                        values["result_hash"],
+                        result_manifest_id=values.get("result_manifest_id"),
+                    )
                 if target is RunStatus.FAILED:
-                    return uow.runs.mark_failed(run_id, values["completed_at"], values["failure_code"])
+                    return uow.runs.mark_failed(
+                        run_id,
+                        values["completed_at"],
+                        values["failure_code"],
+                        retryable=values.get("retryable"),
+                    )
                 if target is RunStatus.UNAVAILABLE:
-                    return uow.runs.mark_unavailable(run_id, values["completed_at"], values["failure_code"])
+                    return uow.runs.mark_unavailable(
+                        run_id,
+                        values["completed_at"],
+                        values["failure_code"],
+                        missing_requirements=values.get("missing_requirements"),
+                    )
                 raise InvalidStatusTransition(f"{target.value} is not a reachable result status")
         except PersistedInvalidStatusTransition as exc:
             raise InvalidStatusTransition(str(exc)) from exc
@@ -500,6 +523,14 @@ class InMemoryRunGateway:
         with self._lock:
             return tuple(self._attempts.get(run_id, ()))
 
+    def attempts_for_runs(self, run_ids: Sequence[UUID]) -> Mapping[UUID, tuple[RunAttemptRow, ...]]:
+        with self._lock:
+            return {
+                run_id: tuple(self._attempts[run_id])
+                for run_id in run_ids
+                if self._attempts.get(run_id)
+            }
+
     def record_attempt(self, row: RunAttemptRow) -> None:
         """Test seam for arranging attempt history; production writes go through BT-d."""
         with self._lock:
@@ -566,9 +597,20 @@ class BacktestLifecycleService:
 
         Every digest in the message is verified, not trusted. Re-accepting the same
         message returns the existing run and does not enqueue a second job.
+
+        The plan is resolved **before** validation when the caller did not supply
+        one. That ordering is load-bearing: `validate_official_backtest_request`
+        can only cross-check `compiledPlanChecksum` and `expectedSnapshotHash`
+        against a plan it was given, and the production intake path
+        (`release_intake.OfficialBacktestIntake`) never supplies one -- B's
+        message names the checksum and D fetches the plan. Validating first and
+        resolving afterwards let a request whose `expectedSnapshotHash` named a
+        different strategy through, with a correctly-derived idempotency key, so
+        the run executed the resolved plan under the wrong release's identity.
         """
-        validated = validate_official_backtest_request(request, compiled_plan=compiled_plan)
-        row, message = self._build_run(validated, compiled_plan=compiled_plan)
+        resolved_plan = compiled_plan if compiled_plan is not None else self._resolve_plan(request)
+        validated = validate_official_backtest_request(request, compiled_plan=resolved_plan)
+        row, message = self._build_run(validated, compiled_plan=resolved_plan)
 
         run_row, created = self.gateway.accept(row)
         dispatched = False
@@ -576,6 +618,20 @@ class BacktestLifecycleService:
             self.queue.publish(message)
             dispatched = True
         return AcceptedRun(run=self._load(run_row), created=created, dispatched=dispatched)
+
+    def _resolve_plan(self, request: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        """The plan the message names, if this deployment can produce it.
+
+        Returns `None` rather than raising when the message is too malformed to
+        carry a checksum: validation runs next and reports the real fault, which
+        is a better error than "plan not resolvable".
+        """
+        if not isinstance(request, Mapping):
+            return None
+        checksum = request.get("compiledPlanChecksum")
+        if not isinstance(checksum, str) or not checksum:
+            return None
+        return self.plans.by_checksum(checksum)
 
     def _build_run(
         self,
@@ -672,8 +728,21 @@ class BacktestLifecycleService:
         return run
 
     def list_runs(self, owner_account_id: UUID, *, limit: int = 50, offset: int = 0) -> tuple[BacktestRun, ...]:
+        """One page of the owner's runs, each with its real attempt history.
+
+        The attempts are loaded, not defaulted. `BacktestRun.attempts` defaults to
+        `()` and the list endpoint serialises `attemptCount: len(run.attempts)`, so
+        building the aggregate without them reported `0` for every run while the
+        single-run endpoint -- which goes through `_load` -- reported the truth. The
+        page is served by one batch read rather than one read per row, so a larger
+        page does not cost more round trips.
+        """
+
         rows = self.gateway.list_by_owner(owner_account_id, limit=limit, offset=offset)
-        return tuple(BacktestRun(run=row) for row in rows)
+        if not rows:
+            return ()
+        attempts = self.gateway.attempts_for_runs([row.id for row in rows])
+        return tuple(BacktestRun(run=row, attempts=attempts.get(row.id, ())) for row in rows)
 
     def attempts_of(self, run_id: UUID, *, owner_account_id: UUID) -> tuple[RunAttemptRow, ...]:
         self.get(run_id, owner_account_id=owner_account_id)
@@ -756,6 +825,16 @@ class BacktestLifecycleService:
             return ResultIngestion(run=self._load(updated), applied=True)
 
     def _apply(self, event: Mapping[str, Any], run_id: UUID) -> RunRow:
+        """Persist the whole terminal event, not the parts that already had a column.
+
+        `validate_backtest_result_event` has already run, and the `backtest.v1`
+        schema makes `resultManifestId`, `retryable` and `missingRequirements`
+        *required* in their branches, so each is read with `[...]` rather than
+        `.get(...)`: a build whose schema and whose persistence disagree about what
+        a terminal event carries should fail loudly here, not silently drop a field
+        the way this method used to.
+        """
+
         status = RunStatus(event["status"])
         if status is RunStatus.QUEUED:
             return self.gateway.get(run_id)
@@ -770,6 +849,7 @@ class BacktestLifecycleService:
                 completed_at=_parse_timestamp(event["completedAt"]),
                 result_hash=event["resultHash"],
                 failure_code=None,
+                result_manifest_id=UUID(event["resultManifestId"]),
             )
         if status is RunStatus.FAILED:
             return self.gateway.transition(
@@ -777,12 +857,14 @@ class BacktestLifecycleService:
                 RunStatus.FAILED,
                 completed_at=_parse_timestamp(event["failedAt"]),
                 failure_code=event["failureCode"],
+                retryable=bool(event["retryable"]),
             )
         return self.gateway.transition(
             run_id,
             RunStatus.UNAVAILABLE,
             completed_at=_parse_timestamp(event["decidedAt"]),
             failure_code=event["reasonCode"],
+            missing_requirements=tuple(event["missingRequirements"]),
         )
 
     def _maybe_dead_letter(self, event: Mapping[str, Any], reason: str, delivery_attempt: int) -> None:
