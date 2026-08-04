@@ -64,8 +64,7 @@ def test_vendored_copy_matches_the_central_bundle() -> None:
     differing = [
         name
         for name in central_names
-        if canonical_sql_sha256(central / name)
-        != canonical_sql_sha256(VENDORED_MIGRATIONS / (name + FIXTURE_SUFFIX))
+        if canonical_sql_sha256(central / name) != canonical_sql_sha256(VENDORED_MIGRATIONS / (name + FIXTURE_SUFFIX))
     ]
     assert differing == [], (
         f"central migration files changed: {differing}. Refresh the vendored copy and "
