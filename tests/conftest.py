@@ -175,7 +175,10 @@ def _execute_scripts(url: str, scripts: list[str]) -> None:
             cursor = raw.cursor()
             for script in scripts:
                 cursor.execute(script)
-            raw.commit()
+                # Flyway commits each versioned migration before applying the next.
+                # This is required when a later migration uses an enum value added
+                # by its predecessor, which PostgreSQL rejects in one transaction.
+                raw.commit()
         finally:
             raw.close()
     finally:

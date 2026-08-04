@@ -1,10 +1,7 @@
 """D91 -- the contract-driven intake that replaces the backend's direct INSERT.
 
-Today `ImmutableStrategyReleaseJooqCommandAdapter.saveOfficialBacktestOnce`
-writes `backtest.runs` itself, from the backend, with `slippage_rate_bps`
-hardcoded to the literal `5`. `DatabaseAccessPolicy` says the backend may not
-write `backtest`. The replacement is the outbox row that adapter *already*
-writes: `operations.outbox_messages` carries B's own
+`ImmutableStrategyReleaseJooqCommandAdapter` now publishes the outbox row that
+replaced its former direct `backtest.runs` write. `operations.outbox_messages` carries B's own
 `OFFICIAL_BACKTEST_REQUESTED` payload, a relay publishes it, and
 :class:`~backtest_engine.release_intake.OfficialBacktestIntake` -- this module's
 subject -- turns it into a run through D's own lifecycle.
@@ -24,10 +21,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import os
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -542,48 +537,3 @@ def test_a_dead_letter_carries_enough_context_to_triage(harness: Harness) -> Non
     assert attributes["DeadLetterReason"]["StringValue"] == "MESSAGE_NOT_PARSEABLE"
     assert attributes["SourceQueueUrl"]["StringValue"] == INTAKE_CONFIG.queue_url
     assert attributes["ConsumerId"]["StringValue"] == "d91-intake-1"
-
-
-# ===========================================================================
-# The ownership violation this card must surface, quoted against the source
-# ===========================================================================
-
-
-def backend_adapter_source() -> str | None:
-    override = os.environ.get("IDEA2STRATEGY_BACKEND_PERSISTENCE")
-    suffix = Path(
-        "backend/modules/backend-persistence/src/main/java/com/idea2strategy/backend/"
-        "persistence/strategy/ImmutableStrategyReleaseJooqCommandAdapter.java"
-    )
-    candidates = [Path(override)] if override else []
-    if not candidates:
-        for ancestor in Path(__file__).resolve().parents:
-            candidates.extend([ancestor / suffix, ancestor / "Idea2Strategy" / suffix])
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate.read_text(encoding="utf-8")
-    return None
-
-
-def test_the_backend_still_writes_backtest_runs_directly() -> None:
-    """A tripwire, not a fix. It fails the day the backend change lands.
-
-    When it does, delete this test and this repository's D91 note along with it:
-    the point of a tripwire is that it goes away.
-    """
-    source = backend_adapter_source()
-    if source is None:
-        pytest.skip(
-            "the backend submodule is not checked out beside this worktree, so the "
-            "upstream half of the D91 ownership violation cannot be re-read here. "
-            "The D-side replacement is covered unconditionally by the tests above."
-        )
-
-    assert "insert into backtest.runs " in source
-    assert "on conflict (idempotency_key) do nothing" in source
-    # The literal `5` the backend substitutes for `slippage_rate_bps`.
-    assert (
-        "values (?, ?, ?, ?, 'QUEUED', ?::date, ?::date, ?, ?, ?, ?, ?, 5, ?, ?, "
-    ) in source
-    # And the outbox row that makes the replacement possible without new contracts.
-    assert "insert into operations.outbox_messages " in source

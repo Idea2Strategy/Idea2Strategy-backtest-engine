@@ -41,7 +41,8 @@ from backtest_engine.persistence.tables import (
 
 CONTRIBUTION_ROOT = Path(__file__).resolve().parents[2] / "db" / "migration-contributions"
 
-CENTRAL_BASELINE = CONTRIBUTION_ROOT / "fixtures" / "central-migration" / "V1__initial_schema.sql.fixture"
+CENTRAL_MIGRATIONS = CONTRIBUTION_ROOT / "fixtures" / "central-migration"
+CENTRAL_BASELINE = CENTRAL_MIGRATIONS / "V1__initial_schema.sql.fixture"
 
 #: This repository's own contributed migrations. The canonical schema this metadata
 #: must restate is *baseline plus contributions*, not the baseline alone: a table or
@@ -183,6 +184,19 @@ def contributed_migration_files() -> list[Path]:
     return sorted(CONTRIBUTED_MIGRATIONS.glob("V*.sql"))
 
 
+def central_migration_files() -> list[Path]:
+    """The complete vendored central Flyway history, in version order."""
+
+    return sorted(CENTRAL_MIGRATIONS.glob("V*.sql.fixture"))
+
+
+def ordered_migration_files() -> list[Path]:
+    """Central and D-owned migrations in the exact Flyway version order."""
+
+    files = [*central_migration_files(), *contributed_migration_files()]
+    return sorted(files, key=lambda path: int(path.name.split("__", 1)[0].removeprefix("V")))
+
+
 def canonical_sql() -> str:
     """The applied baseline followed by this repository's contributed migrations.
 
@@ -193,20 +207,25 @@ def canonical_sql() -> str:
     which is why `baseline()` folds them in afterwards with `_apply_contributions`.
     """
 
-    sources = [CENTRAL_BASELINE.read_text(encoding="utf-8")]
-    sources.extend(path.read_text(encoding="utf-8") for path in contributed_migration_files())
+    sources = [path.read_text(encoding="utf-8") for path in ordered_migration_files()]
     return "\n\n".join(sources)
 
 
 _ADD_COLUMN = re.compile(
-    r'ALTER TABLE\s+"(?P<schema>[a-z_]+)"\."(?P<name>[a-z_]+)"\s+(?P<body>.*?);',
+    r'ALTER TABLE\s+"?(?P<schema>[a-z_]+)"?\."?(?P<name>[a-z_]+)"?\s+(?P<body>.*?);',
     re.S | re.I,
 )
 
 _ADDED_COLUMN_CLAUSE = re.compile(
-    r'ADD COLUMN\s+"(?P<name>[a-z0-9_]+)"\s+'
+    r'ADD COLUMN\s+"?(?P<name>[a-z0-9_]+)"?\s+'
     r"(?P<type>[a-z_]+(?:\.[a-z_]+)?(?:\s*\(\s*[0-9]+(?:\s*,\s*[0-9]+)?\s*\))?)"
     r"(?P<rest>[^,]*)",
+    re.I,
+)
+
+_ALTER_COLUMN_NULLABILITY = re.compile(
+    r'ALTER COLUMN\s+"?(?P<name>[a-z0-9_]+)"?\s+'
+    r'(?P<operation>DROP|SET)\s+NOT NULL',
     re.I,
 )
 
@@ -237,6 +256,9 @@ def _apply_contributions(tables: dict[str, _DdlTable], sql: str) -> None:
             }
             if "UNIQUE" in rest:
                 table.uniques.add((clause.group("name"),))
+        for clause in _ALTER_COLUMN_NULLABILITY.finditer(statement.group("body")):
+            column = table.columns[clause.group("name")]
+            column["nullable"] = clause.group("operation").upper() == "DROP"
 
 
 @pytest.fixture(scope="module")
@@ -253,7 +275,7 @@ def baseline() -> dict[str, _DdlTable]:
     parsed = _parse_baseline(canonical_sql())
     missing = EXPECTED_TABLES - set(parsed)
     assert missing == set(), f"canonical DDL does not declare {sorted(missing)}"
-    for path in contributed_migration_files():
+    for path in ordered_migration_files()[1:]:
         _apply_contributions(parsed, path.read_text(encoding="utf-8"))
     return parsed
 

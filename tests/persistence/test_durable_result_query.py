@@ -449,7 +449,7 @@ def test_an_unavailable_run_reports_its_reason_from_runs_failure_code(
 def test_a_run_without_its_pinned_inputs_is_refused_rather_than_reported_with_blanks(
     service: BacktestResultQueryService, persistence: BacktestPersistence
 ) -> None:
-    """The row the backend inserts directly into `backtest.runs` has no pins."""
+    """Any orphan run without D-owned input pins must fail closed."""
 
     orphan = make_run(idempotency_key="OFFICIAL_BACKTEST:no-pins")
     with persistence.unit_of_work() as uow:
