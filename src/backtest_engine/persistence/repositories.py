@@ -375,7 +375,16 @@ class RunAttemptRepository(_Repository):
         next_number = 1
         if latest is not None:
             next_number = int(latest["attempt_number"]) + 1
-            if latest["status"] == WorkStatus.SUCCEEDED.value:
+            if latest["status"] in {
+                WorkStatus.SUCCEEDED.value,
+                WorkStatus.CANCELLED.value,
+                WorkStatus.SKIPPED.value,
+            }:
+                return None
+            if latest["status"] == WorkStatus.FAILED.value and latest["terminal_reason_code"] not in {
+                "LEASE_EXPIRED",
+                "RETRY_RELEASED",
+            }:
                 return None
             if latest["status"] == WorkStatus.RUNNING.value:
                 expires_at = latest["claim_expires_at"]

@@ -841,6 +841,34 @@ def run() -> None:
     import boto3
 
     client = boto3.client("sqs", endpoint_url=os.environ.get("AWS_ENDPOINT_URL"))
+    scale_down_stop = threading.Event()
+    scale_down_thread: threading.Thread | None = None
+    scale_down_engine = None
+    if os.environ.get("BACKTEST_SCALE_DOWN_ENABLED", "false").strip().lower() not in {"", "false"}:
+        if not lane_mode:
+            raise WorkerConfigurationError("instance scale-down requires the three-lane worker mode")
+        from .persistence import create_backtest_engine
+        from .scale_down import controller_from_env
+
+        database_url = os.environ.get("BACKTEST_DATABASE_URL", "").strip()
+        if not database_url:
+            raise WorkerConfigurationError("BACKTEST_DATABASE_URL is required for instance scale-down")
+        scale_down_engine = create_backtest_engine(database_url)
+        controller = controller_from_env(
+            os.environ,
+            engine=scale_down_engine,
+            sqs_client=client,
+            autoscaling_client=boto3.client("autoscaling", endpoint_url=os.environ.get("AWS_ENDPOINT_URL")),
+            queue_urls=[configs[lane].queue_url for lane in BacktestLane],
+        )
+        assert controller is not None
+        scale_down_thread = threading.Thread(
+            target=controller.run,
+            args=(scale_down_stop,),
+            daemon=True,
+            name="backtest-scale-down",
+        )
+        scale_down_thread.start()
     if lane_mode:
         workers = {
             lane: BacktestWorker(
@@ -857,9 +885,21 @@ def run() -> None:
             global_limit=global_limit,
             idle_wait_seconds=float(os.environ.get("BACKTEST_SCHEDULER_IDLE_SECONDS", "5")),
         )
-        signal.signal(signal.SIGINT, scheduler.request_stop)
-        signal.signal(signal.SIGTERM, scheduler.request_stop)
-        scheduler.run()
+
+        def request_stop(*_: Any) -> None:
+            scale_down_stop.set()
+            scheduler.request_stop()
+
+        signal.signal(signal.SIGINT, request_stop)
+        signal.signal(signal.SIGTERM, request_stop)
+        try:
+            scheduler.run()
+        finally:
+            scale_down_stop.set()
+            if scale_down_thread is not None:
+                scale_down_thread.join(timeout=5)
+            if scale_down_engine is not None:
+                scale_down_engine.dispose()
         return
 
     worker = BacktestWorker(client=client, config=config, handler=handler, store=store)
