@@ -452,6 +452,19 @@ def test_bt_a_replay_and_gate_satisfy_the_orchestrator_protocols(tmp_path: Path)
     assert BAR_CLOSED_EVENT_TYPE == RUNTIME_BAR_CLOSED_EVENT_TYPE
 
 
+def test_orchestrator_uses_bounded_parquet_batches_instead_of_materialized_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def materialized_read_is_forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("the worker must use iter_batches")
+
+    monkeypatch.setattr(ParquetMarketDataReader, "read", materialized_read_is_forbidden)
+
+    outcome, _, _ = _run(tmp_path)
+
+    assert outcome.status is ReplayStatus.COMPLETED
+
+
 # --------------------------------------------------------------------------
 # The replay loop is genuinely driven by the event clock.
 # --------------------------------------------------------------------------

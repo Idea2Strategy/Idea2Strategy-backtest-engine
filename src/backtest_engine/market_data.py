@@ -19,7 +19,7 @@ stricter producer-side validator can be injected during integration.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -45,6 +45,9 @@ class MarketDataValidationError(ValueError):
 
 #: The only ``storage.objects`` / manifest state an official run may read.
 READABLE_MANIFEST_STATUS = "AVAILABLE"
+
+DEFAULT_BATCH_SIZE = 65_536
+_HASH_CHUNK_SIZE = 1024 * 1024
 
 
 def _utc_timestamp(value: object, label: str) -> datetime:
@@ -80,9 +83,13 @@ class ParquetMarketDataReader:
         object_root: Path,
         *,
         manifest_validator: Callable[[Mapping[str, Any]], None] | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
     ) -> None:
+        if not isinstance(batch_size, int) or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
         self.object_root = object_root.expanduser().resolve()
         self._manifest_validator = manifest_validator
+        self._batch_size = batch_size
 
     def _object_path(self, object_key: object) -> Path:
         if not isinstance(object_key, str) or not object_key:
@@ -97,33 +104,44 @@ class ParquetMarketDataReader:
         return candidate
 
     @staticmethod
-    def _verify_schema(table: pa.Table, policy: ExecutionPolicy) -> None:
-        metadata = table.schema.metadata or {}
+    def _verify_schema(schema: pa.Schema, policy: ExecutionPolicy) -> None:
+        metadata = schema.metadata or {}
         actual_version = metadata.get(b"schema_version", b"").decode("ascii", "replace")
         if actual_version != policy.market_data_schema_version:
             raise MarketDataValidationError("Parquet schema_version does not match policy")
         for name, expected_type in ParquetMarketDataReader.REQUIRED_FIELDS.items():
-            field_index = table.schema.get_field_index(name)
+            field_index = schema.get_field_index(name)
             if field_index < 0:
                 raise MarketDataValidationError(f"Parquet schema missing field: {name}")
-            field = table.schema.field(field_index)
+            field = schema.field(field_index)
             if field.type != expected_type or field.nullable:
                 raise MarketDataValidationError(
                     f"Parquet field {name} must be non-nullable {expected_type}"
                 )
 
     @staticmethod
-    def _verify_rows(table: pa.Table, policy: ExecutionPolicy) -> None:
-        timestamp_values = table["bar_start_at"].cast(pa.int64()).to_pylist()
-        session_dates = table["session_date_et"].to_pylist()
-        if timestamp_values != sorted(timestamp_values):
-            raise MarketDataValidationError("bar_start_at must be ordered")
+    def _verify_batch_rows(
+        batch: pa.RecordBatch,
+        policy: ExecutionPolicy,
+        previous_timestamp_micros: int | None,
+    ) -> int | None:
+        timestamp_values = batch.column(
+            batch.schema.get_field_index("bar_start_at")
+        ).cast(pa.int64()).to_pylist()
+        session_dates = batch.column(
+            batch.schema.get_field_index("session_date_et")
+        ).to_pylist()
         period_start_micros = int(policy.period_start.timestamp() * 1_000_000)
         period_end_micros = int(policy.period_end.timestamp() * 1_000_000)
         zone = ZoneInfo(policy.timezone)
         for timestamp_micros, session_date in zip(
             timestamp_values, session_dates, strict=True
         ):
+            if (
+                previous_timestamp_micros is not None
+                and timestamp_micros < previous_timestamp_micros
+            ):
+                raise MarketDataValidationError("bar_start_at must be ordered")
             if not period_start_micros <= timestamp_micros < period_end_micros:
                 raise MarketDataValidationError("bar_start_at is outside the pinned period")
             timestamp = datetime.fromtimestamp(
@@ -134,34 +152,44 @@ class ParquetMarketDataReader:
                 raise MarketDataValidationError(
                     "session_date_et does not match bar_start_at in policy timezone"
                 )
+            previous_timestamp_micros = timestamp_micros
+        return previous_timestamp_micros
 
-    def _read_object(
+    @staticmethod
+    def _content_hash(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            while chunk := source.read(_HASH_CHUNK_SIZE):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _parquet_file(
         self,
         metadata: Mapping[str, Any],
         policy: ExecutionPolicy,
-    ) -> pa.Table:
+    ) -> pq.ParquetFile:
         if metadata.get("object_kind") != "PARQUET":
             raise MarketDataValidationError("object_kind must be PARQUET")
         if metadata.get("schema_version") != policy.market_data_schema_version:
             raise MarketDataValidationError("manifest schema_version does not match policy")
         path = self._object_path(metadata.get("object_key"))
-        actual_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        actual_hash = self._content_hash(path)
         if actual_hash != metadata.get("content_hash"):
             raise MarketDataValidationError("object content_hash does not match manifest")
         try:
-            table = pq.read_table(path)
+            parquet = pq.ParquetFile(path)
         except Exception as exc:
             raise MarketDataValidationError("object is not readable Parquet") from exc
-        if table.num_rows != metadata.get("row_count"):
+        if parquet.metadata.num_rows != metadata.get("row_count"):
             raise MarketDataValidationError("Parquet row_count does not match manifest")
-        self._verify_schema(table, policy)
-        return table
+        self._verify_schema(parquet.schema_arrow, policy)
+        return parquet
 
-    def read(
+    def _validate_manifest(
         self,
         manifest: Mapping[str, Any],
         policy: ExecutionPolicy,
-    ) -> pa.Table:
+    ) -> None:
         try:
             validate_dataset_manifest(manifest)
         except ContractValidationError as exc:
@@ -193,8 +221,43 @@ class ParquetMarketDataReader:
         ):
             raise MarketDataValidationError("manifest period_end does not match policy")
 
-        objects = manifest["objects"]
-        tables = [self._read_object(item, policy) for item in objects]
-        table = pa.concat_tables(tables)
-        self._verify_rows(table, policy)
-        return table
+    def iter_batches(
+        self,
+        manifest: Mapping[str, Any],
+        policy: ExecutionPolicy,
+    ) -> Iterator[pa.RecordBatch]:
+        """Yield verified bounded batches without loading an object as one byte string.
+
+        Hash verification is deliberately a streaming first pass. Parquet decoding is
+        then bounded by ``batch_size`` and validates ordering across row-group and
+        object boundaries before yielding each batch.
+        """
+        self._validate_manifest(manifest, policy)
+        previous_timestamp_micros: int | None = None
+        for metadata in manifest["objects"]:
+            parquet = self._parquet_file(metadata, policy)
+            try:
+                batches = parquet.iter_batches(batch_size=self._batch_size)
+                for batch in batches:
+                    previous_timestamp_micros = self._verify_batch_rows(
+                        batch, policy, previous_timestamp_micros
+                    )
+                    yield batch
+            except MarketDataValidationError:
+                raise
+            except Exception as exc:
+                raise MarketDataValidationError("object is not readable Parquet") from exc
+
+    def read(
+        self,
+        manifest: Mapping[str, Any],
+        policy: ExecutionPolicy,
+    ) -> pa.Table:
+        """Compatibility materialization for callers not yet migrated to batches."""
+        batches = list(self.iter_batches(manifest, policy))
+        if not batches:
+            raise MarketDataValidationError("the pinned dataset contains no rows")
+        try:
+            return pa.Table.from_batches(batches)
+        except Exception as exc:
+            raise MarketDataValidationError("Parquet object schemas do not match") from exc

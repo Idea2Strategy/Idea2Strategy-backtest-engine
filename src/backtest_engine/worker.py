@@ -24,7 +24,9 @@ import json
 import os
 import signal
 import threading
+import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
@@ -34,6 +36,8 @@ from typing import Any, Protocol
 __all__ = [
     "WORKER_EXECUTION_KEY_MAX_LENGTH",
     "WORKER_VERSION",
+    "BacktestLane",
+    "BacktestLaneScheduler",
     "BacktestWorker",
     "ExecutionClaim",
     "ExecutionKeyStore",
@@ -86,6 +90,14 @@ class MessageDisposition(StrEnum):
     DELETED = "DELETED"
     RETURNED = "RETURNED"
     DEAD_LETTERED = "DEAD_LETTERED"
+
+
+class BacktestLane(StrEnum):
+    """Infrastructure work lanes; request classification remains upstream-owned."""
+
+    BASIC = "basic"
+    CUSTOM = "custom"
+    COMPETITION = "competition"
 
 
 def worker_execution_key_for(run_id: str, idempotency_key: str) -> str:
@@ -355,6 +367,29 @@ class BacktestWorker:
         messages = self._receive()
         return tuple(self._handle(message) for message in messages)
 
+    def receive_one(self) -> Mapping[str, Any] | None:
+        """Receive at most one message without blocking.
+
+        The multi-lane scheduler uses a non-blocking receive so an empty lane
+        cannot hold every other lane behind a 20-second SQS long poll. It also
+        calls this only after reserving both a lane slot and a global slot, so
+        work beyond the configured concurrency stays visible in SQS.
+        """
+        response = self._client.receive_message(
+            QueueUrl=self._config.queue_url,
+            MaxNumberOfMessages=1,
+            WaitTimeSeconds=0,
+            VisibilityTimeout=int(self._config.visibility_timeout.total_seconds()),
+            MessageSystemAttributeNames=["ApproximateReceiveCount"],
+            MessageAttributeNames=["All"],
+        )
+        messages = list(response.get("Messages", []))
+        return messages[0] if messages else None
+
+    def handle_message(self, message: Mapping[str, Any]) -> HandledMessage:
+        """Handle one previously received message using the durable lifecycle."""
+        return self._handle(message)
+
     def _receive(self) -> list[Mapping[str, Any]]:
         response = self._client.receive_message(
             QueueUrl=self._config.queue_url,
@@ -533,6 +568,157 @@ class BacktestWorker:
         )
 
 
+class LaneWorker(Protocol):
+    """Worker surface required by :class:`BacktestLaneScheduler`."""
+
+    def receive_one(self) -> Mapping[str, Any] | None: ...
+
+    def handle_message(self, message: Mapping[str, Any]) -> HandledMessage: ...
+
+
+class BacktestLaneScheduler:
+    """Bounded, fair scheduler for three independent SQS backtest lanes.
+
+    The default budget is ``basic=2``, ``custom=1``, ``competition=1`` with a
+    global maximum of four executions. The scheduler never receives a message
+    unless both budgets have a free slot. Consequently excess requests remain
+    queued rather than becoming invisible while waiting for a local thread.
+
+    Lane assignment is deliberately not inferred from a message body here.
+    The upstream publisher owns request classification and sends each request
+    to the corresponding queue; this class only shares compute fairly.
+    """
+
+    DEFAULT_LIMITS: Mapping[BacktestLane, int] = {
+        BacktestLane.BASIC: 2,
+        BacktestLane.CUSTOM: 1,
+        BacktestLane.COMPETITION: 1,
+    }
+
+    def __init__(
+        self,
+        *,
+        workers: Mapping[BacktestLane, LaneWorker],
+        lane_limits: Mapping[BacktestLane, int] | None = None,
+        global_limit: int = 4,
+        idle_wait_seconds: float = 5.0,
+    ) -> None:
+        limits = dict(lane_limits or self.DEFAULT_LIMITS)
+        if not workers:
+            raise WorkerConfigurationError("at least one lane worker is required")
+        if global_limit < 1:
+            raise WorkerConfigurationError("global_limit must be at least 1")
+        if idle_wait_seconds <= 0:
+            raise WorkerConfigurationError("idle_wait_seconds must be positive")
+        if set(workers) != set(limits):
+            raise WorkerConfigurationError(
+                "lane workers and lane limits must name the same lanes"
+            )
+        if any(limit < 1 for limit in limits.values()):
+            raise WorkerConfigurationError("every lane limit must be at least 1")
+        if global_limit > sum(limits.values()):
+            raise WorkerConfigurationError(
+                "global_limit cannot exceed the sum of lane limits"
+            )
+
+        self._workers = dict(workers)
+        self._limits = limits
+        self._global_limit = global_limit
+        self._idle_wait_seconds = idle_wait_seconds
+        self._lanes = tuple(workers)
+        self._cursor = 0
+        self._active_by_lane = dict.fromkeys(self._lanes, 0)
+        self._futures: dict[Future[HandledMessage], BacktestLane] = {}
+        self._executor = ThreadPoolExecutor(
+            max_workers=global_limit, thread_name_prefix="backtest-lane"
+        )
+        self._stop = threading.Event()
+        self._receive_order: list[BacktestLane] = []
+
+    @property
+    def active_count(self) -> int:
+        return len(self._futures)
+
+    @property
+    def receive_order(self) -> tuple[BacktestLane, ...]:
+        return tuple(self._receive_order)
+
+    def request_stop(self, *_: object) -> None:
+        """Stop receiving new work; already received work remains drainable."""
+        self._stop.set()
+
+    def poll_once(self) -> tuple[HandledMessage, ...]:
+        completed = list(self._reap_completed())
+        if self._stop.is_set():
+            return tuple(completed)
+
+        empty_lanes: set[BacktestLane] = set()
+        while len(self._futures) < self._global_limit:
+            lane = self._next_eligible_lane(empty_lanes)
+            if lane is None:
+                break
+            message = self._workers[lane].receive_one()
+            if message is None:
+                empty_lanes.add(lane)
+                continue
+            self._receive_order.append(lane)
+            self._active_by_lane[lane] += 1
+            future = self._executor.submit(
+                self._workers[lane].handle_message, message
+            )
+            self._futures[future] = lane
+        return tuple(completed)
+
+    def wait_for_idle(self, *, timeout: float | None = None) -> tuple[HandledMessage, ...]:
+        """Wait for work already received by the scheduler, without polling SQS."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        completed: list[HandledMessage] = []
+        while self._futures:
+            completed.extend(self._reap_completed())
+            if not self._futures:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("backtest lane scheduler did not become idle")
+            time.sleep(0.005)
+        return tuple(completed)
+
+    def run(self) -> None:
+        try:
+            while not self._stop.is_set():
+                before = len(self._futures)
+                completed = self.poll_once()
+                if not completed and len(self._futures) == before:
+                    wait_seconds = 0.05 if self._futures else self._idle_wait_seconds
+                    self._stop.wait(wait_seconds)
+        finally:
+            self.wait_for_idle()
+            self._executor.shutdown(wait=True)
+
+    def _next_eligible_lane(
+        self, empty_lanes: set[BacktestLane]
+    ) -> BacktestLane | None:
+        for offset in range(len(self._lanes)):
+            index = (self._cursor + offset) % len(self._lanes)
+            lane = self._lanes[index]
+            if lane in empty_lanes:
+                continue
+            if self._active_by_lane[lane] >= self._limits[lane]:
+                continue
+            self._cursor = (index + 1) % len(self._lanes)
+            return lane
+        return None
+
+    def _reap_completed(self) -> tuple[HandledMessage, ...]:
+        completed: list[HandledMessage] = []
+        for future, lane in tuple(self._futures.items()):
+            if not future.done():
+                continue
+            del self._futures[future]
+            self._active_by_lane[lane] -= 1
+            completed.append(future.result())
+        return tuple(completed)
+
+
 # ==========================================================================
 # Entry point
 # ==========================================================================
@@ -545,6 +731,12 @@ _REQUIRED_ENV = (
     "BACKTEST_JOB_HANDLER",
     "BACKTEST_EXECUTION_KEY_STORE",
 )
+
+_LANE_LIMIT_DEFAULTS: Mapping[BacktestLane, int] = {
+    BacktestLane.BASIC: 2,
+    BacktestLane.CUSTOM: 1,
+    BacktestLane.COMPETITION: 1,
+}
 
 
 def _config_from_env(environ: Mapping[str, str]) -> WorkerConfig:
@@ -567,6 +759,64 @@ def _config_from_env(environ: Mapping[str, str]) -> WorkerConfig:
             seconds=int(environ.get("BACKTEST_HEARTBEAT_SECONDS", "60"))
         ),
     )
+
+
+def _lane_configs_from_env(
+    environ: Mapping[str, str],
+) -> tuple[dict[BacktestLane, WorkerConfig], dict[BacktestLane, int], int]:
+    """Read the deployment's three queue URLs and bounded concurrency budget."""
+    required = [
+        "BACKTEST_WORKER_ID",
+        "BACKTEST_JOB_HANDLER",
+        "BACKTEST_EXECUTION_KEY_STORE",
+    ]
+    for lane in BacktestLane:
+        prefix = f"BACKTEST_{lane.value.upper()}"
+        required.extend((f"{prefix}_QUEUE_URL", f"{prefix}_DLQ_URL"))
+    missing = [name for name in required if not environ.get(name)]
+    if missing:
+        raise WorkerConfigurationError(
+            "missing required lane environment settings: "
+            + ", ".join(sorted(missing))
+        )
+
+    configs: dict[BacktestLane, WorkerConfig] = {}
+    limits: dict[BacktestLane, int] = {}
+    for lane, default_limit in _LANE_LIMIT_DEFAULTS.items():
+        prefix = f"BACKTEST_{lane.value.upper()}"
+        configs[lane] = WorkerConfig(
+            queue_url=environ[f"{prefix}_QUEUE_URL"],
+            dead_letter_queue_url=environ[f"{prefix}_DLQ_URL"],
+            worker_id=environ["BACKTEST_WORKER_ID"],
+            max_receive_count=int(environ.get("BACKTEST_MAX_RECEIVE_COUNT", "5")),
+            visibility_timeout=timedelta(
+                seconds=int(
+                    environ.get("BACKTEST_VISIBILITY_TIMEOUT_SECONDS", "300")
+                )
+            ),
+            # The scheduler polls lanes without blocking and admits one message
+            # per reserved slot. These values retain a valid standalone config.
+            wait_time=timedelta(0),
+            max_messages=1,
+            heartbeat_interval=timedelta(
+                seconds=int(environ.get("BACKTEST_HEARTBEAT_SECONDS", "60"))
+            ),
+        )
+        limits[lane] = int(
+            environ.get(f"{prefix}_MAX_CONCURRENCY", str(default_limit))
+        )
+    global_limit = int(environ.get("BACKTEST_MAX_TOTAL_CONCURRENCY", "4"))
+    # Reuse the scheduler's validation so environment errors fail before the
+    # process starts receiving messages. Avoid constructing an executor here.
+    if global_limit < 1:
+        raise WorkerConfigurationError("global_limit must be at least 1")
+    if any(limit < 1 for limit in limits.values()):
+        raise WorkerConfigurationError("every lane limit must be at least 1")
+    if global_limit > sum(limits.values()):
+        raise WorkerConfigurationError(
+            "global_limit cannot exceed the sum of lane limits"
+        )
+    return configs, limits, global_limit
 
 
 def load_factory(target: str, setting: str) -> Any:
@@ -592,7 +842,14 @@ def load_factory(target: str, setting: str) -> Any:
 
 
 def run() -> None:
-    config = _config_from_env(os.environ)
+    lane_mode = any(
+        os.environ.get(f"BACKTEST_{lane.value.upper()}_QUEUE_URL")
+        for lane in BacktestLane
+    )
+    if lane_mode:
+        configs, lane_limits, global_limit = _lane_configs_from_env(os.environ)
+    else:
+        config = _config_from_env(os.environ)
     handler: JobHandler = load_factory(
         os.environ["BACKTEST_JOB_HANDLER"], "BACKTEST_JOB_HANDLER"
     )
@@ -607,9 +864,30 @@ def run() -> None:
     import boto3
 
     client = boto3.client("sqs", endpoint_url=os.environ.get("AWS_ENDPOINT_URL"))
-    worker = BacktestWorker(
-        client=client, config=config, handler=handler, store=store
-    )
+    if lane_mode:
+        workers = {
+            lane: BacktestWorker(
+                client=client,
+                config=lane_config,
+                handler=handler,
+                store=store,
+            )
+            for lane, lane_config in configs.items()
+        }
+        scheduler = BacktestLaneScheduler(
+            workers=workers,
+            lane_limits=lane_limits,
+            global_limit=global_limit,
+            idle_wait_seconds=float(
+                os.environ.get("BACKTEST_SCHEDULER_IDLE_SECONDS", "5")
+            ),
+        )
+        signal.signal(signal.SIGINT, scheduler.request_stop)
+        signal.signal(signal.SIGTERM, scheduler.request_stop)
+        scheduler.run()
+        return
+
+    worker = BacktestWorker(client=client, config=config, handler=handler, store=store)
     signal.signal(signal.SIGINT, worker.request_stop)
     signal.signal(signal.SIGTERM, worker.request_stop)
     worker.run()
