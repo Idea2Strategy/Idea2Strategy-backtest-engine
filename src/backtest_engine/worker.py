@@ -807,6 +807,68 @@ def _lane_configs_from_env(
     return configs, limits, global_limit
 
 
+def _request_configs_from_env(environ: Mapping[str, str]) -> dict[Any, Any]:
+    """Build producer-envelope consumers and prevent request/job queue aliasing."""
+
+    from .backtest_request_intake import RequestIntakeConfig, RequestLane
+
+    required = ["BACKTEST_REQUEST_HANDLER", "BACKTEST_REQUEST_RECEIPT_STORE"]
+    for lane in RequestLane:
+        prefix = f"BACKTEST_{lane.value}_REQUEST"
+        required.extend((f"{prefix}_QUEUE_URL", f"{prefix}_DLQ_URL"))
+    missing = [name for name in required if not environ.get(name)]
+    if missing:
+        raise WorkerConfigurationError(
+            "missing required request intake settings: " + ", ".join(sorted(missing))
+        )
+
+    execution_urls = {
+        environ.get(f"BACKTEST_{lane.value.upper()}_QUEUE_URL", "")
+        for lane in BacktestLane
+    }
+    request_urls = {
+        environ[f"BACKTEST_{lane.value}_REQUEST_QUEUE_URL"] for lane in RequestLane
+    }
+    request_dlq_urls = {
+        environ[f"BACKTEST_{lane.value}_REQUEST_DLQ_URL"] for lane in RequestLane
+    }
+    request_all_urls = request_urls | request_dlq_urls
+    if (
+        "" in execution_urls
+        or len(execution_urls) != len(BacktestLane)
+        or len(request_all_urls) != len(RequestLane) * 2
+    ):
+        raise WorkerConfigurationError(
+            "request intake requires distinct Custom and Competition source and DLQ queues"
+        )
+    if execution_urls & request_all_urls:
+        raise WorkerConfigurationError(
+            "producer request queues and execution job queues must be distinct"
+        )
+
+    configs = {}
+    for lane in RequestLane:
+        prefix = f"BACKTEST_{lane.value}_REQUEST"
+        configs[lane] = RequestIntakeConfig(
+            lane=lane,
+            queue_url=environ[f"{prefix}_QUEUE_URL"],
+            dead_letter_queue_url=environ[f"{prefix}_DLQ_URL"],
+            consumer_id=f"backtest-{lane.value.lower()}-request-v1",
+            max_receive_count=int(
+                environ.get("BACKTEST_REQUEST_MAX_RECEIVE_COUNT", "5")
+            ),
+            visibility_timeout=timedelta(
+                seconds=int(
+                    environ.get("BACKTEST_REQUEST_VISIBILITY_TIMEOUT_SECONDS", "300")
+                )
+            ),
+            wait_time=timedelta(
+                seconds=int(environ.get("BACKTEST_REQUEST_WAIT_SECONDS", "5"))
+            ),
+        )
+    return configs
+
+
 def load_factory(target: str, setting: str) -> Any:
     """Resolve ``package.module:factory`` and call it.
 
@@ -845,6 +907,38 @@ def run() -> None:
     import boto3
 
     client = boto3.client("sqs", endpoint_url=os.environ.get("AWS_ENDPOINT_URL"))
+    request_intake_stop = threading.Event()
+    request_threads: list[threading.Thread] = []
+    request_mode = any(
+        os.environ.get(f"BACKTEST_{lane}_REQUEST_QUEUE_URL")
+        for lane in ("CUSTOM", "COMPETITION")
+    )
+    if request_mode:
+        from .backtest_request_intake import BacktestRequestIntake
+
+        request_configs = _request_configs_from_env(os.environ)
+        request_handler = load_factory(
+            os.environ["BACKTEST_REQUEST_HANDLER"], "BACKTEST_REQUEST_HANDLER"
+        )
+        request_receipts = load_factory(
+            os.environ["BACKTEST_REQUEST_RECEIPT_STORE"],
+            "BACKTEST_REQUEST_RECEIPT_STORE",
+        )
+        for request_lane, request_config in request_configs.items():
+            intake = BacktestRequestIntake(
+                client=client,
+                config=request_config,
+                handler=request_handler,
+                receipts=request_receipts,
+            )
+            thread = threading.Thread(
+                target=intake.run,
+                args=(request_intake_stop,),
+                daemon=True,
+                name=f"backtest-{request_lane.value.lower()}-request-intake",
+            )
+            thread.start()
+            request_threads.append(thread)
     scale_down_stop = threading.Event()
     scale_down_thread: threading.Thread | None = None
     scale_down_engine = None
@@ -890,23 +984,36 @@ def run() -> None:
             idle_wait_seconds=float(os.environ.get("BACKTEST_SCHEDULER_IDLE_SECONDS", "5")),
         )
 
-        def request_stop(*_: Any) -> None:
+        def request_all_stop(*_: Any) -> None:
+            request_intake_stop.set()
             scale_down_stop.set()
             scheduler.request_stop()
 
-        signal.signal(signal.SIGINT, request_stop)
-        signal.signal(signal.SIGTERM, request_stop)
+        signal.signal(signal.SIGINT, request_all_stop)
+        signal.signal(signal.SIGTERM, request_all_stop)
         try:
             scheduler.run()
         finally:
+            request_intake_stop.set()
             scale_down_stop.set()
             if scale_down_thread is not None:
                 scale_down_thread.join(timeout=5)
             if scale_down_engine is not None:
                 scale_down_engine.dispose()
+            for thread in request_threads:
+                thread.join(timeout=6)
         return
 
     worker = BacktestWorker(client=client, config=config, handler=handler, store=store)
-    signal.signal(signal.SIGINT, worker.request_stop)
-    signal.signal(signal.SIGTERM, worker.request_stop)
-    worker.run()
+    def request_single_stop(*args: Any) -> None:
+        request_intake_stop.set()
+        worker.request_stop(*args)
+
+    signal.signal(signal.SIGINT, request_single_stop)
+    signal.signal(signal.SIGTERM, request_single_stop)
+    try:
+        worker.run()
+    finally:
+        request_intake_stop.set()
+        for thread in request_threads:
+            thread.join(timeout=6)

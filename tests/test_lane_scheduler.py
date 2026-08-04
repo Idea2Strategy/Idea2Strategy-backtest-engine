@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from backtest_engine.backtest_request_intake import RequestLane
 from backtest_engine.worker import (
     BacktestLane,
     BacktestLaneScheduler,
@@ -23,6 +24,7 @@ from backtest_engine.worker import (
     WorkerConfig,
     WorkerConfigurationError,
     _lane_configs_from_env,
+    _request_configs_from_env,
 )
 
 
@@ -146,6 +148,29 @@ def test_lane_environment_rejects_partial_queue_configuration() -> None:
                 },
             }
         )
+
+
+def test_request_intake_queues_must_be_complete_and_separate_from_execution_queues() -> None:
+    environ = {
+        "BACKTEST_BASIC_QUEUE_URL": "https://sqs/jobs-basic",
+        "BACKTEST_CUSTOM_QUEUE_URL": "https://sqs/jobs-custom",
+        "BACKTEST_COMPETITION_QUEUE_URL": "https://sqs/jobs-competition",
+        "BACKTEST_CUSTOM_REQUEST_QUEUE_URL": "https://sqs/requests-custom",
+        "BACKTEST_CUSTOM_REQUEST_DLQ_URL": "https://sqs/requests-custom-dlq",
+        "BACKTEST_COMPETITION_REQUEST_QUEUE_URL": "https://sqs/requests-competition",
+        "BACKTEST_COMPETITION_REQUEST_DLQ_URL": "https://sqs/requests-competition-dlq",
+        "BACKTEST_REQUEST_HANDLER": "backtest_engine.production:backtest_request_handler",
+        "BACKTEST_REQUEST_RECEIPT_STORE": "backtest_engine.production:postgres_request_receipt_store",
+    }
+
+    configs = _request_configs_from_env(environ)
+
+    assert configs[RequestLane.CUSTOM].queue_url == "https://sqs/requests-custom"
+    assert configs[RequestLane.COMPETITION].queue_url == "https://sqs/requests-competition"
+
+    environ["BACKTEST_CUSTOM_REQUEST_QUEUE_URL"] = environ["BACKTEST_CUSTOM_QUEUE_URL"]
+    with pytest.raises(WorkerConfigurationError, match="must be distinct"):
+        _request_configs_from_env(environ)
 
 
 def test_lane_scheduler_round_robins_nonempty_lanes_without_starvation() -> None:

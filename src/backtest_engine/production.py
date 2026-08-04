@@ -26,7 +26,7 @@ from sqlalchemy import Engine, text
 
 from backtest_engine.api import RESULT_INGEST_SCOPE, Principal
 from backtest_engine.attempt_coordinator import AttemptPolicy, ProcessResourceMonitor
-from backtest_engine.backtest_request_intake import PostgresRequestReceiptStore
+from backtest_engine.backtest_request_intake import PostgresRequestReceiptStore, RequestLane
 from backtest_engine.basic_runtime import BasicPlanRuntime
 from backtest_engine.calendar import XNYS_CALENDAR
 from backtest_engine.execution_model import (
@@ -40,6 +40,10 @@ from backtest_engine.market_data import ParquetMarketDataReader
 from backtest_engine.money import PRECISION_RULES_VERSION
 from backtest_engine.object_store import S3ObjectStore
 from backtest_engine.persistence import BacktestPersistence, create_backtest_engine
+from backtest_engine.request_dispatch import (
+    BacktestRequestJobPublisher,
+    QueuedRunProjection,
+)
 from backtest_engine.wiring import (
     OrchestratorJobHandler,
     PersistenceExecutionKeyStore,
@@ -222,6 +226,65 @@ class PostgresDatasetManifestSource:
             "available_at": _utc_text(available_at),
             "objects": objects,
         }
+
+
+class PostgresQueuedRunSource:
+    """Read the provider-created run that authorizes request-to-job conversion."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def by_id(self, run_id: uuid.UUID) -> QueuedRunProjection | None:
+        statement = text(
+            """
+            SELECT id, lane::text, message_id, bot_id, owner_account_id,
+                   configuration_hash, aggregate_sequence, evaluation_start,
+                   evaluation_end, execution_policy_version
+              FROM backtest.runs
+             WHERE id = :run_id
+            """
+        )
+        with self._engine.connect() as connection:
+            row = connection.execute(statement, {"run_id": run_id}).mappings().first()
+        if row is None:
+            return None
+        try:
+            return QueuedRunProjection(
+                run_id=uuid.UUID(str(row["id"])),
+                lane=RequestLane(str(row["lane"])),
+                message_id=uuid.UUID(str(row["message_id"])),
+                bot_id=uuid.UUID(str(row["bot_id"])),
+                owner_account_id=uuid.UUID(str(row["owner_account_id"])),
+                configuration_hash=str(row["configuration_hash"]),
+                aggregate_sequence=int(row["aggregate_sequence"]),
+                evaluation_start=row["evaluation_start"],
+                evaluation_end=row["evaluation_end"],
+                execution_policy_version=str(row["execution_policy_version"]),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ConfigurationError(f"backtest run {run_id} cannot form an execution job") from exc
+
+
+class SqsExecutionJobQueue:
+    """Publish the small internal job body to the already bounded lane queues."""
+
+    def __init__(self, client: Any, queue_urls: Mapping[RequestLane, str]) -> None:
+        self._client = client
+        self._queue_urls = dict(queue_urls)
+
+    def publish(self, lane: RequestLane, job: dict[str, Any]) -> None:
+        body = json.dumps(job, sort_keys=True, separators=(",", ":"))
+        self._client.send_message(
+            QueueUrl=self._queue_urls[lane],
+            MessageBody=body,
+            MessageAttributes={
+                "BacktestLane": {"DataType": "String", "StringValue": lane.value},
+                "BacktestRunId": {
+                    "DataType": "String",
+                    "StringValue": str(job["backtestRunId"]),
+                },
+            },
+        )
 
 
 class PostgresSessionAuthenticator:
@@ -566,6 +629,32 @@ def postgres_request_receipt_store(
     """Durable Custom/Competition message receipt and sequence CAS."""
 
     return PostgresRequestReceiptStore(_engine(environ))
+
+
+def backtest_request_handler(
+    environ: Mapping[str, str] = os.environ,
+) -> BacktestRequestJobPublisher:
+    """Build the durable provider-envelope to execution-job adapter."""
+
+    import boto3
+
+    client = boto3.client(
+        "sqs",
+        endpoint_url=environ.get("AWS_ENDPOINT_URL"),
+        region_name=environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION"),
+    )
+    return BacktestRequestJobPublisher(
+        PostgresQueuedRunSource(_engine(environ)),
+        SqsExecutionJobQueue(
+            client,
+            {
+                RequestLane.CUSTOM: _required(environ, "BACKTEST_CUSTOM_QUEUE_URL"),
+                RequestLane.COMPETITION: _required(
+                    environ, "BACKTEST_COMPETITION_QUEUE_URL"
+                ),
+            },
+        ),
+    )
 
 
 def _market_reader(environ: Mapping[str, str]) -> S3ParquetMarketDataReader:

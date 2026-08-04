@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Protocol
 
@@ -51,6 +53,7 @@ BACKTEST_REQUEST_SCHEMA = (
 )
 _OWNER_DOMAIN = "backtest-request"
 _HASH_PATTERN_LENGTH = 64
+_LOGGER = logging.getLogger(__name__)
 
 
 class RequestLane(StrEnum):
@@ -547,8 +550,10 @@ def validate_backtest_request(document: Mapping[str, Any]) -> dict[str, Any]:
         occurred_at = datetime.fromisoformat(str(metadata["occurredAt"]).replace("Z", "+00:00"))
         if occurred_at.tzinfo is None:
             raise ValueError("occurredAt must include an offset")
+        if Decimal(str(instance["initialCashAmount"])) <= 0:
+            raise ValueError("initialCashAmount must be positive")
         if event_type == RequestLane.CUSTOM.event_type:
-            for field in ("botId", "datasetManifestId"):
+            for field in ("requestingAccountId", "botId", "runId", "datasetManifestId"):
                 uuid.UUID(str(instance[field]))
             start = date.fromisoformat(str(instance["periodStart"]))
             end = date.fromisoformat(str(instance["periodEnd"]))
@@ -557,20 +562,37 @@ def validate_backtest_request(document: Mapping[str, Any]) -> dict[str, Any]:
             request_material = "\n".join(
                 str(instance[field])
                 for field in (
+                    "requestingAccountId",
                     "botId",
                     "datasetManifestId",
+                    "expectedDatasetHash",
                     "periodStart",
                     "periodEnd",
                     "expectedSnapshotHash",
                     "compiledPlanChecksum",
+                    "instrumentCatalogVersion",
+                    "initialCashAmount",
                     "assumptionsVersion",
+                    "executionPolicyVersion",
                 )
             )
-            expected_key = None  # account id is intentionally not exposed in the payload
+            # The client idempotency key is deliberately not repeated in the
+            # public envelope, so its one-way producer digest cannot be
+            # recomputed. The canonical Outbox row is checked by the receipt
+            # store before dispatch instead.
+            expected_key = None
         else:
-            for field in ("roomId", "participationId", "botId"):
+            for field in ("runId", "roomId", "participationId", "botId"):
                 uuid.UUID(str(instance[field]))
-            request_material = "\n".join(
+            periods = instance["periods"]
+            if not isinstance(periods, list) or len(periods) != 1:
+                raise ContractValidationError(
+                    "competition runtime envelope must contain exactly one period"
+                )
+            period = periods[0]
+            if Decimal(str(period["importanceWeight"])) <= 0:
+                raise ValueError("importanceWeight must be positive")
+            request_fields = [
                 str(instance[field])
                 for field in (
                     "roomId",
@@ -581,14 +603,52 @@ def validate_backtest_request(document: Mapping[str, Any]) -> dict[str, Any]:
                     "expectedSnapshotHash",
                     "compiledPlanChecksum",
                     "assumptionsVersion",
+                    "executionPolicyVersion",
+                    "scoringTemplateVersionId",
+                    "roomRulesHash",
+                    "initialCashAmount",
+                    "currencyCode",
+                )
+            ]
+            request_fields.extend(
+                str(period[field])
+                for field in (
+                    "evaluationPeriodId",
+                    "periodSequence",
+                    "evaluationStart",
+                    "evaluationEnd",
+                    "importanceWeight",
+                    "inputSetHash",
                 )
             )
+            for dataset in sorted(
+                period["datasets"],
+                key=lambda item: (item["purposeCode"], item["datasetManifestId"]),
+            ):
+                request_fields.extend(
+                    str(dataset[field])
+                    for field in (
+                        "datasetManifestId",
+                        "purposeCode",
+                        "expectedDatasetHash",
+                    )
+                )
+            for feature in sorted(
+                period["featureMaterializations"],
+                key=lambda item: item["featureMaterializationId"],
+            ):
+                request_fields.extend(
+                    str(feature[field])
+                    for field in ("featureMaterializationId", "lockedResultHash")
+                )
+            request_material = "\n".join(request_fields)
             expected_key = _sha256_prefixed(
                 "\n".join(
                     (
-                        "COMPETITION",
+                        "COMPETITION_PERIOD",
                         str(instance["roomId"]),
                         str(instance["participationId"]),
+                        str(period["evaluationPeriodId"]),
                         str(instance["planHash"]),
                     )
                 )
@@ -600,6 +660,8 @@ def validate_backtest_request(document: Mapping[str, Any]) -> dict[str, Any]:
         raise ContractValidationError("requestHash does not match the canonical request fields")
     if expected_key is not None and idempotency_key != expected_key:
         raise ContractValidationError("idempotencyKey does not match competition identity")
+    if str(metadata["correlationId"]) != str(instance["runId"]):
+        raise ContractValidationError("correlationId does not match runId")
     expected_message_id = _java_name_uuid(f"{event_type}:{idempotency_key}")
     if message_id != expected_message_id:
         raise ContractValidationError("messageId does not match event type and idempotency key")
@@ -671,6 +733,16 @@ class BacktestRequestIntake:
             MessageAttributeNames=["All"],
         )
         return tuple(self.handle(message) for message in response.get("Messages", []))
+
+    def run(self, stop: threading.Event) -> None:
+        """Poll until the shared worker shutdown event is set."""
+
+        while not stop.is_set():
+            try:
+                self.poll_once()
+            except Exception:  # pragma: no cover - SDK/network boundary
+                _LOGGER.exception("backtest request intake poll failed; retrying")
+                stop.wait(1)
 
     def handle(self, message: Mapping[str, Any]) -> RequestIntakeOutcome:
         sqs_message_id = str(message.get("MessageId", ""))
@@ -786,9 +858,7 @@ class BacktestRequestIntake:
         event_type = str(metadata["messageType"])
         if event_type != self._config.lane.event_type:
             return "UNEXPECTED_MESSAGE_TYPE"
-        aggregate_id = (
-            request["botId"] if self._config.lane is RequestLane.CUSTOM else request["participationId"]
-        )
+        aggregate_id = request["runId"]
         expected = (
             envelope.event_type == event_type
             and envelope.contract_version == metadata["contractVersion"]
@@ -796,6 +866,7 @@ class BacktestRequestIntake:
             and str(envelope.aggregate_id) == aggregate_id
             and str(envelope.message_id) == metadata["messageId"]
             and envelope.producer_idempotency_key == metadata["idempotencyKey"]
+            and envelope.aggregate_sequence == request["aggregateSequence"]
         )
         return None if expected else "TRANSPORT_ENVELOPE_MISMATCH"
 

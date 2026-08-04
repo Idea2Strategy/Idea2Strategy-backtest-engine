@@ -4,7 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
@@ -12,12 +12,15 @@ from uuid import UUID
 import pytest
 
 from backtest_engine.api import RESULT_INGEST_SCOPE
+from backtest_engine.backtest_request_intake import RequestLane
 from backtest_engine.production import (
     ConfigurationError,
     PostgresCompiledPlanSource,
     PostgresOwnerDirectory,
+    PostgresQueuedRunSource,
     PostgresSessionAuthenticator,
     S3ParquetMarketDataReader,
+    SqsExecutionJobQueue,
     load_execution_policy_catalog,
 )
 
@@ -144,6 +147,53 @@ def test_policy_catalog_refuses_unversioned_configuration(tmp_path: Path) -> Non
 
     with pytest.raises(ConfigurationError, match="schemaVersion"):
         load_execution_policy_catalog(path)
+
+
+def test_request_dispatch_reads_the_provider_created_run_and_publishes_a_small_job() -> None:
+    run_id = UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+    message_id = UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
+    source = PostgresQueuedRunSource(
+        _Engine(
+            {
+                "id": run_id,
+                "lane": "CUSTOM",
+                "message_id": message_id,
+                "bot_id": BOT_ID,
+                "owner_account_id": ACCOUNT_ID,
+                "configuration_hash": "a" * 64,
+                "aggregate_sequence": 1,
+                "evaluation_start": date(2024, 1, 1),
+                "evaluation_end": date(2024, 12, 31),
+                "execution_policy_version": "policy-v1",
+            }
+        )  # type: ignore[arg-type]
+    )
+
+    run = source.by_id(run_id)
+
+    assert run is not None
+    assert run.lane is RequestLane.CUSTOM
+    assert run.owner_account_id == ACCOUNT_ID
+
+    class _Sqs:
+        sent: dict[str, object] | None = None
+
+        def send_message(self, **kwargs: object) -> None:
+            self.sent = kwargs
+
+    sqs = _Sqs()
+    queue = SqsExecutionJobQueue(
+        sqs,  # type: ignore[arg-type]
+        {RequestLane.CUSTOM: "https://sqs/jobs-custom"},
+    )
+    queue.publish(
+        RequestLane.CUSTOM,
+        {"backtestRunId": str(run_id), "idempotencyKey": "sha256:" + "b" * 64},
+    )
+
+    assert sqs.sent is not None
+    assert sqs.sent["QueueUrl"] == "https://sqs/jobs-custom"
+    assert json.loads(str(sqs.sent["MessageBody"]))["backtestRunId"] == str(run_id)
 
 
 def test_s3_reader_materializes_to_a_private_cache_before_delegate_read(tmp_path: Path) -> None:

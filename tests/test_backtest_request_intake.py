@@ -23,11 +23,15 @@ from backtest_engine.backtest_request_intake import (
 NOW = datetime(2026, 8, 4, 12, tzinfo=timezone.utc)
 BOT_ID = uuid.UUID("97000000-0000-4000-8000-000000000002")
 DATASET_ID = uuid.UUID("97000000-0000-4000-8000-000000000003")
+ACCOUNT_ID = uuid.UUID("97000000-0000-4000-8000-000000000001")
 ROOM_ID = uuid.UUID("97000000-0000-4000-8000-000000000004")
 PARTICIPATION_ID = uuid.UUID("97000000-0000-4000-8000-000000000005")
+PERIOD_ID = uuid.UUID("97000000-0000-4000-8000-000000000006")
+SCORING_ID = uuid.UUID("97000000-0000-4000-8000-000000000007")
 SNAPSHOT = "sha256:" + "1" * 64
 PLAN = "sha256:" + "2" * 64
 ROOM_PLAN = "sha256:" + "3" * 64
+DATASET_HASH = "sha256:" + "4" * 64
 
 
 def _sha(value: str) -> str:
@@ -42,44 +46,58 @@ def _java_name_uuid(value: str) -> str:
 def custom_request(
     *, period_start: str = "2024-01-01", client_key: str = "request-42"
 ) -> dict[str, Any]:
-    key = _sha(f"CUSTOM\n97000000-0000-4000-8000-000000000001\n{client_key}")
+    key = _sha(f"CUSTOM\n{ACCOUNT_ID}\n{client_key}")
     request_hash = _sha(
         "\n".join(
             (
+                str(ACCOUNT_ID),
                 str(BOT_ID),
                 str(DATASET_ID),
+                DATASET_HASH,
                 period_start,
                 "2024-12-31",
                 SNAPSHOT,
                 PLAN,
+                "us-supported-universe:2026-08-04",
+                "100000.00000000",
                 "accounting-v1",
+                "backtest-policy-v1",
             )
         )
     )
     event_type = "CUSTOM_BACKTEST_REQUESTED"
+    run_id = _java_name_uuid(f"CUSTOM_BACKTEST_RUN:{key}")
     return {
         "metadata": {
             "contractVersion": "backtest-request.v1",
             "messageType": event_type,
             "messageId": _java_name_uuid(f"{event_type}:{key}"),
             "occurredAt": "2026-08-04T12:00:00Z",
-            "correlationId": str(BOT_ID),
+            "correlationId": run_id,
             "idempotencyKey": key,
         },
         "requestReason": "USER_PERIOD",
         "requestHash": request_hash,
+        "requestingAccountId": str(ACCOUNT_ID),
         "botId": str(BOT_ID),
+        "runId": run_id,
+        "lane": "CUSTOM",
+        "aggregateSequence": 1,
         "expectedSnapshotHash": SNAPSHOT,
         "compiledPlanChecksum": PLAN,
         "datasetManifestId": str(DATASET_ID),
+        "expectedDatasetHash": DATASET_HASH,
         "periodStart": period_start,
         "periodEnd": "2024-12-31",
+        "instrumentCatalogVersion": "us-supported-universe:2026-08-04",
+        "initialCashAmount": "100000.00000000",
         "assumptionsVersion": "accounting-v1",
+        "executionPolicyVersion": "backtest-policy-v1",
     }
 
 
 def competition_request() -> dict[str, Any]:
-    key = _sha(f"COMPETITION\n{ROOM_ID}\n{PARTICIPATION_ID}\n{ROOM_PLAN}")
+    key = _sha(f"COMPETITION_PERIOD\n{ROOM_ID}\n{PARTICIPATION_ID}\n{PERIOD_ID}\n{ROOM_PLAN}")
     request_hash = _sha(
         "\n".join(
             (
@@ -91,21 +109,39 @@ def competition_request() -> dict[str, Any]:
                 SNAPSHOT,
                 PLAN,
                 "accounting-v1",
+                "competition-policy-v1",
+                str(SCORING_ID),
+                "sha256:" + "5" * 64,
+                "100000.00000000",
+                "USD",
+                str(PERIOD_ID),
+                "1",
+                "2025-01-01",
+                "2025-06-30",
+                "1.0",
+                "sha256:" + "6" * 64,
+                str(DATASET_ID),
+                "MARKET_BARS",
+                DATASET_HASH,
             )
         )
     )
     event_type = "COMPETITION_BACKTEST_REQUESTED"
+    run_id = _java_name_uuid(f"COMPETITION_BACKTEST_RUN:{key}")
     return {
         "metadata": {
             "contractVersion": "backtest-request.v1",
             "messageType": event_type,
             "messageId": _java_name_uuid(f"{event_type}:{key}"),
             "occurredAt": "2026-08-04T12:00:00Z",
-            "correlationId": str(PARTICIPATION_ID),
+            "correlationId": run_id,
             "idempotencyKey": key,
         },
         "requestReason": "COMPETITION_EVALUATION",
         "requestHash": request_hash,
+        "runId": run_id,
+        "lane": "COMPETITION",
+        "aggregateSequence": 1,
         "roomId": str(ROOM_ID),
         "participationId": str(PARTICIPATION_ID),
         "botId": str(BOT_ID),
@@ -114,6 +150,29 @@ def competition_request() -> dict[str, Any]:
         "expectedSnapshotHash": SNAPSHOT,
         "compiledPlanChecksum": PLAN,
         "assumptionsVersion": "accounting-v1",
+        "executionPolicyVersion": "competition-policy-v1",
+        "scoringTemplateVersionId": str(SCORING_ID),
+        "roomRulesHash": "sha256:" + "5" * 64,
+        "initialCashAmount": "100000.00000000",
+        "currencyCode": "USD",
+        "periods": [
+            {
+                "evaluationPeriodId": str(PERIOD_ID),
+                "periodSequence": 1,
+                "evaluationStart": "2025-01-01",
+                "evaluationEnd": "2025-06-30",
+                "importanceWeight": "1.0",
+                "inputSetHash": "sha256:" + "6" * 64,
+                "datasets": [
+                    {
+                        "datasetManifestId": str(DATASET_ID),
+                        "purposeCode": "MARKET_BARS",
+                        "expectedDatasetHash": DATASET_HASH,
+                    }
+                ],
+                "featureMaterializations": [],
+            }
+        ],
     }
 
 
@@ -121,11 +180,7 @@ def delivery(document: Mapping[str, Any], *, sequence: int = 1) -> dict[str, Any
     body = json.dumps(document, sort_keys=True, separators=(",", ":"))
     metadata = document["metadata"]
     event_type = str(metadata["messageType"])
-    aggregate_id = (
-        document["botId"]
-        if event_type == "CUSTOM_BACKTEST_REQUESTED"
-        else document["participationId"]
-    )
+    aggregate_id = document["runId"]
     attributes = {
         "eventType": event_type,
         "contractVersion": "backtest-request.v1",
@@ -325,7 +380,7 @@ def test_same_message_id_with_a_different_payload_hash_is_permanent_conflict() -
     store = InMemoryRequestReceiptStore()
     consumer, sqs, _ = intake(RequestLane.CUSTOM, lambda *_: None, store=store)
     consumer.handle(delivery(custom_request()))
-    conflicting = delivery(custom_request(period_start="2023-01-01"), sequence=2)
+    conflicting = delivery(custom_request(period_start="2023-01-01"))
     original_id = custom_request()["metadata"]["messageId"]
     conflicting_doc = json.loads(conflicting["Body"])
     conflicting_doc["metadata"]["messageId"] = original_id
@@ -342,7 +397,7 @@ def test_same_message_id_with_a_different_payload_hash_is_permanent_conflict() -
     assert len(sqs.dead_letters) == 1
 
 
-def test_older_aggregate_sequence_is_acknowledged_stale_without_effect() -> None:
+def test_distinct_custom_runs_do_not_share_an_ordering_stream_just_because_the_bot_matches() -> None:
     handled: list[str] = []
     store = InMemoryRequestReceiptStore()
     consumer, sqs, _ = intake(
@@ -350,17 +405,17 @@ def test_older_aggregate_sequence_is_acknowledged_stale_without_effect() -> None
         lambda request, _: handled.append(request["requestHash"]),
         store=store,
     )
-    newer = delivery(custom_request(period_start="2024-01-01"), sequence=2)
-    older = delivery(
+    first = delivery(custom_request(period_start="2024-01-01"))
+    second = delivery(
         custom_request(period_start="2023-01-01", client_key="request-41"), sequence=1
     )
 
-    assert consumer.handle(newer).disposition is RequestIntakeDisposition.ACCEPTED
-    outcome = consumer.handle(older)
+    assert consumer.handle(first).disposition is RequestIntakeDisposition.ACCEPTED
+    outcome = consumer.handle(second)
 
-    assert outcome.disposition is RequestIntakeDisposition.STALE
-    assert len(handled) == 1
-    assert sqs.deleted == [newer["ReceiptHandle"], older["ReceiptHandle"]]
+    assert outcome.disposition is RequestIntakeDisposition.ACCEPTED
+    assert len(handled) == 2
+    assert sqs.deleted == [first["ReceiptHandle"], second["ReceiptHandle"]]
 
 
 def test_retryable_handler_failure_releases_claim_and_returns_to_same_queue() -> None:
