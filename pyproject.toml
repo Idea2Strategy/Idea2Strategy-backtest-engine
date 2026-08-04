@@ -47,6 +47,7 @@ dev = [
 [project.scripts]
 backtest-api = "backtest_engine.api:run"
 backtest-worker = "backtest_engine.worker:run"
+backtest-validate-deployment-artifacts = "backtest_engine.deployment_artifacts:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/backtest_engine"]

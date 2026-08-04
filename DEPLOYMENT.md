@@ -159,6 +159,30 @@ These examples describe shape, not approved values. Deployment must mount the
 reviewed, checksum-pinned documents. Missing or malformed policy data stops the
 process before it receives work.
 
+Validate the two approved files before uploading them:
+
+```text
+backtest-validate-deployment-artifacts \
+  --execution-policy execution-policy.json \
+  --runtime-policy runtime-policy.json
+```
+
+The command uses the same loaders as the API and worker, exits non-zero for an
+invalid document, and emits stable JSON containing lowercase SHA-256 values for
+the exact file bytes. Use those hashes with the version IDs returned after the
+files are uploaded to the deployment artifact bucket. The Terraform artifact
+map keys are `execution-policy` and `runtime-policy`; their runtime filenames
+are `execution-policy.json` and `runtime-policy.json`. Do not reformat a file
+after hashing or uploading it.
+
+There is no separate backtest warmup artifact. Required warmup coverage comes
+from the immutable compiled plan and is checked against the PostgreSQL dataset
+manifest; the referenced market-data objects are fetched from
+`BACKTEST_MARKET_DATA_BUCKET` and verified against each object's `content_hash`.
+`BACKTEST_MARKET_DATA_CACHE` is only a private writable cache. A deployment-side
+warmup manifest belongs to another runtime and must not be mounted as a backtest
+policy input.
+
 ## Fenced-attempt schema gate
 
 The central Flyway bundle now includes the expand/constrain pair
