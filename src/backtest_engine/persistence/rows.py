@@ -142,7 +142,7 @@ class RunRow:
 
     id: UUID
     bot_id: UUID
-    owner_account_id: UUID
+    owner_account_id: UUID | None
     configuration_hash: str
     status: RunStatus
     evaluation_start: date
@@ -170,6 +170,9 @@ class RunRow:
     #: sent them. The contract requires at least one entry alongside `reasonCode`, so
     #: an empty list is refused here rather than stored as "nothing was missing".
     missing_requirements: tuple[str, ...] | None = None
+    #: Set when retention execution removes the customer identifier from an
+    #: official competition run while preserving immutable result evidence.
+    owner_anonymized_at: datetime | None = None
 
     def __post_init__(self) -> None:
         validate_money(self.initial_cash_amount, "initial_cash_amount")

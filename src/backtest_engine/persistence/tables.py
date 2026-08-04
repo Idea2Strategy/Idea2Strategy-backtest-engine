@@ -125,7 +125,10 @@ runs = Table(
     # not declared as SQLAlchemy ForeignKeys because those tables are not in this
     # metadata and declaring them would pull foreign schemas into it.
     Column("bot_id", UUID(as_uuid=True), nullable=False),
-    Column("owner_account_id", UUID(as_uuid=True), nullable=False),
+    # Retention execution anonymizes historical competition owners after the
+    # account is purged. Active owner-scoped queries still require a UUID, but
+    # the persisted column must accept the canonical tombstone value (NULL).
+    Column("owner_account_id", UUID(as_uuid=True), nullable=True),
     Column("configuration_hash", VARCHAR(128), nullable=False),
     Column("status", _run_status(), nullable=False),
     Column("evaluation_start", Date, nullable=False),
@@ -157,6 +160,7 @@ runs = Table(
     # this column would reject every ordinary insert, and a reader would see the
     # string "null" where it expected absence.
     Column("missing_requirements", JSONB(none_as_null=True)),
+    Column("owner_anonymized_at", TIMESTAMP(timezone=True)),
     Index("ix_runs_bot_id_queued_at", "bot_id", "queued_at"),
     Index("ix_runs_status_queued_at", "status", "queued_at"),
     Index("ix_runs_owner_account_id_queued_at", "owner_account_id", "queued_at"),

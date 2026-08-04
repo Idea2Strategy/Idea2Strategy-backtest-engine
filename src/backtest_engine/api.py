@@ -170,7 +170,7 @@ def _run_payload(run: BacktestRun) -> dict[str, Any]:
     return {
         "backtestRunId": str(row.id),
         "botId": str(row.bot_id),
-        "ownerAccountId": str(row.owner_account_id),
+        "ownerAccountId": None if row.owner_account_id is None else str(row.owner_account_id),
         "status": row.status.value,
         "configurationHash": row.configuration_hash,
         "evaluationStart": row.evaluation_start.isoformat(),

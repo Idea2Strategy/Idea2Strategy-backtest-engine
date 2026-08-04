@@ -30,13 +30,9 @@ def test_vendored_copy_matches_its_recorded_digests() -> None:
 
 
 def test_vendored_bundle_is_ordered_by_flyway_version() -> None:
-    names = [path.name for path in migration_files()]
+    versions = [int(path.name.split("__", 1)[0].removeprefix("V")) for path in migration_files()]
 
-    assert names == [
-        "V1__initial_schema.sql.fixture",
-        "V20260801112341__backend_identity_email_auth.sql.fixture",
-        "V20260801153000__backend_bot_continuation_deadlines.sql.fixture",
-    ]
+    assert versions == sorted(set(versions))
 
 
 def test_vendored_copy_matches_the_central_bundle() -> None:
