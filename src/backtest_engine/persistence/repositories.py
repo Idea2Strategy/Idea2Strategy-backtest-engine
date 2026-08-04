@@ -274,9 +274,7 @@ class RunRepository(_Repository):
         """Serialize cancellation with claim and terminal publication using DB time."""
         if not reason_code.strip():
             raise ValueError("reason_code must not be blank")
-        current = self._connection.execute(
-            select(runs).where(runs.c.id == run_id).with_for_update()
-        ).mappings().first()
+        current = self._connection.execute(select(runs).where(runs.c.id == run_id).with_for_update()).mappings().first()
         if current is None:
             raise RowNotFound(f"backtest run not found: {run_id}")
         hydrated = _hydrate(RunRow, current)
@@ -295,9 +293,11 @@ class RunRepository(_Repository):
         }
         if hydrated.status is RunStatus.QUEUED:
             values.update(status=RunStatus.CANCELLED.value, cancelled_at=now, completed_at=now)
-        updated = self._connection.execute(
-            update(runs).where(runs.c.id == run_id).values(**values).returning(*runs.c)
-        ).mappings().one()
+        updated = (
+            self._connection.execute(update(runs).where(runs.c.id == run_id).values(**values).returning(*runs.c))
+            .mappings()
+            .one()
+        )
         return _hydrate(RunRow, updated)
 
     def _transition(self, run_id: UUID, target: RunStatus, **values: Any) -> RunRow:
@@ -337,30 +337,40 @@ class RunAttemptRepository(_Repository):
             raise ValueError("worker_id and execution_key must not be blank")
         if lease_duration <= timedelta(0):
             raise ValueError("lease_duration must be positive")
-        run = self._connection.execute(
-            select(runs.c.status, runs.c.cancellation_requested_at)
-            .where(runs.c.id == run_id)
-            .with_for_update()
-        ).mappings().first()
+        run = (
+            self._connection.execute(
+                select(runs.c.status, runs.c.cancellation_requested_at).where(runs.c.id == run_id).with_for_update()
+            )
+            .mappings()
+            .first()
+        )
         if run is None:
             raise RowNotFound(f"backtest run not found: {run_id}")
-        if run["status"] in {
-            RunStatus.COMPLETED.value,
-            RunStatus.FAILED.value,
-            RunStatus.CANCELLED.value,
-            RunStatus.UNAVAILABLE.value,
-        } or run["cancellation_requested_at"] is not None:
+        if (
+            run["status"]
+            in {
+                RunStatus.COMPLETED.value,
+                RunStatus.FAILED.value,
+                RunStatus.CANCELLED.value,
+                RunStatus.UNAVAILABLE.value,
+            }
+            or run["cancellation_requested_at"] is not None
+        ):
             return None
 
         now = self._connection.scalar(select(func.clock_timestamp()))
         assert isinstance(now, datetime)
-        latest = self._connection.execute(
-            select(run_attempts)
-            .where(run_attempts.c.run_id == run_id)
-            .order_by(run_attempts.c.attempt_number.desc())
-            .limit(1)
-            .with_for_update()
-        ).mappings().first()
+        latest = (
+            self._connection.execute(
+                select(run_attempts)
+                .where(run_attempts.c.run_id == run_id)
+                .order_by(run_attempts.c.attempt_number.desc())
+                .limit(1)
+                .with_for_update()
+            )
+            .mappings()
+            .first()
+        )
         previous_attempt_id: UUID | None = None
         next_number = 1
         if latest is not None:
@@ -395,25 +405,29 @@ class RunAttemptRepository(_Repository):
         attempt_key = f"{execution_key}:{next_number}"
         if len(attempt_key) > 160:
             raise ValueError("versioned worker execution key exceeds varchar(160)")
-        inserted = self._connection.execute(
-            pg_insert(run_attempts)
-            .values(
-                id=attempt_id,
-                run_id=run_id,
-                attempt_number=next_number,
-                worker_execution_key=attempt_key,
-                status=WorkStatus.RUNNING.value,
-                claim_token=claim_token,
-                worker_id=worker_id,
-                claimed_at=now,
-                claim_expires_at=now + lease_duration,
-                last_heartbeat_at=now,
-                previous_attempt_id=previous_attempt_id,
-                started_at=now,
+        inserted = (
+            self._connection.execute(
+                pg_insert(run_attempts)
+                .values(
+                    id=attempt_id,
+                    run_id=run_id,
+                    attempt_number=next_number,
+                    worker_execution_key=attempt_key,
+                    status=WorkStatus.RUNNING.value,
+                    claim_token=claim_token,
+                    worker_id=worker_id,
+                    claimed_at=now,
+                    claim_expires_at=now + lease_duration,
+                    last_heartbeat_at=now,
+                    previous_attempt_id=previous_attempt_id,
+                    started_at=now,
+                )
+                .on_conflict_do_nothing()
+                .returning(*run_attempts.c)
             )
-            .on_conflict_do_nothing()
-            .returning(*run_attempts.c)
-        ).mappings().first()
+            .mappings()
+            .first()
+        )
         if inserted is None:
             raise StaleAttemptClaim("attempt slot or execution key was claimed concurrently")
         changed = self._connection.execute(
@@ -425,24 +439,26 @@ class RunAttemptRepository(_Repository):
             raise StaleAttemptClaim("run claim affected an unexpected row count")
         return _hydrate(RunAttemptRow, inserted)
 
-    def heartbeat_fenced(
-        self, attempt_id: UUID, claim_token: UUID, *, lease_duration: timedelta
-    ) -> RunAttemptRow:
+    def heartbeat_fenced(self, attempt_id: UUID, claim_token: UUID, *, lease_duration: timedelta) -> RunAttemptRow:
         if lease_duration <= timedelta(0):
             raise ValueError("lease_duration must be positive")
         now = self._connection.scalar(select(func.clock_timestamp()))
         assert isinstance(now, datetime)
-        updated = self._connection.execute(
-            update(run_attempts)
-            .where(
-                run_attempts.c.id == attempt_id,
-                run_attempts.c.claim_token == claim_token,
-                run_attempts.c.status == WorkStatus.RUNNING.value,
-                run_attempts.c.claim_expires_at > now,
+        updated = (
+            self._connection.execute(
+                update(run_attempts)
+                .where(
+                    run_attempts.c.id == attempt_id,
+                    run_attempts.c.claim_token == claim_token,
+                    run_attempts.c.status == WorkStatus.RUNNING.value,
+                    run_attempts.c.claim_expires_at > now,
+                )
+                .values(last_heartbeat_at=now, claim_expires_at=now + lease_duration)
+                .returning(*run_attempts.c)
             )
-            .values(last_heartbeat_at=now, claim_expires_at=now + lease_duration)
-            .returning(*run_attempts.c)
-        ).mappings().first()
+            .mappings()
+            .first()
+        )
         if updated is None:
             raise StaleAttemptClaim("heartbeat matched no live attempt claim")
         return _hydrate(RunAttemptRow, updated)
@@ -465,11 +481,13 @@ class RunAttemptRepository(_Repository):
         failure_code: str | None = None,
     ) -> RunAttemptRow:
         """Close exactly one live delivery and make its non-terminal run retryable."""
-        attempt = self._connection.execute(
-            select(run_attempts.c.run_id)
-            .where(run_attempts.c.id == attempt_id)
-            .with_for_update()
-        ).mappings().first()
+        attempt = (
+            self._connection.execute(
+                select(run_attempts.c.run_id).where(run_attempts.c.id == attempt_id).with_for_update()
+            )
+            .mappings()
+            .first()
+        )
         if attempt is None:
             raise StaleAttemptClaim("release matched no attempt")
         run_id = attempt["run_id"]
@@ -503,18 +521,24 @@ class RunAttemptRepository(_Repository):
     ) -> RunAttemptRow:
         if status in (WorkStatus.PENDING, WorkStatus.RUNNING):
             raise ValueError("close_fenced requires a terminal status")
-        attempt = self._connection.execute(
-            select(run_attempts.c.run_id)
-            .where(run_attempts.c.id == attempt_id)
-            .with_for_update()
-        ).mappings().first()
+        attempt = (
+            self._connection.execute(
+                select(run_attempts.c.run_id).where(run_attempts.c.id == attempt_id).with_for_update()
+            )
+            .mappings()
+            .first()
+        )
         if attempt is None:
             raise StaleAttemptClaim("terminal mutation matched no attempt")
-        run = self._connection.execute(
-            select(runs.c.status, runs.c.cancellation_requested_at)
-            .where(runs.c.id == attempt["run_id"])
-            .with_for_update()
-        ).mappings().first()
+        run = (
+            self._connection.execute(
+                select(runs.c.status, runs.c.cancellation_requested_at)
+                .where(runs.c.id == attempt["run_id"])
+                .with_for_update()
+            )
+            .mappings()
+            .first()
+        )
         if run is None:
             raise RowNotFound(f"backtest run not found: {attempt['run_id']}")
         now = self._connection.scalar(select(func.clock_timestamp()))
@@ -528,22 +552,26 @@ class RunAttemptRepository(_Repository):
                 .where(runs.c.id == attempt["run_id"], runs.c.status == RunStatus.RUNNING.value)
                 .values(status=RunStatus.CANCELLED.value, cancelled_at=now, completed_at=now)
             )
-        updated = self._connection.execute(
-            update(run_attempts)
-            .where(
-                run_attempts.c.id == attempt_id,
-                run_attempts.c.claim_token == claim_token,
-                run_attempts.c.status == WorkStatus.RUNNING.value,
-                run_attempts.c.claim_expires_at > now,
+        updated = (
+            self._connection.execute(
+                update(run_attempts)
+                .where(
+                    run_attempts.c.id == attempt_id,
+                    run_attempts.c.claim_token == claim_token,
+                    run_attempts.c.status == WorkStatus.RUNNING.value,
+                    run_attempts.c.claim_expires_at > now,
+                )
+                .values(
+                    status=status.value,
+                    completed_at=now,
+                    terminal_reason_code=terminal_reason_code,
+                    failure_code=failure_code,
+                )
+                .returning(*run_attempts.c)
             )
-            .values(
-                status=status.value,
-                completed_at=now,
-                terminal_reason_code=terminal_reason_code,
-                failure_code=failure_code,
-            )
-            .returning(*run_attempts.c)
-        ).mappings().first()
+            .mappings()
+            .first()
+        )
         if updated is None:
             raise StaleAttemptClaim("terminal mutation matched no live attempt claim")
         return _hydrate(RunAttemptRow, updated)

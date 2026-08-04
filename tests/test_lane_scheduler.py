@@ -84,9 +84,7 @@ def test_lane_scheduler_enforces_two_one_one_and_leaves_excess_queued() -> None:
     workers = {
         BacktestLane.BASIC: BlockingLaneWorker(BacktestLane.BASIC, 3, release),
         BacktestLane.CUSTOM: BlockingLaneWorker(BacktestLane.CUSTOM, 2, release),
-        BacktestLane.COMPETITION: BlockingLaneWorker(
-            BacktestLane.COMPETITION, 2, release
-        ),
+        BacktestLane.COMPETITION: BlockingLaneWorker(BacktestLane.COMPETITION, 2, release),
     }
     scheduler = BacktestLaneScheduler(workers=workers)
 
@@ -124,9 +122,7 @@ def test_lane_environment_builds_three_queue_configs_with_two_one_one_limits() -
     configs, limits, global_limit = _lane_configs_from_env(environ)
 
     assert set(configs) == set(BacktestLane)
-    assert {
-        lane: config.max_messages for lane, config in configs.items()
-    } == dict.fromkeys(BacktestLane, 1)
+    assert {lane: config.max_messages for lane, config in configs.items()} == dict.fromkeys(BacktestLane, 1)
     assert limits == {
         BacktestLane.BASIC: 2,
         BacktestLane.CUSTOM: 1,
@@ -146,9 +142,7 @@ def test_lane_environment_rejects_partial_queue_configuration() -> None:
                     f"BACKTEST_{lane.value.upper()}_{suffix}": "https://sqs.local/queue"
                     for lane in BacktestLane
                     for suffix in ("QUEUE_URL", "DLQ_URL")
-                    if not (
-                        lane is BacktestLane.COMPETITION and suffix == "DLQ_URL"
-                    )
+                    if not (lane is BacktestLane.COMPETITION and suffix == "DLQ_URL")
                 },
             }
         )
@@ -159,9 +153,7 @@ def test_lane_scheduler_round_robins_nonempty_lanes_without_starvation() -> None
     workers = {
         BacktestLane.BASIC: BlockingLaneWorker(BacktestLane.BASIC, 20, release),
         BacktestLane.CUSTOM: BlockingLaneWorker(BacktestLane.CUSTOM, 1, release),
-        BacktestLane.COMPETITION: BlockingLaneWorker(
-            BacktestLane.COMPETITION, 1, release
-        ),
+        BacktestLane.COMPETITION: BlockingLaneWorker(BacktestLane.COMPETITION, 1, release),
     }
     scheduler = BacktestLaneScheduler(workers=workers)
 
@@ -185,7 +177,11 @@ class BlockingFinishStore(InMemoryExecutionKeyStore):
         self.allow_finish = threading.Event()
 
     def finish(
-        self, key: str, status: ExecutionRecordStatus, *, now: datetime,
+        self,
+        key: str,
+        status: ExecutionRecordStatus,
+        *,
+        now: datetime,
         claim=None,
     ) -> None:
         self.finish_started.set()
@@ -269,9 +265,7 @@ def test_scheduler_retry_releases_the_claim_and_returns_message_to_its_lane() ->
             max_messages=1,
             heartbeat_interval=timedelta(seconds=10),
         ),
-        handler=lambda job, context: JobOutcome(
-            JobResult.RETRY, reason_code="TRANSIENT_DEPENDENCY"
-        ),
+        handler=lambda job, context: JobOutcome(JobResult.RETRY, reason_code="TRANSIENT_DEPENDENCY"),
         store=store,
         clock=lambda: T0,
     )

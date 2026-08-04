@@ -278,10 +278,7 @@ def _apply_contributions(tables: dict[str, _DdlTable], sql: str) -> None:
         table = tables.get(key)
         if table is None:
             continue
-        columns = tuple(
-            token.strip().strip('"')
-            for token in index.group("cols").split(",")
-        )
+        columns = tuple(token.strip().strip('"') for token in index.group("cols").split(","))
         if index.group("unique"):
             table.uniques.add(columns)
         else:
@@ -475,9 +472,7 @@ def test_run_status_enum_uses_the_canonical_labels() -> None:
 
     assert status.name == "run_status"
     assert status.schema == "backtest"
-    assert tuple(status.enums) == (
-        "QUEUED", "RUNNING", "COMPLETED", "FAILED", "UNAVAILABLE", "CANCELLED"
-    )
+    assert tuple(status.enums) == ("QUEUED", "RUNNING", "COMPLETED", "FAILED", "UNAVAILABLE", "CANCELLED")
     assert "COMPLETE" not in status.enums
 
 

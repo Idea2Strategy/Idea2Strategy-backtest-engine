@@ -126,9 +126,7 @@ def test_heartbeat_extends_the_database_lease(persistence: BacktestPersistence) 
     original_expiry = claim.claim_expires_at
 
     with persistence.unit_of_work() as uow:
-        extended = uow.attempts.heartbeat_fenced(
-            claim.id, claim.claim_token, lease_duration=timedelta(minutes=2)
-        )
+        extended = uow.attempts.heartbeat_fenced(claim.id, claim.claim_token, lease_duration=timedelta(minutes=2))
 
     assert original_expiry is not None
     assert extended.claim_expires_at is not None

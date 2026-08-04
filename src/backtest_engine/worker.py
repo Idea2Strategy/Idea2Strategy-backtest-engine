@@ -158,18 +158,25 @@ class ExecutionKeyStore(Protocol):
     """
 
     def claim(
-        self, key: str, *, run_id: str, owner: str, now: datetime,
+        self,
+        key: str,
+        *,
+        run_id: str,
+        owner: str,
+        now: datetime,
         lease_duration: timedelta | None = None,
     ) -> ExecutionClaim: ...
 
-    def heartbeat(
-        self, key: str, claim: ExecutionClaim, *, lease_duration: timedelta
-    ) -> None: ...
+    def heartbeat(self, key: str, claim: ExecutionClaim, *, lease_duration: timedelta) -> None: ...
 
     def release(self, key: str, *, now: datetime, claim: ExecutionClaim | None = None) -> None: ...
 
     def finish(
-        self, key: str, status: ExecutionRecordStatus, *, now: datetime,
+        self,
+        key: str,
+        status: ExecutionRecordStatus,
+        *,
+        now: datetime,
         claim: ExecutionClaim | None = None,
     ) -> None: ...
 
@@ -197,7 +204,12 @@ class InMemoryExecutionKeyStore:
         self._lock = threading.Lock()
 
     def claim(
-        self, key: str, *, run_id: str, owner: str, now: datetime,
+        self,
+        key: str,
+        *,
+        run_id: str,
+        owner: str,
+        now: datetime,
         lease_duration: timedelta | None = None,
     ) -> ExecutionClaim:
         with self._lock:
@@ -227,7 +239,11 @@ class InMemoryExecutionKeyStore:
                 self._released_attempts[key] = record.attempt_number
 
     def finish(
-        self, key: str, status: ExecutionRecordStatus, *, now: datetime,
+        self,
+        key: str,
+        status: ExecutionRecordStatus,
+        *,
+        now: datetime,
         claim: ExecutionClaim | None = None,
     ) -> None:
         if status is ExecutionRecordStatus.IN_PROGRESS:
@@ -313,13 +329,9 @@ class WorkerConfig:
         if self.max_receive_count < 1:
             raise WorkerConfigurationError("max_receive_count must be at least 1")
         if not 1 <= self.max_messages <= _MAX_BATCH:
-            raise WorkerConfigurationError(
-                f"max_messages must be between 1 and {_MAX_BATCH}"
-            )
+            raise WorkerConfigurationError(f"max_messages must be between 1 and {_MAX_BATCH}")
         if not timedelta(0) <= self.wait_time <= _MAX_WAIT:
-            raise WorkerConfigurationError(
-                "wait_time must be between 0 and 20 seconds (the SQS long-poll cap)"
-            )
+            raise WorkerConfigurationError("wait_time must be between 0 and 20 seconds (the SQS long-poll cap)")
         if self.visibility_timeout <= timedelta(0):
             raise WorkerConfigurationError("visibility_timeout must be positive")
         if self.heartbeat_interval <= timedelta(0):
@@ -417,16 +429,12 @@ class BacktestWorker:
     def _handle(self, message: Mapping[str, Any]) -> HandledMessage:
         message_id = str(message.get("MessageId", ""))
         receipt = str(message["ReceiptHandle"])
-        receive_count = int(
-            message.get("Attributes", {}).get("ApproximateReceiveCount", "1")
-        )
+        receive_count = int(message.get("Attributes", {}).get("ApproximateReceiveCount", "1"))
 
         if receive_count > self._config.max_receive_count:
             # Explicit routing, not a redrive policy: the reason travels with
             # the message so the DLQ is triageable.
-            return self._dead_letter(
-                message, receipt, "MAX_RECEIVE_COUNT_EXCEEDED", message_id, None
-            )
+            return self._dead_letter(message, receipt, "MAX_RECEIVE_COUNT_EXCEEDED", message_id, None)
 
         try:
             job = json.loads(str(message.get("Body", "")))
@@ -436,12 +444,13 @@ class BacktestWorker:
             idempotency_key = str(job["idempotencyKey"])
             key = worker_execution_key_for(run_id, idempotency_key)
         except Exception:
-            return self._dead_letter(
-                message, receipt, "MESSAGE_NOT_PARSEABLE", message_id, None
-            )
+            return self._dead_letter(message, receipt, "MESSAGE_NOT_PARSEABLE", message_id, None)
 
         claim = self._store.claim(
-            key, run_id=run_id, owner=self._config.worker_id, now=self._clock(),
+            key,
+            run_id=run_id,
+            owner=self._config.worker_id,
+            now=self._clock(),
             lease_duration=self._config.visibility_timeout,
         )
         if not claim.acquired:
@@ -466,31 +475,27 @@ class BacktestWorker:
             # make the message immediately visible again.
             self._store.release(key, now=self._clock(), claim=claim)
             self._return_to_queue(receipt)
-            return HandledMessage(
-                message_id, MessageDisposition.RETURNED, outcome.reason_code, key
-            )
+            return HandledMessage(message_id, MessageDisposition.RETURNED, outcome.reason_code, key)
 
         self._store.finish(key, ExecutionRecordStatus.FAILED, now=self._clock(), claim=claim)
-        return self._dead_letter(
-            message, receipt, outcome.reason_code or "PERMANENT_FAILURE", message_id, key
-        )
+        return self._dead_letter(message, receipt, outcome.reason_code or "PERMANENT_FAILURE", message_id, key)
 
     def _invoke(
-        self, job: Mapping[str, Any], context: JobContext, receipt: str,
-        key: str, claim: ExecutionClaim,
+        self,
+        job: Mapping[str, Any],
+        context: JobContext,
+        receipt: str,
+        key: str,
+        claim: ExecutionClaim,
     ) -> JobOutcome:
         """Run the handler with a visibility heartbeat alongside it."""
         done = threading.Event()
-        beat = threading.Thread(
-            target=self._beat, args=(receipt, done, key, claim), daemon=True, name="bt4-heartbeat"
-        )
+        beat = threading.Thread(target=self._beat, args=(receipt, done, key, claim), daemon=True, name="bt4-heartbeat")
         beat.start()
         try:
             return self._handler(job, context)
         except Exception as exc:
-            return JobOutcome(
-                JobResult.RETRY, reason_code=f"HANDLER_ERROR:{type(exc).__name__}"
-            )
+            return JobOutcome(JobResult.RETRY, reason_code=f"HANDLER_ERROR:{type(exc).__name__}")
         finally:
             done.set()
             beat.join(timeout=self._config.visibility_timeout.total_seconds())
@@ -531,21 +536,15 @@ class BacktestWorker:
                 key,
             )
         if claim.existing_status is ExecutionRecordStatus.FAILED:
-            return self._dead_letter(
-                message, receipt, "DUPLICATE_ALREADY_FAILED", message_id, key
-            )
+            return self._dead_letter(message, receipt, "DUPLICATE_ALREADY_FAILED", message_id, key)
         # Another worker holds the key. Leave the message for the queue to
         # redeliver after its visibility timeout, without resetting it to 0.
-        return HandledMessage(
-            message_id, MessageDisposition.RETURNED, "EXECUTION_KEY_HELD", key
-        )
+        return HandledMessage(message_id, MessageDisposition.RETURNED, "EXECUTION_KEY_HELD", key)
 
     # -- queue effects ----------------------------------------------------
 
     def _delete(self, receipt: str) -> None:
-        self._client.delete_message(
-            QueueUrl=self._config.queue_url, ReceiptHandle=receipt
-        )
+        self._client.delete_message(QueueUrl=self._config.queue_url, ReceiptHandle=receipt)
 
     def _return_to_queue(self, receipt: str) -> None:
         self._client.change_message_visibility(
@@ -579,9 +578,7 @@ class BacktestWorker:
             MessageAttributes=attributes,
         )
         self._delete(receipt)
-        return HandledMessage(
-            message_id, MessageDisposition.DEAD_LETTERED, reason_code, key
-        )
+        return HandledMessage(message_id, MessageDisposition.DEAD_LETTERED, reason_code, key)
 
 
 class LaneWorker(Protocol):
@@ -627,15 +624,11 @@ class BacktestLaneScheduler:
         if idle_wait_seconds <= 0:
             raise WorkerConfigurationError("idle_wait_seconds must be positive")
         if set(workers) != set(limits):
-            raise WorkerConfigurationError(
-                "lane workers and lane limits must name the same lanes"
-            )
+            raise WorkerConfigurationError("lane workers and lane limits must name the same lanes")
         if any(limit < 1 for limit in limits.values()):
             raise WorkerConfigurationError("every lane limit must be at least 1")
         if global_limit > sum(limits.values()):
-            raise WorkerConfigurationError(
-                "global_limit cannot exceed the sum of lane limits"
-            )
+            raise WorkerConfigurationError("global_limit cannot exceed the sum of lane limits")
 
         self._workers = dict(workers)
         self._limits = limits
@@ -645,9 +638,7 @@ class BacktestLaneScheduler:
         self._cursor = 0
         self._active_by_lane = dict.fromkeys(self._lanes, 0)
         self._futures: dict[Future[HandledMessage], BacktestLane] = {}
-        self._executor = ThreadPoolExecutor(
-            max_workers=global_limit, thread_name_prefix="backtest-lane"
-        )
+        self._executor = ThreadPoolExecutor(max_workers=global_limit, thread_name_prefix="backtest-lane")
         self._stop = threading.Event()
         self._receive_order: list[BacktestLane] = []
 
@@ -679,9 +670,7 @@ class BacktestLaneScheduler:
                 continue
             self._receive_order.append(lane)
             self._active_by_lane[lane] += 1
-            future = self._executor.submit(
-                self._workers[lane].handle_message, message
-            )
+            future = self._executor.submit(self._workers[lane].handle_message, message)
             self._futures[future] = lane
         return tuple(completed)
 
@@ -710,9 +699,7 @@ class BacktestLaneScheduler:
             self.wait_for_idle()
             self._executor.shutdown(wait=True)
 
-    def _next_eligible_lane(
-        self, empty_lanes: set[BacktestLane]
-    ) -> BacktestLane | None:
+    def _next_eligible_lane(self, empty_lanes: set[BacktestLane]) -> BacktestLane | None:
         for offset in range(len(self._lanes)):
             index = (self._cursor + offset) % len(self._lanes)
             lane = self._lanes[index]
@@ -758,22 +745,16 @@ _LANE_LIMIT_DEFAULTS: Mapping[BacktestLane, int] = {
 def _config_from_env(environ: Mapping[str, str]) -> WorkerConfig:
     missing = [name for name in _REQUIRED_ENV if not environ.get(name)]
     if missing:
-        raise WorkerConfigurationError(
-            "missing required environment settings: " + ", ".join(sorted(missing))
-        )
+        raise WorkerConfigurationError("missing required environment settings: " + ", ".join(sorted(missing)))
     return WorkerConfig(
         queue_url=environ["BACKTEST_QUEUE_URL"],
         dead_letter_queue_url=environ["BACKTEST_DLQ_URL"],
         worker_id=environ["BACKTEST_WORKER_ID"],
         max_receive_count=int(environ.get("BACKTEST_MAX_RECEIVE_COUNT", "5")),
-        visibility_timeout=timedelta(
-            seconds=int(environ.get("BACKTEST_VISIBILITY_TIMEOUT_SECONDS", "300"))
-        ),
+        visibility_timeout=timedelta(seconds=int(environ.get("BACKTEST_VISIBILITY_TIMEOUT_SECONDS", "300"))),
         wait_time=timedelta(seconds=int(environ.get("BACKTEST_WAIT_SECONDS", "20"))),
         max_messages=int(environ.get("BACKTEST_MAX_MESSAGES", "1")),
-        heartbeat_interval=timedelta(
-            seconds=int(environ.get("BACKTEST_HEARTBEAT_SECONDS", "60"))
-        ),
+        heartbeat_interval=timedelta(seconds=int(environ.get("BACKTEST_HEARTBEAT_SECONDS", "60"))),
     )
 
 
@@ -791,10 +772,7 @@ def _lane_configs_from_env(
         required.extend((f"{prefix}_QUEUE_URL", f"{prefix}_DLQ_URL"))
     missing = [name for name in required if not environ.get(name)]
     if missing:
-        raise WorkerConfigurationError(
-            "missing required lane environment settings: "
-            + ", ".join(sorted(missing))
-        )
+        raise WorkerConfigurationError("missing required lane environment settings: " + ", ".join(sorted(missing)))
 
     configs: dict[BacktestLane, WorkerConfig] = {}
     limits: dict[BacktestLane, int] = {}
@@ -805,22 +783,14 @@ def _lane_configs_from_env(
             dead_letter_queue_url=environ[f"{prefix}_DLQ_URL"],
             worker_id=environ["BACKTEST_WORKER_ID"],
             max_receive_count=int(environ.get("BACKTEST_MAX_RECEIVE_COUNT", "5")),
-            visibility_timeout=timedelta(
-                seconds=int(
-                    environ.get("BACKTEST_VISIBILITY_TIMEOUT_SECONDS", "300")
-                )
-            ),
+            visibility_timeout=timedelta(seconds=int(environ.get("BACKTEST_VISIBILITY_TIMEOUT_SECONDS", "300"))),
             # The scheduler polls lanes without blocking and admits one message
             # per reserved slot. These values retain a valid standalone config.
             wait_time=timedelta(0),
             max_messages=1,
-            heartbeat_interval=timedelta(
-                seconds=int(environ.get("BACKTEST_HEARTBEAT_SECONDS", "60"))
-            ),
+            heartbeat_interval=timedelta(seconds=int(environ.get("BACKTEST_HEARTBEAT_SECONDS", "60"))),
         )
-        limits[lane] = int(
-            environ.get(f"{prefix}_MAX_CONCURRENCY", str(default_limit))
-        )
+        limits[lane] = int(environ.get(f"{prefix}_MAX_CONCURRENCY", str(default_limit)))
     global_limit = int(environ.get("BACKTEST_MAX_TOTAL_CONCURRENCY", "4"))
     # Reuse the scheduler's validation so environment errors fail before the
     # process starts receiving messages. Avoid constructing an executor here.
@@ -829,9 +799,7 @@ def _lane_configs_from_env(
     if any(limit < 1 for limit in limits.values()):
         raise WorkerConfigurationError("every lane limit must be at least 1")
     if global_limit > sum(limits.values()):
-        raise WorkerConfigurationError(
-            "global_limit cannot exceed the sum of lane limits"
-        )
+        raise WorkerConfigurationError("global_limit cannot exceed the sum of lane limits")
     return configs, limits, global_limit
 
 
@@ -858,24 +826,17 @@ def load_factory(target: str, setting: str) -> Any:
 
 
 def run() -> None:
-    lane_mode = any(
-        os.environ.get(f"BACKTEST_{lane.value.upper()}_QUEUE_URL")
-        for lane in BacktestLane
-    )
+    lane_mode = any(os.environ.get(f"BACKTEST_{lane.value.upper()}_QUEUE_URL") for lane in BacktestLane)
     if lane_mode:
         configs, lane_limits, global_limit = _lane_configs_from_env(os.environ)
     else:
         config = _config_from_env(os.environ)
-    handler: JobHandler = load_factory(
-        os.environ["BACKTEST_JOB_HANDLER"], "BACKTEST_JOB_HANDLER"
-    )
+    handler: JobHandler = load_factory(os.environ["BACKTEST_JOB_HANDLER"], "BACKTEST_JOB_HANDLER")
     # No in-memory fallback. `InMemoryExecutionKeyStore` is a process-local dictionary;
     # a deployment that got it by leaving one variable unset would silently lose the
     # cross-process duplicate-worker control this whole module exists to provide, and
     # two workers would execute the same message twice.
-    store: ExecutionKeyStore = load_factory(
-        os.environ["BACKTEST_EXECUTION_KEY_STORE"], "BACKTEST_EXECUTION_KEY_STORE"
-    )
+    store: ExecutionKeyStore = load_factory(os.environ["BACKTEST_EXECUTION_KEY_STORE"], "BACKTEST_EXECUTION_KEY_STORE")
 
     import boto3
 
@@ -894,9 +855,7 @@ def run() -> None:
             workers=workers,
             lane_limits=lane_limits,
             global_limit=global_limit,
-            idle_wait_seconds=float(
-                os.environ.get("BACKTEST_SCHEDULER_IDLE_SECONDS", "5")
-            ),
+            idle_wait_seconds=float(os.environ.get("BACKTEST_SCHEDULER_IDLE_SECONDS", "5")),
         )
         signal.signal(signal.SIGINT, scheduler.request_stop)
         signal.signal(signal.SIGTERM, scheduler.request_stop)
