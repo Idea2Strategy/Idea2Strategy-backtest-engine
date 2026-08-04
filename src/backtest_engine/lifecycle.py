@@ -254,7 +254,7 @@ class BacktestRun:
         return self.run.status
 
     @property
-    def owner_account_id(self) -> UUID:
+    def owner_account_id(self) -> UUID | None:
         return self.run.owner_account_id
 
     @property
@@ -938,6 +938,8 @@ class BacktestLifecycleService:
         **detail: Any,
     ) -> dict[str, Any]:
         """Build the `backtest.v1` event this service would publish for `run`."""
+        if run.owner_account_id is None:
+            raise ValueError("an anonymized run cannot publish a new result event")
         return build_backtest_result_event(
             status=status,
             backtest_run_id=str(run.backtest_run_id),
