@@ -225,7 +225,7 @@ _ADDED_COLUMN_CLAUSE = re.compile(
 
 _ALTER_COLUMN_NULLABILITY = re.compile(
     r'ALTER COLUMN\s+"?(?P<name>[a-z0-9_]+)"?\s+'
-    r'(?P<operation>DROP|SET)\s+NOT NULL',
+    r"(?P<operation>DROP|SET)\s+NOT NULL",
     re.I,
 )
 
