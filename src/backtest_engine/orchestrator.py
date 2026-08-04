@@ -35,7 +35,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -93,6 +93,7 @@ __all__ = [
     "ResultPublicationError",
     "ResultPublisher",
     "SessionCalendar",
+    "bar_events_from_batches",
     "bar_events_from_table",
     "observations_from_events",
     "replay_digest",
@@ -158,6 +159,10 @@ class ReplayStatus(StrEnum):
 
 class MarketDataReader(Protocol):
     """Satisfied by :class:`backtest_engine.market_data.ParquetMarketDataReader`."""
+
+    def iter_batches(
+        self, manifest: Mapping[str, Any], policy: ExecutionPolicy
+    ) -> Iterable[Any]: ...
 
     def read(self, manifest: Mapping[str, Any], policy: ExecutionPolicy) -> Any: ...
 
@@ -384,6 +389,22 @@ def bar_events_from_table(
     resolution: str,
     publication_lag: timedelta = timedelta(0),
 ) -> tuple[MarketDataEvent, ...]:
+    """Compatibility adapter for already-materialized Arrow tables."""
+    return bar_events_from_batches(
+        table.to_batches(),
+        data_kind=data_kind,
+        resolution=resolution,
+        publication_lag=publication_lag,
+    )
+
+
+def bar_events_from_batches(
+    batches: Iterable[Any],
+    *,
+    data_kind: str,
+    resolution: str,
+    publication_lag: timedelta = timedelta(0),
+) -> tuple[MarketDataEvent, ...]:
     """Turn verified Parquet rows into the clock's event stream.
 
     ``occurred_at`` is the bar's **close**, matching BT-a's
@@ -400,36 +421,39 @@ def bar_events_from_table(
         raise OrchestratorError("publication_lag must not be negative")
     period = resolution_period(resolution)
     events: list[MarketDataEvent] = []
-    for index, row in enumerate(table.to_pylist(), start=1):
-        starts_at: datetime = row["bar_start_at"]
-        ends_at = starts_at + period
-        instrument_id = str(row["instrument_id"])
-        events.append(
-            MarketDataEvent(
-                event_id=f"BAR:{instrument_id}:{starts_at.isoformat()}",
-                instrument_id=instrument_id,
-                occurred_at=ends_at,
-                available_at=ends_at + publication_lag,
-                source_sequence=index,
-                event_type=BAR_CLOSED_EVENT_TYPE,
-                payload={
-                    "dataKind": data_kind,
-                    "resolution": resolution,
-                    "bar": SeriesBar(
-                        instrument_id=instrument_id,
-                        resolution=resolution,
-                        starts_at=starts_at,
-                        ends_at=ends_at,
-                        close=Decimal(str(row["close"])),
-                        volume=Decimal(str(row["volume"])),
-                    ),
-                    "providerSymbol": row["provider_symbol"],
-                    "open": Decimal(str(row["open"])),
-                    "high": Decimal(str(row["high"])),
-                    "low": Decimal(str(row["low"])),
-                },
+    source_sequence = 0
+    for batch in batches:
+        for row in batch.to_pylist():
+            source_sequence += 1
+            starts_at: datetime = row["bar_start_at"]
+            ends_at = starts_at + period
+            instrument_id = str(row["instrument_id"])
+            events.append(
+                MarketDataEvent(
+                    event_id=f"BAR:{instrument_id}:{starts_at.isoformat()}",
+                    instrument_id=instrument_id,
+                    occurred_at=ends_at,
+                    available_at=ends_at + publication_lag,
+                    source_sequence=source_sequence,
+                    event_type=BAR_CLOSED_EVENT_TYPE,
+                    payload={
+                        "dataKind": data_kind,
+                        "resolution": resolution,
+                        "bar": SeriesBar(
+                            instrument_id=instrument_id,
+                            resolution=resolution,
+                            starts_at=starts_at,
+                            ends_at=ends_at,
+                            close=Decimal(str(row["close"])),
+                            volume=Decimal(str(row["volume"])),
+                        ),
+                        "providerSymbol": row["provider_symbol"],
+                        "open": Decimal(str(row["open"])),
+                        "high": Decimal(str(row["high"])),
+                        "low": Decimal(str(row["low"])),
+                    },
+                )
             )
-        )
     if not events:
         raise OrchestratorError("the pinned dataset contains no bars")
     return tuple(events)
@@ -571,19 +595,17 @@ class BacktestOrchestrator:
         monitor: ResourceMonitor,
     ) -> ReplayOutcome:
         try:
-            table = self._reader.read(job.manifest, job.execution_policy)
+            events = bar_events_from_batches(
+                self._reader.iter_batches(job.manifest, job.execution_policy),
+                data_kind=job.data_kind,
+                resolution=job.resolution,
+                publication_lag=self._publication_lag,
+            )
         except MarketDataValidationError:
             return self._abort(
                 job, coordinator, lease, "INPUT_DATASET_UNREADABLE",
                 retryable=False, status=ReplayStatus.FAILED,
             )
-
-        events = bar_events_from_table(
-            table,
-            data_kind=job.data_kind,
-            resolution=job.resolution,
-            publication_lag=self._publication_lag,
-        )
         assessment = self._assessor.assess(
             job.requirements,
             observations_from_events(job.requirements, events, job.bar_interval),

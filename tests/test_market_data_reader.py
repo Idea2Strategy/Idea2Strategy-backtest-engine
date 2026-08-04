@@ -87,6 +87,32 @@ def test_reader_loads_verified_manifest_objects_in_event_order(tmp_path: Path) -
     ]
 
 
+def test_reader_streams_hashing_and_parquet_batches_without_whole_file_helpers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = write_small_market_bars(tmp_path / "market-bars.parquet")
+    manifest = _manifest_for(fixture.path)
+
+    def whole_file_read_is_forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("whole-file Parquet reads are forbidden")
+
+    monkeypatch.setattr(Path, "read_bytes", whole_file_read_is_forbidden)
+    monkeypatch.setattr(pq, "read_table", whole_file_read_is_forbidden)
+
+    batches = list(
+        ParquetMarketDataReader(tmp_path, batch_size=1).iter_batches(
+            manifest,
+            D17_EXECUTION_POLICY_FIXTURE,
+        )
+    )
+
+    assert [batch.num_rows for batch in batches] == [1, 1]
+    assert [row["provider_symbol"] for batch in batches for row in batch.to_pylist()] == [
+        "AAPL",
+        "AAPL",
+    ]
+
+
 def test_reader_rejects_object_bytes_that_do_not_match_manifest(tmp_path: Path) -> None:
     fixture = write_small_market_bars(tmp_path / "market-bars.parquet")
     manifest = _manifest_for(fixture.path)
