@@ -280,6 +280,8 @@ class JobContext:
     receive_count: int
     message_id: str
     worker_id: str
+    attempt_id: str | None = None
+    claim_token: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,6 +464,8 @@ class BacktestWorker:
             receive_count=receive_count,
             message_id=message_id,
             worker_id=self._config.worker_id,
+            attempt_id=claim.attempt_id,
+            claim_token=claim.claim_token,
         )
         outcome = self._invoke(job, context, receipt, key, claim)
 

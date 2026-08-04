@@ -62,6 +62,8 @@ class RunPublication:
     monthly: tuple[MonthlyJudgment, ...] = ()
     detail_manifests: tuple[DetailManifestRow, ...] = ()
     worker_execution_key: str | None = None
+    attempt_id: UUID | None = None
+    claim_token: UUID | None = None
     require_objects_available: bool = True
 
     def __post_init__(self) -> None:
@@ -82,6 +84,8 @@ class RunPublication:
                 "run result_hash and performance summary result_hash disagree: "
                 f"{self.result_hash} != {self.performance.result_hash}"
             )
+        if (self.attempt_id is None) != (self.claim_token is None):
+            raise PublishConflict("attempt_id and claim_token must be supplied together")
 
 
 def publish_completed_run(uow: BacktestUnitOfWork, publication: RunPublication) -> RunRow:
@@ -104,7 +108,14 @@ def publish_completed_run(uow: BacktestUnitOfWork, publication: RunPublication) 
     for manifest in publication.detail_manifests:
         uow.manifests.insert(manifest)
 
-    if publication.worker_execution_key is not None:
+    if publication.attempt_id is not None and publication.claim_token is not None:
+        uow.attempts.close_fenced(
+            publication.attempt_id,
+            publication.claim_token,
+            status=WorkStatus.SUCCEEDED,
+            terminal_reason_code=WorkStatus.SUCCEEDED.value,
+        )
+    elif publication.worker_execution_key is not None:
         uow.attempts.complete(
             publication.worker_execution_key,
             status=WorkStatus.SUCCEEDED,

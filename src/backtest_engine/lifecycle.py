@@ -32,6 +32,7 @@ in `tests/persistence/`.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import threading
 from collections.abc import Iterator, Mapping, Sequence
@@ -60,6 +61,7 @@ from .persistence.rows import (
     PerformanceSummaryRow,
     RunAttemptRow,
     RunInputPinRow,
+    RunLane,
     RunRow,
     RunStatus,
 )
@@ -100,6 +102,31 @@ __all__ = [
 #: `uuid5` namespace for deriving a run id from B's idempotency key. Fixed forever:
 #: changing it would re-address every existing run.
 RUN_ID_NAMESPACE = uuid5(NAMESPACE_URL, "https://contracts.idea2strategy.io/backtest/v1/run")
+
+
+def _postgres_jsonb_payload_hash(document: Mapping[str, Any]) -> str:
+    """Hash a JSON document in PostgreSQL ``jsonb::text`` canonical form.
+
+    The Backend stores this digest on both the run and its Outbox envelope.  JSONB
+    orders object keys by UTF-8 byte length and then byte value, and emits a space
+    after separators.  Reproducing that representation here keeps the legacy
+    consumer-owned insert path byte-compatible with the producer-owned transaction.
+    """
+
+    def ordered(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            keys = sorted(value, key=lambda key: (len(str(key).encode("utf-8")), str(key).encode("utf-8")))
+            return {str(key): ordered(value[key]) for key in keys}
+        if isinstance(value, list):
+            return [ordered(item) for item in value]
+        return value
+
+    canonical = json.dumps(
+        ordered(document),
+        ensure_ascii=False,
+        separators=(", ", ": "),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -393,9 +420,7 @@ class PersistenceRunGateway:
         """
 
         if pins.run_id != row.id:
-            raise IdempotencyConflict(
-                f"pinned inputs belong to run {pins.run_id}, not {row.id}"
-            )
+            raise IdempotencyConflict(f"pinned inputs belong to run {pins.run_id}, not {row.id}")
         try:
             with self._write() as uow:
                 accepted, created = uow.runs.accept(row)
@@ -549,11 +574,7 @@ class InMemoryRunGateway:
 
     def attempts_for_runs(self, run_ids: Sequence[UUID]) -> Mapping[UUID, tuple[RunAttemptRow, ...]]:
         with self._lock:
-            return {
-                run_id: tuple(self._attempts[run_id])
-                for run_id in run_ids
-                if self._attempts.get(run_id)
-            }
+            return {run_id: tuple(self._attempts[run_id]) for run_id in run_ids if self._attempts.get(run_id)}
 
     def record_attempt(self, row: RunAttemptRow) -> None:
         """Test seam for arranging attempt history; production writes go through BT-d."""
@@ -690,8 +711,7 @@ class BacktestLifecycleService:
 
         if missing or policy is None:
             raise RequestNotSatisfiable(
-                "the request cannot be turned into a run because required inputs are "
-                f"unresolved: {missing}",
+                f"the request cannot be turned into a run because required inputs are unresolved: {missing}",
                 reason_code="REQUIRED_INPUT_UNAVAILABLE",
                 missing=missing,
             )
@@ -711,7 +731,20 @@ class BacktestLifecycleService:
         }
         configuration_hash = compute_input_bundle_fingerprint(bundle)
         idempotency_key = request["metadata"]["idempotencyKey"]
-        run_id = run_id_for(idempotency_key)
+        registered_run_id = request.get("runId")
+        run_id = UUID(str(registered_run_id)) if registered_run_id is not None else run_id_for(idempotency_key)
+
+        lane = request.get("lane", RunLane.BASIC.value)
+        if lane != RunLane.BASIC.value:
+            raise ContractValidationError(f"official_backtest_request.lane must be {RunLane.BASIC.value}")
+        aggregate_sequence = request.get("aggregateSequence", 1)
+        if aggregate_sequence != 1:
+            raise ContractValidationError("official_backtest_request.aggregateSequence must be 1")
+        requested_policy = request.get("executionPolicyVersion", policy.version)
+        if requested_policy != policy.version:
+            raise ContractValidationError(
+                "official_backtest_request.executionPolicyVersion does not match the policy selected for occurredAt"
+            )
 
         row = RunRow(
             id=run_id,
@@ -730,6 +763,12 @@ class BacktestLifecycleService:
             buying_power_buffer_policy_id=UUID(policy.buying_power_buffer_policy_id),
             idempotency_key=idempotency_key,
             queued_at=occurred_at,
+            lane=RunLane.BASIC,
+            message_id=UUID(request["metadata"]["messageId"]),
+            canonical_payload_hash=_postgres_jsonb_payload_hash(request),
+            aggregate_sequence=aggregate_sequence,
+            execution_policy_version=policy.version,
+            idempotency_scope=str(bot_id),
         )
         # The four values that go into `configuration_hash` and cannot come back out of
         # it, plus the dataset pair, so `GET /{run_id}/inputs` can answer before a
@@ -801,9 +840,7 @@ class BacktestLifecycleService:
 
     def _require_owner(self, run: BacktestRun, owner_account_id: UUID) -> None:
         if run.owner_account_id != owner_account_id:
-            raise NotRunOwner(
-                f"backtest run {run.backtest_run_id} belongs to another account"
-            )
+            raise NotRunOwner(f"backtest run {run.backtest_run_id} belongs to another account")
 
     def _load(self, row: RunRow) -> BacktestRun:
         return BacktestRun(run=row, attempts=self.gateway.attempts(row.id))
@@ -839,9 +876,7 @@ class BacktestLifecycleService:
             seen = self._applied_events.get(key)
             if seen is not None:
                 if seen != payload:
-                    raise IdempotencyConflict(
-                        f"result idempotency key {key} was already applied to different content"
-                    )
+                    raise IdempotencyConflict(f"result idempotency key {key} was already applied to different content")
                 return ResultIngestion(run=self._load(self.gateway.get(run_id)), applied=False)
 
             current = self._load(self.gateway.get(run_id))
@@ -878,9 +913,7 @@ class BacktestLifecycleService:
         if status is RunStatus.QUEUED:
             return self.gateway.get(run_id)
         if status is RunStatus.RUNNING:
-            return self.gateway.transition(
-                run_id, RunStatus.RUNNING, started_at=_parse_timestamp(event["startedAt"])
-            )
+            return self.gateway.transition(run_id, RunStatus.RUNNING, started_at=_parse_timestamp(event["startedAt"]))
         if status is RunStatus.COMPLETED:
             return self.gateway.transition(
                 run_id,
@@ -910,9 +943,7 @@ class BacktestLifecycleService:
         if delivery_attempt >= self.max_delivery_attempts:
             self._dead_letter(event, reason, _TRANSIENT_FAILURE_KIND, delivery_attempt)
 
-    def _dead_letter(
-        self, event: Mapping[str, Any], reason: str, failure_kind: str, delivery_attempt: int
-    ) -> None:
+    def _dead_letter(self, event: Mapping[str, Any], reason: str, failure_kind: str, delivery_attempt: int) -> None:
         if self.dead_letters is None:
             return
         self.dead_letters.dead_letter(

@@ -6,6 +6,7 @@ an in-process lock could not make them pass.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import uuid4
@@ -47,7 +48,7 @@ def test_duplicate_idempotency_key_returns_the_existing_run(
 ) -> None:
     first = make_run(idempotency_key="BOT_CREATE:same")
     # A redelivery generates a fresh run id but the same material request.
-    redelivery = make_run(run_id=uuid4(), idempotency_key="BOT_CREATE:same")
+    redelivery = replace(first, id=uuid4())
 
     with persistence.unit_of_work() as uow:
         stored, created = uow.runs.accept(first)
@@ -60,6 +61,17 @@ def test_duplicate_idempotency_key_returns_the_existing_run(
     assert again == stored
     assert again.id == first.id
     assert _count(persistence, "backtest.runs") == 1
+
+
+def test_run_acceptance_fails_closed_without_an_explicit_lane_envelope(
+    persistence: BacktestPersistence,
+) -> None:
+    incomplete = replace(make_run(idempotency_key="BOT_CREATE:missing-lane"), lane=None)
+
+    with persistence.unit_of_work() as uow, pytest.raises(ValueError, match="explicit lane envelope"):
+        uow.runs.accept(incomplete)
+
+    assert _count(persistence, "backtest.runs") == 0
 
 
 def test_same_idempotency_key_with_a_different_request_is_a_conflict(

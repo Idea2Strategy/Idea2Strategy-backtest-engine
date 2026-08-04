@@ -750,6 +750,8 @@ class JobBinding:
 
     envelope: JobEnvelope
     worker_execution_key: str
+    attempt_id: uuid.UUID | None
+    claim_token: uuid.UUID | None
     manifest: Mapping[str, Any]
     policy: ExecutionPolicy
     plan: BasicCompiledPlan
@@ -964,6 +966,8 @@ class DurableResultPublisher:
                     monthly=tuple(_monthly_judgment(binding.run_id, summary) for summary in monthly),
                     detail_manifests=tuple(manifest_rows),
                     worker_execution_key=binding.worker_execution_key,
+                    attempt_id=binding.attempt_id,
+                    claim_token=binding.claim_token,
                 ),
             )
 
@@ -1328,6 +1332,8 @@ class OrchestratorJobHandler:
         return JobBinding(
             envelope=envelope,
             worker_execution_key=context.worker_execution_key,
+            attempt_id=(uuid.UUID(context.attempt_id) if context.attempt_id is not None else None),
+            claim_token=(uuid.UUID(context.claim_token) if context.claim_token is not None else None),
             manifest=manifest,
             policy=policy,
             plan=plan,

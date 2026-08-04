@@ -50,6 +50,7 @@ from .rows import (
     PerformanceSummaryRow,
     RunAttemptRow,
     RunInputPinRow,
+    RunLane,
     RunRow,
     RunStatus,
     StorageObjectRow,
@@ -86,7 +87,7 @@ __all__ = [
 
 
 _ENUM_FIELDS: dict[type, dict[str, type]] = {
-    RunRow: {"status": RunStatus},
+    RunRow: {"status": RunStatus, "lane": RunLane},
     RunAttemptRow: {"status": WorkStatus},
     StorageObjectRow: {"status": ObjectStatus},
 }
@@ -105,6 +106,21 @@ _RUN_IDENTITY_FIELDS = (
     "fee_policy_id",
     "slippage_rate_bps",
     "buying_power_buffer_policy_id",
+    "lane",
+    "message_id",
+    "canonical_payload_hash",
+    "aggregate_sequence",
+    "execution_policy_version",
+    "idempotency_scope",
+)
+
+_RUN_REQUIRED_ENVELOPE_FIELDS = (
+    "lane",
+    "message_id",
+    "canonical_payload_hash",
+    "aggregate_sequence",
+    "execution_policy_version",
+    "idempotency_scope",
 )
 
 
@@ -147,6 +163,10 @@ class RunRepository(_Repository):
         the same material inputs is not an error — it is the at-least-once delivery the
         queue guarantees. A *different* request under the same key is a conflict.
         """
+
+        missing = [field for field in _RUN_REQUIRED_ENVELOPE_FIELDS if getattr(row, field) is None]
+        if missing:
+            raise ValueError(f"run acceptance requires an explicit lane envelope; missing fields: {missing}")
 
         statement = pg_insert(runs).values(**row_to_params(row)).on_conflict_do_nothing().returning(*runs.c)
         inserted = _first(self._connection.execute(statement).all())
@@ -582,6 +602,12 @@ class RunAttemptRepository(_Repository):
             .first()
         )
         if updated is None:
+            existing = self._fetch_one(
+                select(run_attempts).where(run_attempts.c.id == attempt_id),
+                RunAttemptRow,
+            )
+            if existing is not None and existing.claim_token == claim_token and existing.status is status:
+                return existing
             raise StaleAttemptClaim("terminal mutation matched no live attempt claim")
         return _hydrate(RunAttemptRow, updated)
 
