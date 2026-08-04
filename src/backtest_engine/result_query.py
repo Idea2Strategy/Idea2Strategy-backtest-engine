@@ -74,7 +74,7 @@ authors no result-side schema, which matters while governance is fail-closed.
 
 The one piece of storage this card did add is `backtest.run_input_pins`, and it is an
 *input* row, not a projection: `compiled_plan_checksum`, `strategy_snapshot_hash`,
-`input_bundle_hash`, `feature_materialization_version` and `execution_policy_version`
+`input_bundle_fingerprint`, `feature_materialization_version` and `execution_policy_version`
 are explicit request pins and cannot be recovered from the independent bot launch
 `runs.configuration_hash`. They are written in
 the acceptance transaction, so `GET /{run_id}/inputs` answers at every status.
@@ -646,7 +646,7 @@ class DurableBacktestResultQueryStore:
                     strategy_snapshot_hash=pin.strategy_snapshot_hash,
                     dataset_manifest_id=str(pin.dataset_manifest_id),
                     dataset_hash=pin.dataset_hash,
-                    input_bundle_fingerprint=pin.input_bundle_hash,
+                    input_bundle_fingerprint=pin.input_bundle_fingerprint,
                     feature_materialization_version=pin.feature_materialization_version,
                     execution_policy_version=pin.execution_policy_version,
                     precision_rules_version=row.precision_rules_version,
@@ -907,9 +907,9 @@ class DurableBacktestResultQueryStore:
                 raise QueryIntegrityError(
                     f"monthly summary {summary.summary_id} names another result manifest"
                 )
-        if result.run_snapshot.input_bundle_fingerprint != pin.input_bundle_hash.removeprefix("sha256:"):
+        if result.run_snapshot.input_bundle_fingerprint != pin.input_bundle_fingerprint.removeprefix("sha256:"):
             raise QueryIntegrityError(
-                f"run {row.id} pinned {pin.input_bundle_hash} but the stored evidence was "
+                f"run {row.id} pinned {pin.input_bundle_fingerprint} but the stored evidence was "
                 f"produced from sha256:{result.run_snapshot.input_bundle_fingerprint}"
             )
         self._check_locked_dataset(uow, row, pin)

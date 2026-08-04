@@ -263,7 +263,7 @@ class PostgresQueuedRunSource:
         statement = text(
             """
             SELECT r.id, r.lane::text, r.message_id, r.bot_id, r.owner_account_id,
-                   p.input_bundle_hash, p.compiled_plan_checksum,
+                   p.input_bundle_fingerprint, p.compiled_plan_checksum,
                    p.strategy_snapshot_hash, p.dataset_manifest_id, p.dataset_hash,
                    p.feature_materialization_version, r.aggregate_sequence,
                    r.evaluation_start, r.evaluation_end, r.execution_policy_version
@@ -283,7 +283,7 @@ class PostgresQueuedRunSource:
                 message_id=uuid.UUID(str(row["message_id"])),
                 bot_id=uuid.UUID(str(row["bot_id"])),
                 owner_account_id=uuid.UUID(str(row["owner_account_id"])),
-                input_bundle_hash=str(row["input_bundle_hash"]),
+                input_bundle_fingerprint=str(row["input_bundle_fingerprint"]),
                 compiled_plan_checksum=str(row["compiled_plan_checksum"]),
                 strategy_snapshot_hash=str(row["strategy_snapshot_hash"]),
                 dataset_manifest_id=uuid.UUID(str(row["dataset_manifest_id"])),

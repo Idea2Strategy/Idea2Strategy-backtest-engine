@@ -20,7 +20,7 @@ class QueuedRunProjection:
     message_id: uuid.UUID
     bot_id: uuid.UUID
     owner_account_id: uuid.UUID
-    input_bundle_hash: str
+    input_bundle_fingerprint: str
     compiled_plan_checksum: str
     strategy_snapshot_hash: str
     dataset_manifest_id: uuid.UUID
@@ -159,7 +159,7 @@ class BacktestRequestJobPublisher:
             "botId": str(run.bot_id),
             "ownerAccountId": str(run.owner_account_id),
             "idempotencyKey": str(request["metadata"]["idempotencyKey"]),
-            "inputBundleFingerprint": _prefixed(run.input_bundle_hash),
+            "inputBundleFingerprint": _prefixed(run.input_bundle_fingerprint),
             "executionPolicyVersion": run.execution_policy_version,
             "compiledPlanChecksum": str(request["compiledPlanChecksum"]),
             "datasetManifestId": str(dataset_id),

@@ -777,7 +777,7 @@ class BacktestLifecycleService:
         # B's fingerprint material, not to the column.
         pins = RunInputPinRow(
             run_id=run_id,
-            input_bundle_hash=configuration_hash,
+            input_bundle_fingerprint=configuration_hash,
             compiled_plan_checksum=checksum,
             strategy_snapshot_hash=request["expectedSnapshotHash"],
             dataset_manifest_id=manifest_id,

@@ -82,7 +82,7 @@ creating or repairing them.
 ## Runtime activation rule
 
 The provider now pre-creates `backtest.runs` and `backtest.run_input_pins`.
-Dispatch reads `run_input_pins.input_bundle_hash`; it never substitutes
+Dispatch reads `run_input_pins.input_bundle_fingerprint`; it never substitutes
 `runs.configuration_hash`, which remains the bot launch configuration hash.
 Competition jobs preserve `evaluationPeriodId`, `inputSetHash`, all dataset pins
 and all feature materialization pins. The worker re-resolves every dataset and
