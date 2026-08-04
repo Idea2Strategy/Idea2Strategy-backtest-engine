@@ -210,6 +210,20 @@ def test_builds_parquet_objects_partitioned_by_et_monday_week_and_record_type() 
     assert {item.descriptor.week.start_date.weekday() for item in bundle.objects} == {0}
 
 
+def test_detail_builder_writes_parts_through_parquet_writer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def whole_table_writer_is_forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("detail parts must use ParquetWriter")
+
+    monkeypatch.setattr(pq, "write_table", whole_table_writer_is_forbidden)
+
+    bundle = _bundle(DetailObjectBuilder(max_rows_per_part=1))
+
+    assert bundle.objects
+    assert all(item.parquet_bytes[:4] == b"PAR1" for item in bundle.objects)
+
+
 @pytest.mark.parametrize(
     ("instant", "expected_week"),
     [

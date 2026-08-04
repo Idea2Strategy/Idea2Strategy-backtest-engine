@@ -111,6 +111,7 @@ COMPRESSION_CODEC = UNCOMPRESSED_CODEC
 
 #: Rows per Parquet part. A week that exceeds this is split into `part=0001`, `0002`, …
 DEFAULT_MAX_ROWS_PER_PART = 100_000
+_PARQUET_WRITE_BATCH_ROWS = 8_192
 
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 ZERO = Decimal("0")
@@ -656,21 +657,25 @@ class DetailObjectBuilder:
             b"source_set_hash": source_set_hash.encode(),
         }
         schema = _schema(record_type).with_metadata(metadata)
-        table = pa.Table.from_pylist(rows, schema=schema)
         sink = pa.BufferOutputStream()
-        pq.write_table(
-            table,
+        writer = pq.ParquetWriter(
             sink,
-            # Canonical: `storage.objects.compression_codec` and the detail_manifests
-            # note both mandate explicit UNCOMPRESSED. The previous "zstd" made every
-            # object unreadable to a reader that trusts the canonical model.
+            schema,
             compression="none",
             use_dictionary=False,
             write_statistics=True,
             version="2.6",
             data_page_version="2.0",
-            row_group_size=max(1, len(rows)),
         )
+        try:
+            for offset in range(0, len(rows), _PARQUET_WRITE_BATCH_ROWS):
+                batch_rows = rows[offset : offset + _PARQUET_WRITE_BATCH_ROWS]
+                writer.write_batch(
+                    pa.RecordBatch.from_pylist(batch_rows, schema=schema),
+                    row_group_size=len(batch_rows),
+                )
+        finally:
+            writer.close()
         parquet_bytes = sink.getvalue().to_pybytes()
         content_hash = _sha256(parquet_bytes)
         storage_object_id = _object_id(
