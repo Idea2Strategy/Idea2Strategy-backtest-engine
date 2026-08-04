@@ -6,6 +6,7 @@ import json
 import uuid
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -176,15 +177,29 @@ def competition_request() -> dict[str, Any]:
     }
 
 
+def basic_request() -> dict[str, Any]:
+    request = json.loads(
+        Path("tests/fixtures/contracts/strategy-bot/v1/official-backtest-request.valid.json")
+        .read_text(encoding="utf-8")
+    )
+    request["runId"] = "00000000-0000-4000-8000-000000000214"
+    request["lane"] = "BASIC"
+    request["aggregateSequence"] = 1
+    request["executionPolicyVersion"] = "backtest-policy-v1"
+    return request
+
+
 def delivery(document: Mapping[str, Any], *, sequence: int = 1) -> dict[str, Any]:
     body = json.dumps(document, sort_keys=True, separators=(",", ":"))
     metadata = document["metadata"]
     event_type = str(metadata["messageType"])
-    aggregate_id = document["runId"]
+    aggregate_id = document["botId"] if event_type == "OFFICIAL_BACKTEST_REQUESTED" else document["runId"]
     attributes = {
         "eventType": event_type,
-        "contractVersion": "backtest-request.v1",
-        "ownerDomain": "backtest-request",
+        "contractVersion": str(metadata["contractVersion"]),
+        "ownerDomain": (
+            "strategy-bot" if event_type == "OFFICIAL_BACKTEST_REQUESTED" else "backtest-request"
+        ),
         "aggregateId": str(aggregate_id),
         "aggregateSequence": str(sequence),
         "messageId": str(metadata["messageId"]),
@@ -262,7 +277,11 @@ def intake(
 
 @pytest.mark.parametrize(
     ("lane", "factory"),
-    ((RequestLane.CUSTOM, custom_request), (RequestLane.COMPETITION, competition_request)),
+    (
+        (RequestLane.BASIC, basic_request),
+        (RequestLane.CUSTOM, custom_request),
+        (RequestLane.COMPETITION, competition_request),
+    ),
 )
 def test_accepts_exact_backend_payload_and_routes_only_to_its_lane(
     lane: RequestLane, factory: Any
@@ -277,7 +296,7 @@ def test_accepts_exact_backend_payload_and_routes_only_to_its_lane(
 
     assert outcome.disposition is RequestIntakeDisposition.ACCEPTED
     assert [item[0] for item in handled] == [lane]
-    assert handled[0][1]["metadata"]["messageType"] == f"{lane.value}_BACKTEST_REQUESTED"
+    assert handled[0][1]["metadata"]["messageType"] == lane.event_type
     assert sqs.deleted == [message["ReceiptHandle"]]
     assert sqs.dead_letters == []
     assert receipts.completed_message_ids == {uuid.UUID(factory()["metadata"]["messageId"])}

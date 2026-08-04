@@ -20,11 +20,15 @@
         {"properties": {"messageType": {"const": "OFFICIAL_BACKTEST_REQUESTED"}}}
       ]
     },
+    "runId": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/uuid"},
+    "lane": {"const": "BASIC"},
+    "aggregateSequence": {"const": 1},
     "botId": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/uuid"},
     "expectedSnapshotHash": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/sha256Prefixed"},
     "compiledPlanChecksum": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/sha256Prefixed"},
     "datasetManifestId": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/uuid"},
     "assumptionsVersion": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/nonEmptyString"},
+    "executionPolicyVersion": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/nonEmptyString"},
     "requestReason": {"const": "STRATEGY_RELEASE"}
   }
 }

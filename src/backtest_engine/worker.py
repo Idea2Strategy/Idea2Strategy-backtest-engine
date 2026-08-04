@@ -839,7 +839,7 @@ def _request_configs_from_env(environ: Mapping[str, str]) -> dict[Any, Any]:
         or len(request_all_urls) != len(RequestLane) * 2
     ):
         raise WorkerConfigurationError(
-            "request intake requires distinct Custom and Competition source and DLQ queues"
+            "request intake requires distinct Basic, Custom and Competition source and DLQ queues"
         )
     if execution_urls & request_all_urls:
         raise WorkerConfigurationError(
@@ -911,7 +911,7 @@ def run() -> None:
     request_threads: list[threading.Thread] = []
     request_mode = any(
         os.environ.get(f"BACKTEST_{lane}_REQUEST_QUEUE_URL")
-        for lane in ("CUSTOM", "COMPETITION")
+        for lane in ("BASIC", "CUSTOM", "COMPETITION")
     )
     if request_mode:
         from .backtest_request_intake import BacktestRequestIntake

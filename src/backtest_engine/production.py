@@ -228,6 +228,31 @@ class PostgresDatasetManifestSource:
         }
 
 
+class PostgresFeatureMaterializationSource:
+    """Resolve a locked feature result and its immutable output manifest evidence."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def by_id(self, materialization_id: uuid.UUID) -> Mapping[str, Any] | None:
+        statement = text(
+            """
+            SELECT f.id, f.status::text, f.result_hash, f.output_dataset_manifest_id,
+                   d.status::text AS output_dataset_status,
+                   d.dataset_hash AS output_dataset_hash
+              FROM market_data.feature_materializations f
+              LEFT JOIN market_data.dataset_manifests d
+                ON d.id = f.output_dataset_manifest_id
+             WHERE f.id = :materialization_id
+            """
+        )
+        with self._engine.connect() as connection:
+            row = connection.execute(
+                statement, {"materialization_id": materialization_id}
+            ).mappings().first()
+        return None if row is None else dict(row)
+
+
 class PostgresQueuedRunSource:
     """Read the provider-created run that authorizes request-to-job conversion."""
 
@@ -237,11 +262,14 @@ class PostgresQueuedRunSource:
     def by_id(self, run_id: uuid.UUID) -> QueuedRunProjection | None:
         statement = text(
             """
-            SELECT id, lane::text, message_id, bot_id, owner_account_id,
-                   configuration_hash, aggregate_sequence, evaluation_start,
-                   evaluation_end, execution_policy_version
-              FROM backtest.runs
-             WHERE id = :run_id
+            SELECT r.id, r.lane::text, r.message_id, r.bot_id, r.owner_account_id,
+                   p.input_bundle_hash, p.compiled_plan_checksum,
+                   p.strategy_snapshot_hash, p.dataset_manifest_id, p.dataset_hash,
+                   p.feature_materialization_version, r.aggregate_sequence,
+                   r.evaluation_start, r.evaluation_end, r.execution_policy_version
+              FROM backtest.runs r
+              JOIN backtest.run_input_pins p ON p.run_id = r.id
+             WHERE r.id = :run_id
             """
         )
         with self._engine.connect() as connection:
@@ -255,7 +283,12 @@ class PostgresQueuedRunSource:
                 message_id=uuid.UUID(str(row["message_id"])),
                 bot_id=uuid.UUID(str(row["bot_id"])),
                 owner_account_id=uuid.UUID(str(row["owner_account_id"])),
-                configuration_hash=str(row["configuration_hash"]),
+                input_bundle_hash=str(row["input_bundle_hash"]),
+                compiled_plan_checksum=str(row["compiled_plan_checksum"]),
+                strategy_snapshot_hash=str(row["strategy_snapshot_hash"]),
+                dataset_manifest_id=uuid.UUID(str(row["dataset_manifest_id"])),
+                dataset_hash=str(row["dataset_hash"]),
+                feature_materialization_version=str(row["feature_materialization_version"]),
                 aggregate_sequence=int(row["aggregate_sequence"]),
                 evaluation_start=row["evaluation_start"],
                 evaluation_end=row["evaluation_end"],
@@ -648,6 +681,7 @@ def backtest_request_handler(
         SqsExecutionJobQueue(
             client,
             {
+                RequestLane.BASIC: _required(environ, "BACKTEST_BASIC_QUEUE_URL"),
                 RequestLane.CUSTOM: _required(environ, "BACKTEST_CUSTOM_QUEUE_URL"),
                 RequestLane.COMPETITION: _required(
                     environ, "BACKTEST_COMPETITION_QUEUE_URL"
@@ -685,6 +719,7 @@ def orchestrator_job_handler(
         policies=execution_policy_catalog(environ),
         plans=PostgresCompiledPlanSource(engine),
         manifests=PostgresDatasetManifestSource(engine),
+        feature_materializations=PostgresFeatureMaterializationSource(engine),
         reader=_market_reader(environ),
         calendar=XNYS_CALENDAR,
         object_store=s3_object_store(environ),

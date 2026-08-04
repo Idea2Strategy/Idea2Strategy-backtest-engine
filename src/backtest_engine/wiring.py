@@ -138,6 +138,7 @@ from .persistence import (
     FailureConditionCountRow,
     InputBundleRow,
     InputDatasetRow,
+    InputFeatureMaterializationRow,
     MonthlyJudgment,
     MonthlyJudgmentSummaryRow,
     ObjectStatus,
@@ -249,6 +250,14 @@ def _utc_text(value: datetime) -> str:
 
 def _prefixed(digest: str) -> str:
     return digest if digest.startswith("sha256:") else f"sha256:{digest}"
+
+
+def _pinned_hash(value: Any) -> str:
+    digest = _prefixed(str(value))
+    payload = digest.removeprefix("sha256:")
+    if len(payload) != 64 or any(character not in "0123456789abcdef" for character in payload):
+        raise ValueError("pinned hashes must use sha256:<64 lowercase hex>")
+    return digest
 
 
 def _floor_to_quantum(value: Decimal, quantum: Decimal) -> Decimal:
@@ -704,6 +713,51 @@ def _execution_status(status: WorkStatus) -> ExecutionRecordStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class DatasetPin:
+    manifest_id: uuid.UUID
+    purpose_code: str
+    expected_hash: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureMaterializationPin:
+    materialization_id: uuid.UUID
+    locked_result_hash: str
+
+
+def verify_feature_materialization_pins(
+    pins: Sequence[FeatureMaterializationPin], source: Any | None
+) -> None:
+    """Verify every immutable feature output, then fail closed until consumption is defined."""
+
+    if not pins:
+        return
+    if source is None:
+        raise JobNotSatisfiable(
+            "feature materialization verification is unavailable",
+            reason_code="REQUIRED_INPUT_UNAVAILABLE",
+        )
+    for pin in pins:
+        feature = source.by_id(pin.materialization_id)
+        if (
+            feature is None
+            or feature.get("status") != "SUCCEEDED"
+            or _prefixed(str(feature.get("result_hash", ""))) != pin.locked_result_hash
+            or feature.get("output_dataset_manifest_id") is None
+            or feature.get("output_dataset_status") != "AVAILABLE"
+            or not feature.get("output_dataset_hash")
+        ):
+            raise JobNotSatisfiable(
+                f"feature materialization {pin.materialization_id} is missing or changed",
+                reason_code="REQUIRED_INPUT_UNAVAILABLE",
+            )
+    raise JobNotSatisfiable(
+        "locked feature outputs cannot yet be bound to compiled-plan inputs without canonical semantics",
+        reason_code="FEATURE_OUTPUT_CONSUMPTION_UNSUPPORTED",
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class JobEnvelope:
     """What the queue message itself asserts, before anything is resolved.
 
@@ -723,25 +777,82 @@ class JobEnvelope:
     dataset_manifest_id: uuid.UUID
     expected_dataset_hash: str | None
     expected_snapshot_hash: str
+    datasets: tuple[DatasetPin, ...]
+    feature_materializations: tuple[FeatureMaterializationPin, ...]
+    feature_materialization_version: str
+    evaluation_period_id: uuid.UUID | None
+    input_set_hash: str | None
 
     @classmethod
     def parse(cls, job: Mapping[str, Any]) -> JobEnvelope:
         try:
+            raw_datasets = job.get("datasets") or (
+                {
+                    "datasetManifestId": job["datasetManifestId"],
+                    "purposeCode": "MARKET_BARS",
+                    "expectedDatasetHash": job.get("expectedDatasetHash"),
+                },
+            )
+            datasets = tuple(
+                DatasetPin(
+                    manifest_id=uuid.UUID(str(item["datasetManifestId"])),
+                    purpose_code=str(item["purposeCode"]),
+                    expected_hash=(
+                        _pinned_hash(item["expectedDatasetHash"])
+                        if item.get("expectedDatasetHash") is not None
+                        else None
+                    ),
+                )
+                for item in raw_datasets
+            )
+            features = tuple(
+                FeatureMaterializationPin(
+                    materialization_id=uuid.UUID(str(item["featureMaterializationId"])),
+                    locked_result_hash=_pinned_hash(item["lockedResultHash"]),
+                )
+                for item in job.get("featureMaterializations", ())
+            )
+            if not datasets:
+                raise ValueError("datasets must not be empty")
+            representative_id = uuid.UUID(str(job["datasetManifestId"]))
+            representative_hash = (
+                _pinned_hash(job["expectedDatasetHash"])
+                if job.get("expectedDatasetHash") is not None
+                else None
+            )
+            representatives = [pin for pin in datasets if pin.manifest_id == representative_id]
+            if len(representatives) != 1 or representatives[0].expected_hash != representative_hash:
+                raise ValueError("representative dataset must match exactly one dataset pin")
             return cls(
                 run_id=uuid.UUID(str(job["backtestRunId"])),
                 bot_id=uuid.UUID(str(job["botId"])),
                 owner_account_id=uuid.UUID(str(job["ownerAccountId"])),
                 idempotency_key=str(job["idempotencyKey"]),
-                input_bundle_fingerprint=str(job["inputBundleFingerprint"]),
+                input_bundle_fingerprint=_pinned_hash(job["inputBundleFingerprint"]),
                 execution_policy_version=str(job["executionPolicyVersion"]),
-                compiled_plan_checksum=str(job["compiledPlanChecksum"]),
-                dataset_manifest_id=uuid.UUID(str(job["datasetManifestId"])),
+                compiled_plan_checksum=_pinned_hash(job["compiledPlanChecksum"]),
+                dataset_manifest_id=representative_id,
                 expected_dataset_hash=(
-                    str(job["expectedDatasetHash"])
+                    representative_hash
                     if job.get("expectedDatasetHash") is not None
                     else None
                 ),
-                expected_snapshot_hash=str(job["expectedSnapshotHash"]),
+                expected_snapshot_hash=_pinned_hash(job["expectedSnapshotHash"]),
+                datasets=datasets,
+                feature_materializations=features,
+                feature_materialization_version=str(
+                    job.get("featureMaterializationVersion", "legacy-unspecified")
+                ),
+                evaluation_period_id=(
+                    uuid.UUID(str(job["evaluationPeriodId"]))
+                    if job.get("evaluationPeriodId") is not None
+                    else None
+                ),
+                input_set_hash=(
+                    _pinned_hash(job["inputSetHash"])
+                    if job.get("inputSetHash") is not None
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise JobNotSatisfiable(
@@ -764,6 +875,7 @@ class JobBinding:
     run_snapshot: RunSnapshot
     job: BacktestJob
     correlation_id: str
+    manifests: tuple[tuple[DatasetPin, Mapping[str, Any]], ...]
 
     @property
     def run_id(self) -> uuid.UUID:
@@ -944,13 +1056,22 @@ class DurableResultPublisher:
                     as_of_at=binding.policy.period_end,
                     locked_at=completed_at,
                 ),
-                datasets=(
+                datasets=tuple(
                     InputDatasetRow(
                         input_bundle_id=bundle_id,
-                        dataset_manifest_id=binding.dataset_manifest_id,
-                        purpose_code="MARKET_INPUT",
-                        locked_dataset_hash=str(binding.manifest["dataset_hash"]),
-                    ),
+                        dataset_manifest_id=pin.manifest_id,
+                        purpose_code=pin.purpose_code,
+                        locked_dataset_hash=str(manifest["dataset_hash"]),
+                    )
+                    for pin, manifest in binding.manifests
+                ),
+                features=tuple(
+                    InputFeatureMaterializationRow(
+                        input_bundle_id=bundle_id,
+                        feature_materialization_id=pin.materialization_id,
+                        locked_result_hash=pin.locked_result_hash,
+                    )
+                    for pin in binding.envelope.feature_materializations
                 ),
             )
             publish_completed_run(
@@ -1160,6 +1281,7 @@ class OrchestratorJobHandler:
         policies: ExecutionPolicyCatalog,
         plans: Any,
         manifests: Any,
+        feature_materializations: Any | None = None,
         reader: Any,
         calendar: SessionCalendar,
         object_store: ObjectStore,
@@ -1185,6 +1307,7 @@ class OrchestratorJobHandler:
         self._policies = policies
         self._plans = plans
         self._manifests = manifests
+        self._feature_materializations = feature_materializations
         self._reader = reader
         self._calendar = calendar
         self._store = object_store
@@ -1289,21 +1412,28 @@ class OrchestratorJobHandler:
                 f"compiled plan {plan_checksum} is not resolvable",
                 reason_code="REQUIRED_INPUT_UNAVAILABLE",
             )
-        manifest = self._manifests.by_id(envelope.dataset_manifest_id)
-        if manifest is None:
+        resolved_manifests: list[tuple[DatasetPin, Mapping[str, Any]]] = []
+        for pin in envelope.datasets:
+            resolved = self._manifests.by_id(pin.manifest_id)
+            if resolved is None or (
+                pin.expected_hash is not None
+                and _prefixed(str(resolved["dataset_hash"])) != pin.expected_hash
+            ):
+                raise JobNotSatisfiable(
+                    f"dataset manifest {pin.manifest_id} is missing or changed",
+                    reason_code="REQUIRED_INPUT_UNAVAILABLE",
+                )
+            resolved_manifests.append((pin, resolved))
+        primary = [item for item in resolved_manifests if item[0].manifest_id == envelope.dataset_manifest_id]
+        if len(primary) != 1:
             raise JobNotSatisfiable(
-                f"dataset manifest {envelope.dataset_manifest_id} is not resolvable",
+                "the representative dataset is not pinned exactly once",
                 reason_code="REQUIRED_INPUT_UNAVAILABLE",
             )
-        if (
-            envelope.expected_dataset_hash is not None
-            and _prefixed(str(manifest["dataset_hash"]))
-            != envelope.expected_dataset_hash
-        ):
-            raise JobNotSatisfiable(
-                f"dataset manifest {envelope.dataset_manifest_id} changed from its requested hash",
-                reason_code="REQUIRED_INPUT_UNAVAILABLE",
-            )
+        manifest = primary[0][1]
+        verify_feature_materialization_pins(
+            envelope.feature_materializations, self._feature_materializations
+        )
 
         plan = self._runtime.load(plan_document, compiled_plan_checksum=plan_checksum)
         evaluation_from, evaluation_through = evaluation_window(manifest, plan)
@@ -1355,6 +1485,7 @@ class OrchestratorJobHandler:
             run_snapshot=run_snapshot,
             job=backtest_job,
             correlation_id=self._correlation_id,
+            manifests=tuple(resolved_manifests),
         )
 
     # -- reporting ---------------------------------------------------------

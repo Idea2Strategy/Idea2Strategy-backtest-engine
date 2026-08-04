@@ -53,6 +53,7 @@ MONEY_SCALE = 8
 #: `pinned_at`: two acceptances of the same request pin the same inputs, but they do
 #: not happen at the same instant.
 RUN_INPUT_PIN_IDENTITY_FIELDS: tuple[str, ...] = (
+    "input_bundle_hash",
     "compiled_plan_checksum",
     "strategy_snapshot_hash",
     "dataset_manifest_id",
@@ -243,12 +244,12 @@ class RunAttemptRow:
 class RunInputPinRow:
     """`backtest.run_input_pins`. The request's pinned identifiers, written at accept.
 
-    Every field is required. `runs.configuration_hash` is a digest *over* these values,
-    so a blank one here would mean the fingerprint covers an empty string and the
-    reproducibility boundary the API reports would be a fiction.
+    Every field is required. `input_bundle_hash` is the execution input fingerprint;
+    `runs.configuration_hash` independently remains the bot launch configuration hash.
     """
 
     run_id: UUID
+    input_bundle_hash: str
     compiled_plan_checksum: str
     strategy_snapshot_hash: str
     dataset_manifest_id: UUID
@@ -259,6 +260,7 @@ class RunInputPinRow:
 
     def __post_init__(self) -> None:
         for name in (
+            "input_bundle_hash",
             "compiled_plan_checksum",
             "strategy_snapshot_hash",
             "dataset_hash",

@@ -1,6 +1,7 @@
 # Backtest request consumer boundary
 
-`backtest-request.v1` is carried by the backend transactional Outbox. The SQS
+`strategy-bot.v1` Basic requests and `backtest-request.v1` Custom/Competition
+requests are carried by the backend transactional Outbox. The SQS
 body is the Outbox JSONB rendering and these string message attributes are
 required: `eventType`, `contractVersion`, `ownerDomain`, `aggregateId`,
 `aggregateSequence`, `messageId`, `idempotencyKey`, `outboxIdempotencyKey`, and
@@ -8,18 +9,16 @@ required: `eventType`, `contractVersion`, `ownerDomain`, `aggregateId`,
 bytes. The consumer rejects a missing or mismatched attribute before invoking a
 handler.
 
-Custom and Competition use separate main queues and DLQs. A request delivered to
+Basic, Custom and Competition use separate main queues and DLQs. A request delivered to
 the other lane is permanent poison. The consumer receipt identity is
 `(consumer_handler_id, messageId)`; the same ID and hash is a duplicate, the same
 ID with another hash is a permanent conflict, and a lower sequence for the same
 aggregate is acknowledged as stale without applying an effect.
 
-## Producer additions required before relay enablement
+## Producer fields implemented for relay enablement
 
-The backend #199 payload is sufficient to validate its current request hash, but
-not to construct every immutable execution input required by the approved root
-contract. Keep both routes disabled until the following producer additions and
-consumer handler are integrated.
+The provider payloads carry the following immutable execution inputs. Relay still
+requires the runtime activation checks at the end of this document.
 
 ### Custom
 
@@ -75,14 +74,26 @@ The Competition resolver must cross-check those values against:
 - `bot.launch_snapshots` and `bot.launch_contract_plans` for the immutable bot
   release.
 
-Two canonical gaps remain. The current room tables do not carry an explicit
-`execution_policy_version`, so the consumer must not invent one from a hash or
-choose a current policy. Also, one Competition request creates period runs, but
-the backtest service cannot write `competition.backtest_period_runs`; an approved
-accepted-period event or another owner-safe linkage path is required before the
-handler can publish executable jobs.
+The provider resolves the exact execution-policy version and creates the
+`competition.backtest_period_runs` linkage before publishing a Competition
+request. The consumer cross-checks those provider-owned facts rather than
+creating or repairing them.
 
 ## Runtime activation rule
+
+The provider now pre-creates `backtest.runs` and `backtest.run_input_pins`.
+Dispatch reads `run_input_pins.input_bundle_hash`; it never substitutes
+`runs.configuration_hash`, which remains the bot launch configuration hash.
+Competition jobs preserve `evaluationPeriodId`, `inputSetHash`, all dataset pins
+and all feature materialization pins. The worker re-resolves every dataset and
+hash-checks it before execution, and publication persists the complete pin set.
+
+Locked feature output consumption remains deliberately fail-closed. The current
+canonical/code sources do not define how an output dataset is bound to a
+compiled-plan `LOAD_FEATURE` input. The runtime verifies materialization status,
+result hash, output manifest presence, output availability and output hash, then
+returns `FEATURE_OUTPUT_CONSUMPTION_UNSUPPORTED` rather than silently ignoring
+the locked features.
 
 `BacktestRequestIntake` and `PostgresRequestReceiptStore` are safe wire-boundary
 components, not a substitute for the missing domain handler. The internal lane

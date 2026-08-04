@@ -34,6 +34,7 @@
 
 CREATE TABLE "backtest"."run_input_pins" (
   "run_id" uuid PRIMARY KEY,
+  "input_bundle_hash" varchar(128) NOT NULL,
   "compiled_plan_checksum" varchar(128) NOT NULL,
   "strategy_snapshot_hash" varchar(128) NOT NULL,
   "dataset_manifest_id" uuid NOT NULL,

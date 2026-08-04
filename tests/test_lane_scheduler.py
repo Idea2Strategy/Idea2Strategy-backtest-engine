@@ -155,6 +155,8 @@ def test_request_intake_queues_must_be_complete_and_separate_from_execution_queu
         "BACKTEST_BASIC_QUEUE_URL": "https://sqs/jobs-basic",
         "BACKTEST_CUSTOM_QUEUE_URL": "https://sqs/jobs-custom",
         "BACKTEST_COMPETITION_QUEUE_URL": "https://sqs/jobs-competition",
+        "BACKTEST_BASIC_REQUEST_QUEUE_URL": "https://sqs/requests-basic",
+        "BACKTEST_BASIC_REQUEST_DLQ_URL": "https://sqs/requests-basic-dlq",
         "BACKTEST_CUSTOM_REQUEST_QUEUE_URL": "https://sqs/requests-custom",
         "BACKTEST_CUSTOM_REQUEST_DLQ_URL": "https://sqs/requests-custom-dlq",
         "BACKTEST_COMPETITION_REQUEST_QUEUE_URL": "https://sqs/requests-competition",
@@ -165,6 +167,7 @@ def test_request_intake_queues_must_be_complete_and_separate_from_execution_queu
 
     configs = _request_configs_from_env(environ)
 
+    assert configs[RequestLane.BASIC].queue_url == "https://sqs/requests-basic"
     assert configs[RequestLane.CUSTOM].queue_url == "https://sqs/requests-custom"
     assert configs[RequestLane.COMPETITION].queue_url == "https://sqs/requests-competition"
 
