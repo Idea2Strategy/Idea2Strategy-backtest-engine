@@ -129,10 +129,7 @@ def test_postgres_receipt_rejects_reversed_sequence_and_conflicting_transport(
     finally:
         with admin_engine.begin() as connection:
             connection.execute(
-                text(
-                    "DELETE FROM operations.outbox_consumer_receipts "
-                    "WHERE consumer_handler_id = :handler"
-                ),
+                text("DELETE FROM operations.outbox_consumer_receipts WHERE consumer_handler_id = :handler"),
                 {"handler": HANDLER},
             )
             connection.execute(

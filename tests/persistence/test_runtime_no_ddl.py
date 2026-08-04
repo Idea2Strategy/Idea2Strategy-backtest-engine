@@ -101,8 +101,7 @@ def test_permitted_statements_pass(statement: str) -> None:
 
 def test_only_the_contract_receipt_table_is_writable_in_operations() -> None:
     check_statement(
-        "INSERT INTO operations.outbox_consumer_receipts "
-        "(consumer_handler_id) VALUES (:handler)",
+        "INSERT INTO operations.outbox_consumer_receipts (consumer_handler_id) VALUES (:handler)",
         WRITABLE,
         RUNTIME_SHARED_WRITE_TABLES,
     )

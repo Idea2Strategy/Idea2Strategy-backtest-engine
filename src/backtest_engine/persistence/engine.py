@@ -59,9 +59,7 @@ READABLE_SCHEMAS: frozenset[str] = frozenset({"backtest", "storage", "market_dat
 # Root contract.operations.outbox-delivery.v1 requires each consumer to persist a
 # message-id receipt.  The canonical table is operations-owned, so D may write rows
 # there but may not write any other operations table or author operations DDL.
-RUNTIME_SHARED_WRITE_TABLES: frozenset[str] = frozenset(
-    {"operations.outbox_consumer_receipts"}
-)
+RUNTIME_SHARED_WRITE_TABLES: frozenset[str] = frozenset({"operations.outbox_consumer_receipts"})
 
 
 def _strip(statement: str) -> str:
