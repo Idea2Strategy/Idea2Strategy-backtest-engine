@@ -229,6 +229,13 @@ _ALTER_COLUMN_NULLABILITY = re.compile(
     re.I,
 )
 
+_CREATE_INDEX = re.compile(
+    r"CREATE\s+(?P<unique>UNIQUE\s+)?INDEX(?:\s+[a-z0-9_]+)?\s+"
+    r'ON\s+"?(?P<schema>[a-z_]+)"?\."?(?P<name>[a-z_]+)"?\s*'
+    r"\((?P<cols>[^)]*)\)",
+    re.I,
+)
+
 
 def _apply_contributions(tables: dict[str, _DdlTable], sql: str) -> None:
     """Fold this repository's `ADD COLUMN` clauses into the parsed baseline.
@@ -259,6 +266,26 @@ def _apply_contributions(tables: dict[str, _DdlTable], sql: str) -> None:
         for clause in _ALTER_COLUMN_NULLABILITY.finditer(statement.group("body")):
             column = table.columns[clause.group("name")]
             column["nullable"] = clause.group("operation").upper() == "DROP"
+
+    # Later central migrations replace the baseline's inline idempotency UNIQUE
+    # constraint with lane-scoped uniqueness. The small parser models that exact
+    # evolution so metadata checks compare with the applied schema, not V1 alone.
+    if re.search(r"DROP\s+CONSTRAINT\s+IF\s+EXISTS\s+runs_idempotency_key_key", sql, re.I):
+        tables["backtest.runs"].uniques.discard(("idempotency_key",))
+
+    for index in _CREATE_INDEX.finditer(sql):
+        key = f"{index.group('schema')}.{index.group('name')}"
+        table = tables.get(key)
+        if table is None:
+            continue
+        columns = tuple(
+            token.strip().strip('"')
+            for token in index.group("cols").split(",")
+        )
+        if index.group("unique"):
+            table.uniques.add(columns)
+        else:
+            table.indexes.add(columns)
 
 
 @pytest.fixture(scope="module")
@@ -448,7 +475,9 @@ def test_run_status_enum_uses_the_canonical_labels() -> None:
 
     assert status.name == "run_status"
     assert status.schema == "backtest"
-    assert tuple(status.enums) == ("QUEUED", "RUNNING", "COMPLETED", "FAILED", "UNAVAILABLE")
+    assert tuple(status.enums) == (
+        "QUEUED", "RUNNING", "COMPLETED", "FAILED", "UNAVAILABLE", "CANCELLED"
+    )
     assert "COMPLETE" not in status.enums
 
 

@@ -35,6 +35,7 @@ __all__ = [
     "PerformanceSummaryRow",
     "RunAttemptRow",
     "RunInputPinRow",
+    "RunLane",
     "RunRow",
     "RunStatus",
     "StorageObjectRow",
@@ -68,7 +69,14 @@ class RunStatus(StrEnum):
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
     UNAVAILABLE = "UNAVAILABLE"
+
+
+class RunLane(StrEnum):
+    BASIC = "BASIC"
+    CUSTOM = "CUSTOM"
+    COMPETITION = "COMPETITION"
 
 
 class WorkStatus(StrEnum):
@@ -92,14 +100,17 @@ class ObjectStatus(StrEnum):
     DELETED = "DELETED"
 
 
-TERMINAL_RUN_STATUSES: frozenset[RunStatus] = frozenset({RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.UNAVAILABLE})
+TERMINAL_RUN_STATUSES: frozenset[RunStatus] = frozenset(
+    {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.UNAVAILABLE}
+)
 
 #: Canonical lifecycle. A run never leaves a terminal status.
 RUN_STATUS_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
-    RunStatus.QUEUED: frozenset({RunStatus.RUNNING, RunStatus.FAILED, RunStatus.UNAVAILABLE}),
-    RunStatus.RUNNING: frozenset({RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.UNAVAILABLE}),
+    RunStatus.QUEUED: frozenset({RunStatus.RUNNING, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.UNAVAILABLE}),
+    RunStatus.RUNNING: frozenset({RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.UNAVAILABLE}),
     RunStatus.COMPLETED: frozenset(),
     RunStatus.FAILED: frozenset(),
+    RunStatus.CANCELLED: frozenset(),
     RunStatus.UNAVAILABLE: frozenset(),
 }
 
@@ -173,6 +184,15 @@ class RunRow:
     #: Set when retention execution removes the customer identifier from an
     #: official competition run while preserving immutable result evidence.
     owner_anonymized_at: datetime | None = None
+    lane: RunLane | None = None
+    message_id: UUID | None = None
+    canonical_payload_hash: str | None = None
+    aggregate_sequence: int | None = None
+    execution_policy_version: str | None = None
+    idempotency_scope: str | None = None
+    cancellation_requested_at: datetime | None = None
+    cancellation_reason_code: str | None = None
+    cancelled_at: datetime | None = None
 
     def __post_init__(self) -> None:
         validate_money(self.initial_cash_amount, "initial_cash_amount")
@@ -204,6 +224,13 @@ class RunAttemptRow:
     started_at: datetime
     completed_at: datetime | None = None
     failure_code: str | None = None
+    claim_token: UUID | None = None
+    worker_id: str | None = None
+    claimed_at: datetime | None = None
+    claim_expires_at: datetime | None = None
+    last_heartbeat_at: datetime | None = None
+    previous_attempt_id: UUID | None = None
+    terminal_reason_code: str | None = None
 
     def __post_init__(self) -> None:
         if self.attempt_number < 1:

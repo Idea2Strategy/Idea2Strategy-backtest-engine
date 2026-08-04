@@ -61,7 +61,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import ROUND_FLOOR, Decimal, localcontext
 from typing import Any, Protocol, cast
 
-from sqlalchemy import update
+from sqlalchemy import select
 
 from .api import create_app
 from .attempt_coordinator import (
@@ -142,7 +142,6 @@ from .persistence import (
     MonthlyJudgmentSummaryRow,
     ObjectStatus,
     PerformanceSummaryRow,
-    RunAttemptRow,
     RunPublication,
     StorageObjectRow,
     WorkStatus,
@@ -150,7 +149,7 @@ from .persistence import (
     publish_completed_run,
 )
 from .persistence.errors import InvalidStatusTransition as PersistedInvalidStatusTransition
-from .persistence.errors import PersistenceError, PublishConflict, RowNotFound
+from .persistence.errors import PublishConflict, RowNotFound
 from .persistence.tables import run_attempts as _run_attempts_table
 from .result_query import BacktestResultQueryService, DurableBacktestResultQueryStore
 from .result_snapshot import (
@@ -616,104 +615,94 @@ class PersistenceExecutionKeyStore:
     because the arbiter is the column's unique index rather than a process-local
     dictionary.
 
-    One deliberate difference from the reference. ``worker_execution_key`` is
-    ``UNIQUE`` across the whole table, so a redelivery of the same message can
-    never become a *second* attempt row -- there is exactly one row per message,
-    forever. ``release`` therefore returns that row to ``PENDING`` instead of
-    allocating a new attempt number, and ``claim`` re-acquires a ``PENDING`` row
-    with a conditional update whose affected row count is the CAS result. The
-    attempt number is stable because it identifies the message, not the delivery.
+    Claims are leased with database time. Every retry gets a fresh attempt row and
+    fencing token; a late heartbeat or completion from an expired worker therefore
+    cannot mutate the successor attempt.
     """
 
     def __init__(self, persistence: BacktestPersistence) -> None:
         self._persistence = persistence
 
     def claim(
-        self, key: str, *, run_id: str, owner: str, now: datetime
+        self, key: str, *, run_id: str, owner: str, now: datetime,
+        lease_duration: timedelta | None = None,
     ) -> ExecutionClaim:
+        if lease_duration is None:
+            raise ValueError("persistent execution claims require a lease duration")
         run_uuid = uuid.UUID(run_id)
         with self._persistence.unit_of_work() as uow:
-            existing = uow.attempts.find_by_execution_key(key)
-            if existing is None:
-                candidate = RunAttemptRow(
-                    id=uuid.uuid5(_ATTEMPT_ID_NAMESPACE, key),
-                    run_id=run_uuid,
-                    attempt_number=uow.attempts.next_attempt_number(run_uuid),
-                    worker_execution_key=key,
-                    status=WorkStatus.RUNNING,
-                    started_at=now,
+            attempt = uow.attempts.claim_fenced(
+                run_uuid,
+                worker_id=owner,
+                execution_key=key,
+                lease_duration=lease_duration,
+            )
+            if attempt is not None:
+                return ExecutionClaim(
+                    acquired=True,
+                    attempt_number=attempt.attempt_number,
+                    attempt_id=str(attempt.id),
+                    claim_token=str(attempt.claim_token),
                 )
-                try:
-                    attempt, created = uow.attempts.claim(candidate)
-                except PersistenceError:
-                    # Another worker took this attempt slot between the count and
-                    # the insert. Leave the message for redelivery rather than
-                    # guessing a free number inside somebody else's race.
-                    return ExecutionClaim(
-                        acquired=False,
-                        attempt_number=candidate.attempt_number,
-                        existing_status=ExecutionRecordStatus.IN_PROGRESS,
-                    )
-                if created:
-                    return ExecutionClaim(acquired=True, attempt_number=attempt.attempt_number)
-                existing = attempt
-
-            if existing.status is WorkStatus.PENDING:
-                reclaimed = uow.connection.execute(
-                    update(_run_attempts_table)
-                    .where(
-                        _run_attempts_table.c.worker_execution_key == key,
-                        _run_attempts_table.c.status == WorkStatus.PENDING.value,
-                    )
-                    .values(
-                        status=WorkStatus.RUNNING.value,
-                        started_at=now,
-                        completed_at=None,
-                        failure_code=None,
-                    )
-                    .returning(_run_attempts_table.c.attempt_number)
-                ).all()
-                if reclaimed:
-                    return ExecutionClaim(
-                        acquired=True, attempt_number=int(reclaimed[0][0])
-                    )
-                existing = uow.attempts.find_by_execution_key(key)
-                if existing is None:  # pragma: no cover - only on a torn write
-                    raise WiringError(f"run attempt {key} vanished during the re-claim")
-
+            existing = uow.attempts.latest_for_run(run_uuid)
             return ExecutionClaim(
                 acquired=False,
-                attempt_number=existing.attempt_number,
-                existing_status=_execution_status(existing.status),
+                attempt_number=0 if existing is None else existing.attempt_number,
+                existing_status=None if existing is None else _execution_status(existing.status),
             )
 
-    def release(self, key: str, *, now: datetime) -> None:
+    @staticmethod
+    def _claim_ids(claim: ExecutionClaim | None) -> tuple[uuid.UUID, uuid.UUID]:
+        if claim is None or claim.attempt_id is None or claim.claim_token is None:
+            raise ValueError("persistent execution mutation requires its fencing claim")
+        return uuid.UUID(claim.attempt_id), uuid.UUID(claim.claim_token)
+
+    def heartbeat(self, key: str, claim: ExecutionClaim, *, lease_duration: timedelta) -> None:
+        attempt_id, claim_token = self._claim_ids(claim)
         with self._persistence.unit_of_work() as uow:
-            uow.connection.execute(
-                update(_run_attempts_table)
-                .where(_run_attempts_table.c.worker_execution_key == key)
-                .values(
-                    status=WorkStatus.PENDING.value,
-                    completed_at=None,
-                    failure_code=None,
-                )
+            uow.attempts.heartbeat_fenced(attempt_id, claim_token, lease_duration=lease_duration)
+
+    def release(self, key: str, *, now: datetime, claim: ExecutionClaim | None = None) -> None:
+        attempt_id, claim_token = self._claim_ids(claim)
+        with self._persistence.unit_of_work() as uow:
+            uow.attempts.release_fenced(
+                attempt_id, claim_token, terminal_reason_code="RETRY_RELEASED"
             )
 
-    def finish(self, key: str, status: ExecutionRecordStatus, *, now: datetime) -> None:
+    def finish(
+        self, key: str, status: ExecutionRecordStatus, *, now: datetime,
+        claim: ExecutionClaim | None = None,
+    ) -> None:
         if status is ExecutionRecordStatus.IN_PROGRESS:
             raise ValueError("finish requires a terminal status")
+        attempt_id, claim_token = self._claim_ids(claim)
         work_status = (
             WorkStatus.SUCCEEDED
             if status is ExecutionRecordStatus.SUCCEEDED
             else WorkStatus.FAILED
         )
         with self._persistence.unit_of_work() as uow:
-            uow.attempts.complete(key, status=work_status, completed_at=now)
+            uow.attempts.close_fenced(
+                attempt_id,
+                claim_token,
+                status=work_status,
+                terminal_reason_code=status.value,
+                failure_code=None if work_status is WorkStatus.SUCCEEDED else "EXECUTION_FAILED",
+            )
 
     def status(self, key: str) -> ExecutionRecordStatus | None:
         with self._persistence.read_only() as uow:
-            attempt = uow.attempts.find_by_execution_key(key)
-        return None if attempt is None else _execution_status(attempt.status)
+            attempt = uow.connection.execute(
+                select(_run_attempts_table)
+                .where(
+                    _run_attempts_table.c.worker_execution_key.startswith(
+                        f"{key}:", autoescape=True
+                    )
+                )
+                .order_by(_run_attempts_table.c.attempt_number.desc())
+                .limit(1)
+            ).mappings().first()
+        return None if attempt is None else _execution_status(WorkStatus(attempt["status"]))
 
 
 def _execution_status(status: WorkStatus) -> ExecutionRecordStatus:

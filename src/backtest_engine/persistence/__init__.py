@@ -46,6 +46,7 @@ from .errors import (
     RuntimeDdlForbidden,
     SchemaDriftError,
     SchemaWriteForbidden,
+    StaleAttemptClaim,
 )
 from .publish import (
     MonthlyJudgment,
@@ -77,6 +78,7 @@ from .rows import (
     PerformanceSummaryRow,
     RunAttemptRow,
     RunInputPinRow,
+    RunLane,
     RunRow,
     RunStatus,
     StorageObjectRow,
@@ -121,6 +123,7 @@ __all__ = [
     "RunAttemptRow",
     "RunInputPinRepository",
     "RunInputPinRow",
+    "RunLane",
     "RunPublication",
     "RunRepository",
     "RunRow",
@@ -128,6 +131,7 @@ __all__ = [
     "RuntimeDdlForbidden",
     "SchemaDriftError",
     "SchemaWriteForbidden",
+    "StaleAttemptClaim",
     "StorageObjectReader",
     "StorageObjectRepository",
     "StorageObjectRow",

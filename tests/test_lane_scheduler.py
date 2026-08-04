@@ -185,11 +185,12 @@ class BlockingFinishStore(InMemoryExecutionKeyStore):
         self.allow_finish = threading.Event()
 
     def finish(
-        self, key: str, status: ExecutionRecordStatus, *, now: datetime
+        self, key: str, status: ExecutionRecordStatus, *, now: datetime,
+        claim=None,
     ) -> None:
         self.finish_started.set()
         assert self.allow_finish.wait(5)
-        super().finish(key, status, now=now)
+        super().finish(key, status, now=now, claim=claim)
 
 
 class OneMessageSqs:

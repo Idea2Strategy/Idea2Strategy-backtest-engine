@@ -145,6 +145,8 @@ class ExecutionClaim:
     acquired: bool
     attempt_number: int
     existing_status: ExecutionRecordStatus | None = None
+    attempt_id: str | None = None
+    claim_token: str | None = None
 
 
 class ExecutionKeyStore(Protocol):
@@ -156,13 +158,19 @@ class ExecutionKeyStore(Protocol):
     """
 
     def claim(
-        self, key: str, *, run_id: str, owner: str, now: datetime
+        self, key: str, *, run_id: str, owner: str, now: datetime,
+        lease_duration: timedelta | None = None,
     ) -> ExecutionClaim: ...
 
-    def release(self, key: str, *, now: datetime) -> None: ...
+    def heartbeat(
+        self, key: str, claim: ExecutionClaim, *, lease_duration: timedelta
+    ) -> None: ...
+
+    def release(self, key: str, *, now: datetime, claim: ExecutionClaim | None = None) -> None: ...
 
     def finish(
-        self, key: str, status: ExecutionRecordStatus, *, now: datetime
+        self, key: str, status: ExecutionRecordStatus, *, now: datetime,
+        claim: ExecutionClaim | None = None,
     ) -> None: ...
 
     def status(self, key: str) -> ExecutionRecordStatus | None: ...
@@ -189,7 +197,8 @@ class InMemoryExecutionKeyStore:
         self._lock = threading.Lock()
 
     def claim(
-        self, key: str, *, run_id: str, owner: str, now: datetime
+        self, key: str, *, run_id: str, owner: str, now: datetime,
+        lease_duration: timedelta | None = None,
     ) -> ExecutionClaim:
         with self._lock:
             record = self._records.get(key)
@@ -207,7 +216,10 @@ class InMemoryExecutionKeyStore:
                 existing_status=record.status,
             )
 
-    def release(self, key: str, *, now: datetime) -> None:
+    def heartbeat(self, key: str, claim: ExecutionClaim, *, lease_duration: timedelta) -> None:
+        return None
+
+    def release(self, key: str, *, now: datetime, claim: ExecutionClaim | None = None) -> None:
         """Hand a retryable attempt back so the next delivery can re-claim it."""
         with self._lock:
             record = self._records.pop(key, None)
@@ -215,7 +227,8 @@ class InMemoryExecutionKeyStore:
                 self._released_attempts[key] = record.attempt_number
 
     def finish(
-        self, key: str, status: ExecutionRecordStatus, *, now: datetime
+        self, key: str, status: ExecutionRecordStatus, *, now: datetime,
+        claim: ExecutionClaim | None = None,
     ) -> None:
         if status is ExecutionRecordStatus.IN_PROGRESS:
             raise ValueError("finish requires a terminal status")
@@ -428,7 +441,8 @@ class BacktestWorker:
             )
 
         claim = self._store.claim(
-            key, run_id=run_id, owner=self._config.worker_id, now=self._clock()
+            key, run_id=run_id, owner=self._config.worker_id, now=self._clock(),
+            lease_duration=self._config.visibility_timeout,
         )
         if not claim.acquired:
             return self._on_duplicate(message, receipt, claim, message_id, key)
@@ -440,34 +454,35 @@ class BacktestWorker:
             message_id=message_id,
             worker_id=self._config.worker_id,
         )
-        outcome = self._invoke(job, context, receipt)
+        outcome = self._invoke(job, context, receipt, key, claim)
 
         if outcome.result is JobResult.SUCCEEDED:
-            self._store.finish(key, ExecutionRecordStatus.SUCCEEDED, now=self._clock())
+            self._store.finish(key, ExecutionRecordStatus.SUCCEEDED, now=self._clock(), claim=claim)
             self._delete(receipt)
             return HandledMessage(message_id, MessageDisposition.DELETED, None, key)
 
         if outcome.result is JobResult.RETRY:
             # Release the CAS record so the redelivery is a *new* attempt, then
             # make the message immediately visible again.
-            self._store.release(key, now=self._clock())
+            self._store.release(key, now=self._clock(), claim=claim)
             self._return_to_queue(receipt)
             return HandledMessage(
                 message_id, MessageDisposition.RETURNED, outcome.reason_code, key
             )
 
-        self._store.finish(key, ExecutionRecordStatus.FAILED, now=self._clock())
+        self._store.finish(key, ExecutionRecordStatus.FAILED, now=self._clock(), claim=claim)
         return self._dead_letter(
             message, receipt, outcome.reason_code or "PERMANENT_FAILURE", message_id, key
         )
 
     def _invoke(
-        self, job: Mapping[str, Any], context: JobContext, receipt: str
+        self, job: Mapping[str, Any], context: JobContext, receipt: str,
+        key: str, claim: ExecutionClaim,
     ) -> JobOutcome:
         """Run the handler with a visibility heartbeat alongside it."""
         done = threading.Event()
         beat = threading.Thread(
-            target=self._beat, args=(receipt, done), daemon=True, name="bt4-heartbeat"
+            target=self._beat, args=(receipt, done, key, claim), daemon=True, name="bt4-heartbeat"
         )
         beat.start()
         try:
@@ -480,11 +495,12 @@ class BacktestWorker:
             done.set()
             beat.join(timeout=self._config.visibility_timeout.total_seconds())
 
-    def _beat(self, receipt: str, done: threading.Event) -> None:
+    def _beat(self, receipt: str, done: threading.Event, key: str, claim: ExecutionClaim) -> None:
         interval = self._config.heartbeat_interval.total_seconds()
         timeout = int(self._config.visibility_timeout.total_seconds())
         while not done.wait(interval):
             try:
+                self._store.heartbeat(key, claim, lease_duration=self._config.visibility_timeout)
                 self._client.change_message_visibility(
                     QueueUrl=self._config.queue_url,
                     ReceiptHandle=receipt,

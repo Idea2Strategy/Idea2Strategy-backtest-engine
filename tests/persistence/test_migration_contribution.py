@@ -53,12 +53,12 @@ def test_declared_schemas_are_writable_by_this_repository() -> None:
 
 
 def test_storage_schema_is_not_claimed_by_this_contribution() -> None:
-    """`DatabaseAccessPolicy` registers `storage` as SHARED; D must not claim it."""
+    """Pipeline owns `storage` DDL; the backtest contribution must not claim it."""
 
     contribution = load_contribution(CONTRIBUTION_ROOT)
 
     assert "storage" not in contribution.schemas
-    assert CENTRAL_SCHEMA_OWNERS["storage"] == "shared"
+    assert CENTRAL_SCHEMA_OWNERS["storage"] == "pipeline"
 
 
 def test_every_contributed_migration_matches_the_filename_regex() -> None:

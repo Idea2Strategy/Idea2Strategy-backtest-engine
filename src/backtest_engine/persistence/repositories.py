@@ -21,11 +21,11 @@ controls they are:
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from sqlalchemy import Connection, Row, Select, select, update
+from sqlalchemy import Connection, Row, Select, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .errors import (
@@ -35,6 +35,7 @@ from .errors import (
     InvalidStatusTransition,
     PublishConflict,
     RowNotFound,
+    StaleAttemptClaim,
 )
 from .rows import (
     RUN_INPUT_PIN_IDENTITY_FIELDS,
@@ -269,6 +270,36 @@ class RunRepository(_Repository):
             missing_requirements=None if missing_requirements is None else list(missing_requirements),
         )
 
+    def request_cancellation(self, run_id: UUID, *, reason_code: str) -> RunRow:
+        """Serialize cancellation with claim and terminal publication using DB time."""
+        if not reason_code.strip():
+            raise ValueError("reason_code must not be blank")
+        current = self._connection.execute(
+            select(runs).where(runs.c.id == run_id).with_for_update()
+        ).mappings().first()
+        if current is None:
+            raise RowNotFound(f"backtest run not found: {run_id}")
+        hydrated = _hydrate(RunRow, current)
+        if hydrated.status in {
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+            RunStatus.UNAVAILABLE,
+        }:
+            return hydrated
+        now = self._connection.scalar(select(func.clock_timestamp()))
+        assert isinstance(now, datetime)
+        values: dict[str, Any] = {
+            "cancellation_requested_at": now,
+            "cancellation_reason_code": reason_code,
+        }
+        if hydrated.status is RunStatus.QUEUED:
+            values.update(status=RunStatus.CANCELLED.value, cancelled_at=now, completed_at=now)
+        updated = self._connection.execute(
+            update(runs).where(runs.c.id == run_id).values(**values).returning(*runs.c)
+        ).mappings().one()
+        return _hydrate(RunRow, updated)
+
     def _transition(self, run_id: UUID, target: RunStatus, **values: Any) -> RunRow:
         sources = sorted(source.value for source, allowed in RUN_STATUS_TRANSITIONS.items() if target in allowed)
         statement = (
@@ -292,6 +323,230 @@ class RunRepository(_Repository):
 
 class RunAttemptRepository(_Repository):
     """`backtest.run_attempts` — the cross-process duplicate-worker control."""
+
+    def claim_fenced(
+        self,
+        run_id: UUID,
+        *,
+        worker_id: str,
+        execution_key: str,
+        lease_duration: timedelta,
+    ) -> RunAttemptRow | None:
+        """Claim using database time and close an expired predecessor atomically."""
+        if not worker_id.strip() or not execution_key.strip():
+            raise ValueError("worker_id and execution_key must not be blank")
+        if lease_duration <= timedelta(0):
+            raise ValueError("lease_duration must be positive")
+        run = self._connection.execute(
+            select(runs.c.status, runs.c.cancellation_requested_at)
+            .where(runs.c.id == run_id)
+            .with_for_update()
+        ).mappings().first()
+        if run is None:
+            raise RowNotFound(f"backtest run not found: {run_id}")
+        if run["status"] in {
+            RunStatus.COMPLETED.value,
+            RunStatus.FAILED.value,
+            RunStatus.CANCELLED.value,
+            RunStatus.UNAVAILABLE.value,
+        } or run["cancellation_requested_at"] is not None:
+            return None
+
+        now = self._connection.scalar(select(func.clock_timestamp()))
+        assert isinstance(now, datetime)
+        latest = self._connection.execute(
+            select(run_attempts)
+            .where(run_attempts.c.run_id == run_id)
+            .order_by(run_attempts.c.attempt_number.desc())
+            .limit(1)
+            .with_for_update()
+        ).mappings().first()
+        previous_attempt_id: UUID | None = None
+        next_number = 1
+        if latest is not None:
+            next_number = int(latest["attempt_number"]) + 1
+            if latest["status"] == WorkStatus.SUCCEEDED.value:
+                return None
+            if latest["status"] == WorkStatus.RUNNING.value:
+                expires_at = latest["claim_expires_at"]
+                if expires_at is not None and expires_at > now:
+                    return None
+                closed = self._connection.execute(
+                    update(run_attempts)
+                    .where(
+                        run_attempts.c.id == latest["id"],
+                        run_attempts.c.claim_token == latest["claim_token"],
+                        run_attempts.c.status == WorkStatus.RUNNING.value,
+                        run_attempts.c.claim_expires_at <= now,
+                    )
+                    .values(
+                        status=WorkStatus.FAILED.value,
+                        completed_at=now,
+                        failure_code="LEASE_EXPIRED",
+                        terminal_reason_code="LEASE_EXPIRED",
+                    )
+                )
+                if closed.rowcount != 1:
+                    raise StaleAttemptClaim("expired attempt was reclaimed concurrently")
+                previous_attempt_id = latest["id"]
+
+        attempt_id = uuid4()
+        claim_token = uuid4()
+        attempt_key = f"{execution_key}:{next_number}"
+        if len(attempt_key) > 160:
+            raise ValueError("versioned worker execution key exceeds varchar(160)")
+        inserted = self._connection.execute(
+            pg_insert(run_attempts)
+            .values(
+                id=attempt_id,
+                run_id=run_id,
+                attempt_number=next_number,
+                worker_execution_key=attempt_key,
+                status=WorkStatus.RUNNING.value,
+                claim_token=claim_token,
+                worker_id=worker_id,
+                claimed_at=now,
+                claim_expires_at=now + lease_duration,
+                last_heartbeat_at=now,
+                previous_attempt_id=previous_attempt_id,
+                started_at=now,
+            )
+            .on_conflict_do_nothing()
+            .returning(*run_attempts.c)
+        ).mappings().first()
+        if inserted is None:
+            raise StaleAttemptClaim("attempt slot or execution key was claimed concurrently")
+        changed = self._connection.execute(
+            update(runs)
+            .where(runs.c.id == run_id, runs.c.status == RunStatus.QUEUED.value)
+            .values(status=RunStatus.RUNNING.value, started_at=func.coalesce(runs.c.started_at, now))
+        )
+        if changed.rowcount not in (0, 1):
+            raise StaleAttemptClaim("run claim affected an unexpected row count")
+        return _hydrate(RunAttemptRow, inserted)
+
+    def heartbeat_fenced(
+        self, attempt_id: UUID, claim_token: UUID, *, lease_duration: timedelta
+    ) -> RunAttemptRow:
+        if lease_duration <= timedelta(0):
+            raise ValueError("lease_duration must be positive")
+        now = self._connection.scalar(select(func.clock_timestamp()))
+        assert isinstance(now, datetime)
+        updated = self._connection.execute(
+            update(run_attempts)
+            .where(
+                run_attempts.c.id == attempt_id,
+                run_attempts.c.claim_token == claim_token,
+                run_attempts.c.status == WorkStatus.RUNNING.value,
+                run_attempts.c.claim_expires_at > now,
+            )
+            .values(last_heartbeat_at=now, claim_expires_at=now + lease_duration)
+            .returning(*run_attempts.c)
+        ).mappings().first()
+        if updated is None:
+            raise StaleAttemptClaim("heartbeat matched no live attempt claim")
+        return _hydrate(RunAttemptRow, updated)
+
+    def latest_for_run(self, run_id: UUID) -> RunAttemptRow | None:
+        return self._fetch_one(
+            select(run_attempts)
+            .where(run_attempts.c.run_id == run_id)
+            .order_by(run_attempts.c.attempt_number.desc())
+            .limit(1),
+            RunAttemptRow,
+        )
+
+    def release_fenced(
+        self,
+        attempt_id: UUID,
+        claim_token: UUID,
+        *,
+        terminal_reason_code: str,
+        failure_code: str | None = None,
+    ) -> RunAttemptRow:
+        """Close exactly one live delivery and make its non-terminal run retryable."""
+        attempt = self._connection.execute(
+            select(run_attempts.c.run_id)
+            .where(run_attempts.c.id == attempt_id)
+            .with_for_update()
+        ).mappings().first()
+        if attempt is None:
+            raise StaleAttemptClaim("release matched no attempt")
+        run_id = attempt["run_id"]
+        self._connection.execute(select(runs.c.id).where(runs.c.id == run_id).with_for_update()).first()
+        closed = self.close_fenced(
+            attempt_id,
+            claim_token,
+            status=WorkStatus.FAILED,
+            terminal_reason_code=terminal_reason_code,
+            failure_code=failure_code,
+        )
+        self._connection.execute(
+            update(runs)
+            .where(
+                runs.c.id == run_id,
+                runs.c.status == RunStatus.RUNNING.value,
+                runs.c.cancellation_requested_at.is_(None),
+            )
+            .values(status=RunStatus.QUEUED.value)
+        )
+        return closed
+
+    def close_fenced(
+        self,
+        attempt_id: UUID,
+        claim_token: UUID,
+        *,
+        status: WorkStatus,
+        terminal_reason_code: str,
+        failure_code: str | None = None,
+    ) -> RunAttemptRow:
+        if status in (WorkStatus.PENDING, WorkStatus.RUNNING):
+            raise ValueError("close_fenced requires a terminal status")
+        attempt = self._connection.execute(
+            select(run_attempts.c.run_id)
+            .where(run_attempts.c.id == attempt_id)
+            .with_for_update()
+        ).mappings().first()
+        if attempt is None:
+            raise StaleAttemptClaim("terminal mutation matched no attempt")
+        run = self._connection.execute(
+            select(runs.c.status, runs.c.cancellation_requested_at)
+            .where(runs.c.id == attempt["run_id"])
+            .with_for_update()
+        ).mappings().first()
+        if run is None:
+            raise RowNotFound(f"backtest run not found: {attempt['run_id']}")
+        now = self._connection.scalar(select(func.clock_timestamp()))
+        assert isinstance(now, datetime)
+        if run["cancellation_requested_at"] is not None and status is WorkStatus.SUCCEEDED:
+            status = WorkStatus.CANCELLED
+            terminal_reason_code = "CANCELLED_BY_REQUEST"
+            failure_code = None
+            self._connection.execute(
+                update(runs)
+                .where(runs.c.id == attempt["run_id"], runs.c.status == RunStatus.RUNNING.value)
+                .values(status=RunStatus.CANCELLED.value, cancelled_at=now, completed_at=now)
+            )
+        updated = self._connection.execute(
+            update(run_attempts)
+            .where(
+                run_attempts.c.id == attempt_id,
+                run_attempts.c.claim_token == claim_token,
+                run_attempts.c.status == WorkStatus.RUNNING.value,
+                run_attempts.c.claim_expires_at > now,
+            )
+            .values(
+                status=status.value,
+                completed_at=now,
+                terminal_reason_code=terminal_reason_code,
+                failure_code=failure_code,
+            )
+            .returning(*run_attempts.c)
+        ).mappings().first()
+        if updated is None:
+            raise StaleAttemptClaim("terminal mutation matched no live attempt claim")
+        return _hydrate(RunAttemptRow, updated)
 
     def claim(self, row: RunAttemptRow) -> tuple[RunAttemptRow, bool]:
         """Claim an attempt. Returns `(attempt, created)`.
@@ -358,7 +613,12 @@ class RunAttemptRepository(_Repository):
                 run_attempts.c.worker_execution_key == worker_execution_key,
                 run_attempts.c.completed_at.is_(None),
             )
-            .values(status=status.value, completed_at=completed_at, failure_code=failure_code)
+            .values(
+                status=status.value,
+                completed_at=completed_at,
+                failure_code=failure_code,
+                terminal_reason_code=(failure_code or status.value),
+            )
             .returning(*run_attempts.c)
         )
         updated = _first(self._connection.execute(statement).all())

@@ -157,3 +157,11 @@ VALUES ('00000000-0000-4000-8000-0000000000c2', 'STAGED', 'local', 'i2s-backtest
         'PARQUET', 'UNCOMPRESSED', 'application/vnd.apache.parquet', '1.0.0', 64,
         '2024-03-04T14:30:00+00', '2024-03-08T21:00:00+00', '1.0.0', false,
         '2026-01-01T00:00:00+00', NULL);
+
+INSERT INTO backtest.execution_policy_versions (
+  version, policy_artifact_hash, policy_document, locked_at)
+VALUES (
+  'test-policy-v1',
+  'ep000000000000000000000000000000000000000000000000000000000000001',
+  '{"fixture":true}'::jsonb,
+  '2026-01-01T00:00:00+00');
