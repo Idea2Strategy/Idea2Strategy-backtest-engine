@@ -721,6 +721,7 @@ class JobEnvelope:
     execution_policy_version: str
     compiled_plan_checksum: str
     dataset_manifest_id: uuid.UUID
+    expected_dataset_hash: str | None
     expected_snapshot_hash: str
 
     @classmethod
@@ -735,6 +736,11 @@ class JobEnvelope:
                 execution_policy_version=str(job["executionPolicyVersion"]),
                 compiled_plan_checksum=str(job["compiledPlanChecksum"]),
                 dataset_manifest_id=uuid.UUID(str(job["datasetManifestId"])),
+                expected_dataset_hash=(
+                    str(job["expectedDatasetHash"])
+                    if job.get("expectedDatasetHash") is not None
+                    else None
+                ),
                 expected_snapshot_hash=str(job["expectedSnapshotHash"]),
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -1287,6 +1293,15 @@ class OrchestratorJobHandler:
         if manifest is None:
             raise JobNotSatisfiable(
                 f"dataset manifest {envelope.dataset_manifest_id} is not resolvable",
+                reason_code="REQUIRED_INPUT_UNAVAILABLE",
+            )
+        if (
+            envelope.expected_dataset_hash is not None
+            and _prefixed(str(manifest["dataset_hash"]))
+            != envelope.expected_dataset_hash
+        ):
+            raise JobNotSatisfiable(
+                f"dataset manifest {envelope.dataset_manifest_id} changed from its requested hash",
                 reason_code="REQUIRED_INPUT_UNAVAILABLE",
             )
 

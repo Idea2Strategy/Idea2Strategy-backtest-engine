@@ -56,14 +56,35 @@ attributes and raw payload hash, rejects the wrong lane, records the canonical
 `operations.outbox_consumer_receipts` receipt, and prevents an older aggregate
 sequence from applying after a newer one.
 
-Enabling either producer route still requires a production request handler. In
-particular, the current Custom payload does not expose the requesting account
-needed to recompute its producer key, and the Competition payload identifies its
-hidden periods and datasets only through `planHash`. Until the corresponding
-owner-bound Custom resolver and Competition plan/period resolver are integrated,
-leave `CUSTOM_BACKTEST_REQUESTED` and `COMPETITION_BACKTEST_REQUESTED` disabled in
-the backend Outbox relay. Never substitute the three job queue URLs for those two
-request queue URLs.
+The current backend provider creates each Custom or Competition-period
+`backtest.runs` row before its Outbox message. Competition also creates the exact
+`competition.backtest_period_runs` link first. Its v1 payload exposes the Custom
+requesting account and the locked Competition period, datasets, policy and run
+identity. `BacktestRequestIntake` verifies that envelope and its canonical Outbox
+row, while `backtest_engine.production:backtest_request_handler` checks the
+pre-created run and converts it to the smaller internal execution job.
+
+Producer request queues and internal execution queues are different trust
+boundaries and must be different SQS resources. Configure the backend relay to
+the `_REQUEST_QUEUE_URL` queues below; keep `BACKTEST_{CUSTOM,COMPETITION}_QUEUE_URL`
+for the 2/1/1 execution scheduler. The worker refuses to start if any request,
+request-DLQ or execution URL aliases another boundary.
+
+```text
+BACKTEST_CUSTOM_REQUEST_QUEUE_URL=...
+BACKTEST_CUSTOM_REQUEST_DLQ_URL=...
+BACKTEST_COMPETITION_REQUEST_QUEUE_URL=...
+BACKTEST_COMPETITION_REQUEST_DLQ_URL=...
+BACKTEST_REQUEST_HANDLER=backtest_engine.production:backtest_request_handler
+BACKTEST_REQUEST_RECEIPT_STORE=backtest_engine.production:postgres_request_receipt_store
+```
+
+Optional request-consumer controls are
+`BACKTEST_REQUEST_MAX_RECEIVE_COUNT` (default 5),
+`BACKTEST_REQUEST_VISIBILITY_TIMEOUT_SECONDS` (default 300), and
+`BACKTEST_REQUEST_WAIT_SECONDS` (default 5). Never point a backend producer at
+an execution queue: execution workers accept only internal jobs containing
+`backtestRunId`, and raw Outbox envelopes are intentionally rejected.
 
 The receipt adapter factory is:
 
