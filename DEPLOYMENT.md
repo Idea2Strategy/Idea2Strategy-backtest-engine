@@ -159,12 +159,16 @@ These examples describe shape, not approved values. Deployment must mount the
 reviewed, checksum-pinned documents. Missing or malformed policy data stops the
 process before it receives work.
 
-## Remaining schema gate
+## Fenced-attempt schema gate
 
-The current `backtest.run_attempts` table has no opaque claim token,
-`claim_expires_at`, heartbeat timestamp, cancellation marker, or attempt lineage
-needed for fenced lease reclaim and cancellation races. The production adapter
-therefore supplies durable duplicate execution exclusion with the existing unique
-execution key, but cannot claim the stronger lease/cancellation guarantees without
-a reviewed central Flyway/DBML change. Do not describe that portion as release-ready
-until the migration and the corresponding worker tests are integrated.
+The central Flyway bundle now includes the expand/constrain pair
+`V20260804160000__backtest_runtime_ownership_expand.sql` and
+`V20260804160100__backtest_runtime_ownership_constrain.sql`. They add the opaque
+claim token, claim expiry, heartbeat, cancellation state, and attempt-lineage
+constraints used by the production persistence adapter.
+
+`tests/persistence/test_fenced_attempts.py` verifies expired-claim replacement,
+late-completion fencing, heartbeat renewal, and cancellation winning over a live
+claim against the migrated PostgreSQL container. Deployment still must apply the
+reviewed central bundle before starting this image; startup schema verification is
+fail-closed and never applies DDL itself.
