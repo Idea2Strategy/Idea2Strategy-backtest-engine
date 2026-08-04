@@ -56,8 +56,9 @@ attributes and raw payload hash, rejects the wrong lane, records the canonical
 `operations.outbox_consumer_receipts` receipt, and prevents an older aggregate
 sequence from applying after a newer one.
 
-The current backend provider creates each Custom or Competition-period
-`backtest.runs` row before its Outbox message. Competition also creates the exact
+The current backend provider creates each Basic, Custom or Competition-period
+`backtest.runs` row and `backtest.run_input_pins` row before its Outbox message.
+Competition also creates the exact
 `competition.backtest_period_runs` link first. Its v1 payload exposes the Custom
 requesting account and the locked Competition period, datasets, policy and run
 identity. `BacktestRequestIntake` verifies that envelope and its canonical Outbox
@@ -66,11 +67,13 @@ pre-created run and converts it to the smaller internal execution job.
 
 Producer request queues and internal execution queues are different trust
 boundaries and must be different SQS resources. Configure the backend relay to
-the `_REQUEST_QUEUE_URL` queues below; keep `BACKTEST_{CUSTOM,COMPETITION}_QUEUE_URL`
+the `_REQUEST_QUEUE_URL` queues below; keep `BACKTEST_{BASIC,CUSTOM,COMPETITION}_QUEUE_URL`
 for the 2/1/1 execution scheduler. The worker refuses to start if any request,
 request-DLQ or execution URL aliases another boundary.
 
 ```text
+BACKTEST_BASIC_REQUEST_QUEUE_URL=...
+BACKTEST_BASIC_REQUEST_DLQ_URL=...
 BACKTEST_CUSTOM_REQUEST_QUEUE_URL=...
 BACKTEST_CUSTOM_REQUEST_DLQ_URL=...
 BACKTEST_COMPETITION_REQUEST_QUEUE_URL=...

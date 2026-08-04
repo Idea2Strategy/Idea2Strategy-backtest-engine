@@ -24,7 +24,12 @@ from typing import Any, Protocol
 from jsonschema.exceptions import best_match
 from sqlalchemy import Engine, text
 
-from .contracts import ContractValidationError, UnsupportedContractVersion, _validator
+from .contracts import (
+    ContractValidationError,
+    UnsupportedContractVersion,
+    _validator,
+    validate_official_backtest_request,
+)
 from .worker import SqsClient
 
 
@@ -51,18 +56,27 @@ BACKTEST_REQUEST_CONTRACT_VERSION = "backtest-request.v1"
 BACKTEST_REQUEST_SCHEMA = (
     "https://contracts.idea2strategy.io/backtest-request/v1/backtest-request.schema.json"
 )
-_OWNER_DOMAIN = "backtest-request"
+_OWNER_DOMAINS = {
+    "BASIC": "strategy-bot",
+    "CUSTOM": "backtest-request",
+    "COMPETITION": "backtest-request",
+}
 _HASH_PATTERN_LENGTH = 64
 _LOGGER = logging.getLogger(__name__)
 
 
 class RequestLane(StrEnum):
+    BASIC = "BASIC"
     CUSTOM = "CUSTOM"
     COMPETITION = "COMPETITION"
 
     @property
     def event_type(self) -> str:
-        return f"{self.value}_BACKTEST_REQUESTED"
+        return (
+            "OFFICIAL_BACKTEST_REQUESTED"
+            if self is RequestLane.BASIC
+            else f"{self.value}_BACKTEST_REQUESTED"
+        )
 
 
 class RequestIntakeDisposition(StrEnum):
@@ -533,6 +547,13 @@ def validate_backtest_request(document: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(metadata, Mapping):
         raise ContractValidationError("backtest request metadata must be an object")
     actual_version = metadata.get("contractVersion")
+    if actual_version == "strategy-bot.v1":
+        request = validate_official_backtest_request(instance)
+        if request.get("lane") != RequestLane.BASIC.value:
+            raise ContractValidationError("official backtest request lane must be BASIC")
+        if request.get("aggregateSequence") != 1:
+            raise ContractValidationError("official backtest aggregateSequence must be 1")
+        return request
     if actual_version != BACKTEST_REQUEST_CONTRACT_VERSION:
         raise UnsupportedContractVersion(
             f"backtest request declares {actual_version!r}; only "
@@ -862,8 +883,9 @@ class BacktestRequestIntake:
         expected = (
             envelope.event_type == event_type
             and envelope.contract_version == metadata["contractVersion"]
-            and envelope.owner_domain == _OWNER_DOMAIN
-            and str(envelope.aggregate_id) == aggregate_id
+            and envelope.owner_domain == _OWNER_DOMAINS[self._config.lane.value]
+            and str(envelope.aggregate_id)
+            == (str(request["botId"]) if self._config.lane is RequestLane.BASIC else aggregate_id)
             and str(envelope.message_id) == metadata["messageId"]
             and envelope.producer_idempotency_key == metadata["idempotencyKey"]
             and envelope.aggregate_sequence == request["aggregateSequence"]

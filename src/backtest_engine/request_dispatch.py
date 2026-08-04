@@ -20,7 +20,12 @@ class QueuedRunProjection:
     message_id: uuid.UUID
     bot_id: uuid.UUID
     owner_account_id: uuid.UUID
-    configuration_hash: str
+    input_bundle_hash: str
+    compiled_plan_checksum: str
+    strategy_snapshot_hash: str
+    dataset_manifest_id: uuid.UUID
+    dataset_hash: str
+    feature_materialization_version: str
     aggregate_sequence: int
     evaluation_start: date
     evaluation_end: date
@@ -47,6 +52,8 @@ def _period(
     request: Mapping[str, Any], lane: RequestLane
 ) -> tuple[date, date, uuid.UUID, str]:
     try:
+        if lane is RequestLane.BASIC:
+            raise RequestProcessingError("BASIC_PERIOD_COMES_FROM_RUN", retryable=False)
         if lane is RequestLane.CUSTOM:
             return (
                 date.fromisoformat(str(request["periodStart"])),
@@ -99,7 +106,35 @@ class BacktestRequestJobPublisher:
         run = self._source.by_id(run_id)
         if run is None:
             raise RequestProcessingError("RUN_NOT_FOUND", retryable=False)
-        start, end, dataset_id, expected_dataset_hash = _period(request, lane)
+        if lane is RequestLane.BASIC:
+            start, end = run.evaluation_start, run.evaluation_end
+            dataset_id = uuid.UUID(str(request["datasetManifestId"]))
+            expected_dataset_hash = run.dataset_hash
+            datasets = ({
+                "datasetManifestId": str(dataset_id),
+                "purposeCode": "MARKET_BARS",
+                "expectedDatasetHash": expected_dataset_hash,
+            },)
+            features: tuple[Mapping[str, Any], ...] = ()
+            period_identity: dict[str, str] = {}
+        else:
+            start, end, dataset_id, expected_dataset_hash = _period(request, lane)
+            if lane is RequestLane.CUSTOM:
+                datasets = ({
+                    "datasetManifestId": str(dataset_id),
+                    "purposeCode": "MARKET_BARS",
+                    "expectedDatasetHash": expected_dataset_hash,
+                },)
+                features = ()
+                period_identity = {}
+            else:
+                period = request["periods"][0]
+                datasets = tuple(period["datasets"])
+                features = tuple(period["featureMaterializations"])
+                period_identity = {
+                    "evaluationPeriodId": str(period["evaluationPeriodId"]),
+                    "inputSetHash": str(period["inputSetHash"]),
+                }
         identity_matches = all(
             (
                 run.lane is lane,
@@ -110,6 +145,10 @@ class BacktestRequestJobPublisher:
                 run.evaluation_start == start,
                 run.evaluation_end == end,
                 run.execution_policy_version == policy_version,
+                run.compiled_plan_checksum == str(request["compiledPlanChecksum"]),
+                run.strategy_snapshot_hash == str(request["expectedSnapshotHash"]),
+                run.dataset_manifest_id == dataset_id,
+                _prefixed(run.dataset_hash) == _prefixed(expected_dataset_hash),
             )
         )
         if not identity_matches:
@@ -120,11 +159,15 @@ class BacktestRequestJobPublisher:
             "botId": str(run.bot_id),
             "ownerAccountId": str(run.owner_account_id),
             "idempotencyKey": str(request["metadata"]["idempotencyKey"]),
-            "inputBundleFingerprint": _prefixed(run.configuration_hash),
+            "inputBundleFingerprint": _prefixed(run.input_bundle_hash),
             "executionPolicyVersion": run.execution_policy_version,
             "compiledPlanChecksum": str(request["compiledPlanChecksum"]),
             "datasetManifestId": str(dataset_id),
             "expectedDatasetHash": expected_dataset_hash,
             "expectedSnapshotHash": str(request["expectedSnapshotHash"]),
+            "datasets": [dict(item) for item in datasets],
+            "featureMaterializations": [dict(item) for item in features],
+            "featureMaterializationVersion": run.feature_materialization_version,
+            **period_identity,
         }
         self._queue.publish(lane, job)

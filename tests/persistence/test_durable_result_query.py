@@ -193,6 +193,7 @@ class Published:
     def pins(self) -> RunInputPinRow:
         return RunInputPinRow(
             run_id=self.run_id,
+            input_bundle_hash=HASH_A,
             compiled_plan_checksum=COMPILED_PLAN_CHECKSUM,
             strategy_snapshot_hash=STRATEGY_SNAPSHOT_HASH,
             dataset_manifest_id=DATASET_MANIFEST_ID,
