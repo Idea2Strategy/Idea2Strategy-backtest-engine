@@ -14,6 +14,7 @@ import json
 import os
 import uuid
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -440,8 +441,60 @@ def load_execution_policy_catalog(path: Path) -> ExecutionPolicyCatalog:
     return ExecutionPolicyCatalog(policies)
 
 
-def _runtime_document(environ: Mapping[str, str] = os.environ) -> Mapping[str, Any]:
-    return _read_document(Path(_required(environ, "BACKTEST_RUNTIME_POLICY_FILE")), "runtime policy")
+@dataclass(frozen=True, slots=True)
+class RuntimePolicy:
+    """Validated values loaded from the checksum-pinned worker policy file."""
+
+    attempt: AttemptPolicy
+    microstructure: ExecutionMicrostructurePolicy
+    fractional: InstrumentFractionalPolicy
+    risk_limits: RiskLimits
+
+
+def load_runtime_policy(path: Path) -> RuntimePolicy:
+    document = _read_document(path, "runtime policy")
+    if document.get("schemaVersion") != 1:
+        raise ConfigurationError("runtime policy schemaVersion must be 1")
+    try:
+        attempt = document["attempt"]
+        micro = document["microstructure"]
+        fractional = document["fractional"]
+        risks = document["riskLimits"]
+        attempt_policy = AttemptPolicy(
+            max_attempts=int(attempt["maxAttempts"]),
+            lease_duration=timedelta(seconds=int(attempt["leaseDurationSeconds"])),
+            attempt_timeout=timedelta(seconds=int(attempt["attemptTimeoutSeconds"])),
+            max_cpu_time=timedelta(seconds=int(attempt["maxCpuTimeSeconds"])),
+            max_memory_bytes=int(attempt["maxMemoryBytes"]),
+        )
+        attempt_values = {
+            "maxAttempts": attempt_policy.max_attempts,
+            "leaseDurationSeconds": int(attempt_policy.lease_duration.total_seconds()),
+            "attemptTimeoutSeconds": int(attempt_policy.attempt_timeout.total_seconds()),
+            "maxCpuTimeSeconds": int(attempt_policy.max_cpu_time.total_seconds()),
+            "maxMemoryBytes": attempt_policy.max_memory_bytes,
+        }
+        for name, value in attempt_values.items():
+            if value <= 0:
+                raise ValueError(f"{name} must be positive")
+        microstructure = ExecutionMicrostructurePolicy(
+            version=micro["version"],
+            max_volume_participation_bps=int(micro["maxVolumeParticipationBps"]),
+            buying_power_buffer_policy_id=micro["buyingPowerBufferPolicyId"],
+            buying_power_buffer_bps=int(micro["buyingPowerBufferBps"]),
+        )
+        fractional_policy = InstrumentFractionalPolicy(
+            policy_version=fractional["policyVersion"],
+            fractional_instrument_ids=frozenset(fractional["instrumentIds"]),
+        )
+        risk_limits = RiskLimits(
+            max_strategy_notional=Decimal(risks["maxStrategyNotional"]),
+            max_gross_exposure=Decimal(risks["maxGrossExposure"]),
+            max_instrument_exposure=Decimal(risks["maxInstrumentExposure"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ConfigurationError(f"runtime policy is invalid: {exc}") from exc
+    return RuntimePolicy(attempt_policy, microstructure, fractional_policy, risk_limits)
 
 
 def api_authenticator(environ: Mapping[str, str] = os.environ) -> PostgresSessionAuthenticator:
@@ -534,38 +587,7 @@ def _market_reader(environ: Mapping[str, str]) -> S3ParquetMarketDataReader:
 def orchestrator_job_handler(
     environ: Mapping[str, str] = os.environ,
 ) -> OrchestratorJobHandler:
-    policy = _runtime_document(environ)
-    if policy.get("schemaVersion") != 1:
-        raise ConfigurationError("runtime policy schemaVersion must be 1")
-    try:
-        attempt = policy["attempt"]
-        micro = policy["microstructure"]
-        fractional = policy["fractional"]
-        risks = policy["riskLimits"]
-        attempt_policy = AttemptPolicy(
-            max_attempts=int(attempt["maxAttempts"]),
-            lease_duration=timedelta(seconds=int(attempt["leaseDurationSeconds"])),
-            attempt_timeout=timedelta(seconds=int(attempt["attemptTimeoutSeconds"])),
-            max_cpu_time=timedelta(seconds=int(attempt["maxCpuTimeSeconds"])),
-            max_memory_bytes=int(attempt["maxMemoryBytes"]),
-        )
-        microstructure = ExecutionMicrostructurePolicy(
-            version=micro["version"],
-            max_volume_participation_bps=int(micro["maxVolumeParticipationBps"]),
-            buying_power_buffer_policy_id=micro["buyingPowerBufferPolicyId"],
-            buying_power_buffer_bps=int(micro["buyingPowerBufferBps"]),
-        )
-        fractional_policy = InstrumentFractionalPolicy(
-            policy_version=fractional["policyVersion"],
-            fractional_instrument_ids=frozenset(fractional["instrumentIds"]),
-        )
-        risk_limits = RiskLimits(
-            max_strategy_notional=Decimal(risks["maxStrategyNotional"]),
-            max_gross_exposure=Decimal(risks["maxGrossExposure"]),
-            max_instrument_exposure=Decimal(risks["maxInstrumentExposure"]),
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ConfigurationError(f"runtime policy is invalid: {exc}") from exc
+    policy = load_runtime_policy(Path(_required(environ, "BACKTEST_RUNTIME_POLICY_FILE")))
 
     engine = _engine(environ)
     persistence = BacktestPersistence(engine)
@@ -583,11 +605,11 @@ def orchestrator_job_handler(
             _required(environ, "BACKTEST_RESULT_INGEST_TOKEN"),
             timeout_seconds=float(environ.get("BACKTEST_RESULT_TIMEOUT_SECONDS", "10")),
         ),
-        attempt_policy=attempt_policy,
+        attempt_policy=policy.attempt,
         monitor=ProcessResourceMonitor(),
-        microstructure=microstructure,
-        fractional_policy=fractional_policy,
-        risk_limits=risk_limits,
+        microstructure=policy.microstructure,
+        fractional_policy=policy.fractional,
+        risk_limits=policy.risk_limits,
         runtime=BasicPlanRuntime(),
         wall_clock=lambda: datetime.now(UTC),
         correlation_id=_required(environ, "BACKTEST_WORKER_CORRELATION_ID"),
