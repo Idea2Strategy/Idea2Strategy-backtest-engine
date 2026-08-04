@@ -61,7 +61,7 @@ def projection(request: dict[str, Any], lane: RequestLane) -> QueuedRunProjectio
         message_id=uuid.UUID(request["metadata"]["messageId"]),
         bot_id=uuid.UUID(request["botId"]),
         owner_account_id=ACCOUNT_ID,
-        input_bundle_hash="7" * 64,
+        input_bundle_fingerprint="7" * 64,
         compiled_plan_checksum=request["compiledPlanChecksum"],
         strategy_snapshot_hash=request["expectedSnapshotHash"],
         dataset_manifest_id=uuid.UUID(

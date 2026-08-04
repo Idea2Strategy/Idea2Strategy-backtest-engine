@@ -223,7 +223,7 @@ run_attempts = Table(
 
 #: Contributed by this repository, not by the applied baseline:
 #: `db/migration-contributions/migrations/V20260802094500__backtest_run_input_pins.sql`
-#: plus the change request beside it. `input_bundle_hash` is independent from the bot
+#: plus the change request beside it. `input_bundle_fingerprint` is independent from the bot
 #: launch `runs.configuration_hash`. Written once, in the acceptance
 #: transaction, so the route answers at `QUEUED` and `UNAVAILABLE` too.
 run_input_pins = Table(
@@ -235,7 +235,7 @@ run_input_pins = Table(
         ForeignKey(runs.c.id, deferrable=True, initially="IMMEDIATE"),
         primary_key=True,
     ),
-    Column("input_bundle_hash", VARCHAR(128), nullable=False),
+    Column("input_bundle_fingerprint", VARCHAR(128), nullable=False),
     Column("compiled_plan_checksum", VARCHAR(128), nullable=False),
     Column("strategy_snapshot_hash", VARCHAR(128), nullable=False),
     # `market_data.dataset_manifests.id`: read-only upstream reference, declared in the

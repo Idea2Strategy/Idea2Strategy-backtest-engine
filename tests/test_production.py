@@ -160,7 +160,7 @@ def test_request_dispatch_reads_the_provider_created_run_and_publishes_a_small_j
                 "message_id": message_id,
                 "bot_id": BOT_ID,
                 "owner_account_id": ACCOUNT_ID,
-                "input_bundle_hash": "a" * 64,
+                "input_bundle_fingerprint": "a" * 64,
                 "compiled_plan_checksum": "sha256:" + "b" * 64,
                 "strategy_snapshot_hash": "sha256:" + "c" * 64,
                 "dataset_manifest_id": UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
