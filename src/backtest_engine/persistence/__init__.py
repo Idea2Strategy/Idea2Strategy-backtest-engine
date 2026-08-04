@@ -28,6 +28,7 @@ from .contribution import (
     load_contribution,
 )
 from .engine import (
+    RUNTIME_SHARED_WRITE_TABLES,
     BacktestPersistence,
     bind,
     check_statement,
@@ -94,6 +95,7 @@ __all__ = [
     "CENTRAL_SCHEMA_OWNERS",
     "METADATA",
     "RUNTIME_ROW_ONLY_SCHEMAS",
+    "RUNTIME_SHARED_WRITE_TABLES",
     "AttemptNumberConflict",
     "BacktestPersistence",
     "BacktestUnitOfWork",

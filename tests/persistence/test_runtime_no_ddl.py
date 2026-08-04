@@ -15,6 +15,7 @@ from sqlalchemy import Engine, text
 from backtest_engine.persistence import (
     METADATA,
     RUNTIME_ROW_ONLY_SCHEMAS,
+    RUNTIME_SHARED_WRITE_TABLES,
     BacktestPersistence,
     RuntimeDdlForbidden,
     SchemaWriteForbidden,
@@ -33,6 +34,7 @@ def test_the_runtime_writable_set_is_backtest_plus_storage_rows_only() -> None:
     """Spec 2.4: `backtest` is D's to migrate; `storage` is D's to write rows in."""
     assert WRITABLE == {"backtest", "storage"}
     assert RUNTIME_ROW_ONLY_SCHEMAS == {"storage"}
+    assert RUNTIME_SHARED_WRITE_TABLES == {"operations.outbox_consumer_receipts"}
     # `storage` must NOT appear in the COM07 migration declaration: D authors no
     # `storage` DDL, because the central policy registers that schema as SHARED.
     assert load_contribution().schemas == ("backtest",)
@@ -67,6 +69,7 @@ def test_ddl_statements_are_rejected(statement: str) -> None:
         "UPDATE identity.accounts SET lifecycle_status = 'CLOSED'",
         "DELETE FROM market_data.dataset_manifests WHERE id = :id",
         "UPDATE ONLY bot.bots SET name = 'x'",
+        "UPDATE operations.outbox_messages SET delivery_status = 'PUBLISHED'",
     ],
 )
 def test_writes_outside_the_declared_schemas_are_rejected(statement: str) -> None:
@@ -93,7 +96,15 @@ def test_writes_outside_the_declared_schemas_are_rejected(statement: str) -> Non
     ],
 )
 def test_permitted_statements_pass(statement: str) -> None:
-    check_statement(statement, WRITABLE)
+    check_statement(statement, WRITABLE, RUNTIME_SHARED_WRITE_TABLES)
+
+
+def test_only_the_contract_receipt_table_is_writable_in_operations() -> None:
+    check_statement(
+        "INSERT INTO operations.outbox_consumer_receipts (consumer_handler_id) VALUES (:handler)",
+        WRITABLE,
+        RUNTIME_SHARED_WRITE_TABLES,
+    )
 
 
 def test_no_production_module_calls_create_all() -> None:

@@ -5,10 +5,9 @@ Two guards are installed on every engine this module builds:
 * **No DDL.** COM07 acceptance `runtime-no-ddl`. Migration execution belongs to the
   central Flyway bundle; an application connection must never be able to create,
   alter, drop or truncate anything, no matter what code path asks it to.
-* **Declared schemas only.** Writes are restricted to the schemas declared in
-  `db/migration-contributions/contribution.properties` (`backtest`). The applied
-  baseline contains no role `GRANT`s, so the database itself does not enforce
-  ownership; this is the part of that boundary this repository can enforce for itself.
+* **Declared schemas and shared tables only.** Writes are restricted to the schemas
+  declared in `db/migration-contributions/contribution.properties` plus the exact
+  shared tables named below.  A shared-table grant never widens to its whole schema.
 
 Both guards are `before_cursor_execute` listeners, so they see the final SQL text
 regardless of whether it came from Core constructs or `text()`.
@@ -31,6 +30,7 @@ from .schema_guard import verify_schema
 
 
 __all__ = [
+    "RUNTIME_SHARED_WRITE_TABLES",
     "BacktestPersistence",
     "check_statement",
     "create_backtest_engine",
@@ -56,12 +56,21 @@ _WRITE_TARGET = re.compile(
 #: read by the persistence layer at all, so they are not listed.
 READABLE_SCHEMAS: frozenset[str] = frozenset({"backtest", "storage", "market_data", "strategy"})
 
+# Root contract.operations.outbox-delivery.v1 requires each consumer to persist a
+# message-id receipt.  The canonical table is operations-owned, so D may write rows
+# there but may not write any other operations table or author operations DDL.
+RUNTIME_SHARED_WRITE_TABLES: frozenset[str] = frozenset({"operations.outbox_consumer_receipts"})
+
 
 def _strip(statement: str) -> str:
     return _COMMENT.sub(" ", statement).strip()
 
 
-def check_statement(statement: str, writable_schemas: frozenset[str]) -> None:
+def check_statement(
+    statement: str,
+    writable_schemas: frozenset[str],
+    writable_tables: frozenset[str] = frozenset(),
+) -> None:
     """Raise if `statement` is DDL, or writes a schema outside `writable_schemas`.
 
     Pure and side-effect free so it can be unit-tested without a database.
@@ -76,17 +85,27 @@ def check_statement(statement: str, writable_schemas: frozenset[str]) -> None:
             f"Flyway bundle. Rejected: {cleaned[:120]!r}"
         )
     target = _WRITE_TARGET.match(cleaned)
-    if target is not None and target.group("schema").lower() not in writable_schemas:
+    if target is None:
+        return
+    schema = target.group("schema").lower()
+    table = target.group("table").lower()
+    qualified = f"{schema}.{table}"
+    if schema not in writable_schemas and qualified not in writable_tables:
         raise SchemaWriteForbidden(
-            f"this repository may only write {sorted(writable_schemas)}; rejected write to "
-            f"{target.group('schema')}.{target.group('table')}"
+            f"this repository may only write schemas {sorted(writable_schemas)} and shared "
+            f"tables {sorted(writable_tables)}; rejected write to {qualified}"
         )
 
 
-def install_runtime_guards(engine: Engine, writable_schemas: Sequence[str]) -> None:
+def install_runtime_guards(
+    engine: Engine,
+    writable_schemas: Sequence[str],
+    writable_tables: Sequence[str] = (),
+) -> None:
     """Refuse DDL and out-of-contract writes on every cursor this engine executes."""
 
     writable = frozenset(writable_schemas)
+    shared_tables = frozenset(value.lower() for value in writable_tables)
     if not writable:
         raise ValueError("writable_schemas must not be empty")
 
@@ -94,13 +113,14 @@ def install_runtime_guards(engine: Engine, writable_schemas: Sequence[str]) -> N
     def _guard(  # type: ignore[no-untyped-def]
         conn, cursor, statement, parameters, context, executemany
     ) -> None:
-        check_statement(statement, writable)
+        check_statement(statement, writable, shared_tables)
 
 
 def create_backtest_engine(
     url: str | URL,
     *,
     writable_schemas: Sequence[str] | None = None,
+    writable_tables: Sequence[str] | None = None,
     contribution: MigrationContribution | None = None,
     application_name: str = "idea2strategy-backtest-engine",
     pool_pre_ping: bool = True,
@@ -118,6 +138,8 @@ def create_backtest_engine(
     if writable_schemas is None:
         contribution = contribution or load_contribution()
         writable_schemas = sorted(contribution.writable_schemas())
+    if writable_tables is None:
+        writable_tables = sorted(RUNTIME_SHARED_WRITE_TABLES)
     connect_args: dict[str, Any] = dict(engine_kwargs.pop("connect_args", {}))
     connect_args.setdefault("application_name", application_name)
     engine = create_engine(
@@ -128,7 +150,7 @@ def create_backtest_engine(
         connect_args=connect_args,
         **engine_kwargs,
     )
-    install_runtime_guards(engine, writable_schemas)
+    install_runtime_guards(engine, writable_schemas, writable_tables)
     return engine
 
 

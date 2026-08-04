@@ -576,7 +576,7 @@ def test_input_bundle_fingerprint_does_not_key_on_strategy_version_id() -> None:
 
 
 # ===========================================================================
-# Schema hygiene - one copy of each schema, in its producer repository
+# Schema hygiene - one executable schema per consumed or produced wire contract
 # ===========================================================================
 
 
@@ -584,6 +584,9 @@ def test_input_bundle_fingerprint_does_not_key_on_strategy_version_id() -> None:
 SCHEMA_FAMILIES_THIS_REPO_MAY_HOLD = {
     # Published by D. This repository is the producer, so the single copy lives here.
     "backtest",
+    # Root-approved request contract consumed from backend #199, whose producer
+    # publishes executable fixtures but no JSON Schema.
+    "backtest-request",
     # Shared primitives referenced by D's own schemas.
     "common",
     # Consumed from B, which publishes fixtures but no JSON Schema.
@@ -597,9 +600,11 @@ def test_no_com06_schema_or_fixture_survives() -> None:
     """`com06.backtest-request`/`-result` described a format no producer publishes."""
     assert not (SCHEMA_ROOT / "com06").exists()
     assert not list(SCHEMA_ROOT.rglob("*com06*"))
-    # B's `official-backtest-request` survives; D's flat snake_case one does not.
-    assert {path.name for path in SCHEMA_ROOT.rglob("*backtest-request*")} == {
-        "official-backtest-request.schema.json"
+    # B's official release and the root-approved Custom/Competition envelope
+    # survive; D's old flat snake_case COM06 shape does not.
+    assert {path.name for path in SCHEMA_ROOT.rglob("*backtest-request*.schema.json")} == {
+        "backtest-request.schema.json",
+        "official-backtest-request.schema.json",
     }
     assert not list(SCHEMA_ROOT.rglob("*backtest-result.schema.json")) or [
         path.parent.parent.name for path in SCHEMA_ROOT.rglob("*backtest-result.schema.json")
@@ -631,16 +636,17 @@ def test_exactly_one_schema_file_exists_per_contract() -> None:
 
     duplicated = {schema_id: paths for schema_id, paths in by_id.items() if len(paths) > 1}
     assert duplicated == {}
-    # Eight, not seven: the compiled plan has two live shapes. Version 1 carries one
+    # Nine, not eight: the compiled plan has two live shapes. Version 1 carries one
     # plan-wide steps list, version 2 one per trade container (root #202), and both are
     # on the wire because every plan published before version 2 exists in the old shape.
-    assert len(by_id) == 8
+    # The ninth is the approved backtest-request.v1 Custom/Competition consumer schema.
+    assert len(by_id) == 9
 
 
 def test_every_schema_declares_draft_2020_12_and_a_matching_id() -> None:
     """Validation is versioned JSON Schema, not hand-written Python `if` statements."""
     schemas = sorted(SCHEMA_ROOT.rglob("*.schema.json"))
-    assert len(schemas) == 8
+    assert len(schemas) == 9
 
     for path in schemas:
         document = json.loads(path.read_text(encoding="utf-8"))
