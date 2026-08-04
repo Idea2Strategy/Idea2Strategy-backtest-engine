@@ -47,7 +47,13 @@ from backtest_engine.contracts import (
     build_backtest_result_event,
     validate_backtest_result_event,
 )
-from backtest_engine.persistence import METADATA, SchemaWriteForbidden, check_statement, load_contribution
+from backtest_engine.persistence import (
+    METADATA,
+    RUNTIME_SHARED_WRITE_TABLES,
+    SchemaWriteForbidden,
+    check_statement,
+    load_contribution,
+)
 from backtest_engine.persistence.engine import READABLE_SCHEMAS
 
 
@@ -220,7 +226,7 @@ def test_no_literal_sql_in_the_package_writes_outside_the_declared_schemas() -> 
                 continue
             checked += 1
             try:
-                check_statement(node.value, writable)
+                check_statement(node.value, writable, RUNTIME_SHARED_WRITE_TABLES)
             except SchemaWriteForbidden as exc:
                 offenders.append(f"{path.name}:{node.lineno}: {exc}")
 

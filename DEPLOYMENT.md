@@ -47,6 +47,35 @@ settings. The defaults are BASIC 2, CUSTOM 1, COMPETITION 1 and total 4; they ma
 be stated explicitly with the corresponding `_MAX_CONCURRENCY` variables and
 `BACKTEST_MAX_TOTAL_CONCURRENCY=4`.
 
+The lane scheduler consumes internal execution jobs containing `backtestRunId`.
+Do not point its CUSTOM or COMPETITION URL at backend-worker's
+`backtest-request.v1` producer queues: those bodies are immutable request
+envelopes and are rejected by the job worker. `BacktestRequestIntake` is the
+fail-closed boundary for those producer queues. It verifies the Outbox message
+attributes and raw payload hash, rejects the wrong lane, records the canonical
+`operations.outbox_consumer_receipts` receipt, and prevents an older aggregate
+sequence from applying after a newer one.
+
+Enabling either producer route still requires a production request handler. In
+particular, the current Custom payload does not expose the requesting account
+needed to recompute its producer key, and the Competition payload identifies its
+hidden periods and datasets only through `planHash`. Until the corresponding
+owner-bound Custom resolver and Competition plan/period resolver are integrated,
+leave `CUSTOM_BACKTEST_REQUESTED` and `COMPETITION_BACKTEST_REQUESTED` disabled in
+the backend Outbox relay. Never substitute the three job queue URLs for those two
+request queue URLs.
+
+The receipt adapter factory is:
+
+```text
+BACKTEST_REQUEST_RECEIPT_STORE=backtest_engine.production:postgres_request_receipt_store
+```
+
+The database role must have row DML on
+`operations.outbox_consumer_receipts` and read access to the referenced immutable
+`operations.outbox_messages` rows; it must not receive write access to any other
+`operations` table.
+
 The worker also requires:
 
 | Setting | Purpose |

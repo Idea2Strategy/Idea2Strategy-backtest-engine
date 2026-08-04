@@ -25,6 +25,7 @@ from sqlalchemy import Engine, text
 
 from backtest_engine.api import RESULT_INGEST_SCOPE, Principal
 from backtest_engine.attempt_coordinator import AttemptPolicy, ProcessResourceMonitor
+from backtest_engine.backtest_request_intake import PostgresRequestReceiptStore
 from backtest_engine.basic_runtime import BasicPlanRuntime
 from backtest_engine.calendar import XNYS_CALENDAR
 from backtest_engine.execution_model import (
@@ -504,6 +505,14 @@ def postgres_execution_key_store(
     environ: Mapping[str, str] = os.environ,
 ) -> PersistenceExecutionKeyStore:
     return PersistenceExecutionKeyStore(BacktestPersistence(_engine(environ)))
+
+
+def postgres_request_receipt_store(
+    environ: Mapping[str, str] = os.environ,
+) -> PostgresRequestReceiptStore:
+    """Durable Custom/Competition message receipt and sequence CAS."""
+
+    return PostgresRequestReceiptStore(_engine(environ))
 
 
 def _market_reader(environ: Mapping[str, str]) -> S3ParquetMarketDataReader:
