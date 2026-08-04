@@ -229,7 +229,7 @@ def test_verifies_both_the_plan_checksum_and_the_requests_copy_of_it() -> None:
 def test_plan_schema_version_mismatch_mirrors_c() -> None:
     runtime = _runtime(
         BasicRuntimeCompatibility(
-            plan_schema_version="basic-compiled-plan.v2",
+            plan_schema_versions=("basic-compiled-plan.v99",),
             runtime_schema_version=RUNTIME_SCHEMA_VERSION,
             supported_feature_versions={"RSI_14": "rsi:1.0.0"},
         )
@@ -239,13 +239,15 @@ def test_plan_schema_version_mismatch_mirrors_c() -> None:
         runtime.load(_document())
 
     assert failure.value.failure is PlanLoadFailure.PLAN_SCHEMA_VERSION_MISMATCH
-    assert "basic-compiled-plan.v1 != basic-compiled-plan.v2" in str(failure.value)
+    assert "basic-compiled-plan.v1 not in ['basic-compiled-plan.v99']" in str(
+        failure.value
+    )
 
 
 def test_feature_version_mismatch_mirrors_c() -> None:
     runtime = _runtime(
         BasicRuntimeCompatibility(
-            plan_schema_version=PLAN_SCHEMA_VERSION,
+            plan_schema_versions=(PLAN_SCHEMA_VERSION,),
             runtime_schema_version=RUNTIME_SCHEMA_VERSION,
             supported_feature_versions={"RSI_14": "rsi:2.0.0"},
         )
@@ -261,7 +263,7 @@ def test_feature_version_mismatch_mirrors_c() -> None:
 def test_a_feature_the_runtime_does_not_implement_at_all_is_a_version_mismatch() -> None:
     runtime = _runtime(
         BasicRuntimeCompatibility(
-            plan_schema_version=PLAN_SCHEMA_VERSION,
+            plan_schema_versions=(PLAN_SCHEMA_VERSION,),
             runtime_schema_version=RUNTIME_SCHEMA_VERSION,
             supported_feature_versions={},
         )
@@ -276,7 +278,7 @@ def test_a_feature_the_runtime_does_not_implement_at_all_is_a_version_mismatch()
 def test_runtime_schema_version_mismatch_mirrors_c() -> None:
     runtime = _runtime(
         BasicRuntimeCompatibility(
-            plan_schema_version=PLAN_SCHEMA_VERSION,
+            plan_schema_versions=(PLAN_SCHEMA_VERSION,),
             runtime_schema_version="strategy-bot-runtime.v2",
             supported_feature_versions={"RSI_14": "rsi:1.0.0"},
         )
@@ -1104,3 +1106,73 @@ def test_the_gate_is_stateless_and_does_not_move_the_replay_clock() -> None:
         assert gate.is_fill_allowed(_utc("2025-11-28T14:35:00Z")) is True
 
     assert len(replay.run()) == 20
+
+
+# ---------------------------------------------------------------------------
+# Root #202: one container per trade side
+# ---------------------------------------------------------------------------
+
+
+def _two_container_document() -> dict[str, Any]:
+    """B's plan reshaped as version 2: a buy container and a sell container.
+
+    Built from the pinned version 1 fixture rather than hand-written, so the only
+    difference under test is where the steps live. The buy container keeps the
+    fixture's chain; the sell container reads the same feature and sells above 70,
+    which is the ordinary shape a user writes.
+    """
+    document = copy.deepcopy(_document())
+    steps = copy.deepcopy(document.pop("steps"))
+    document["schemaVersion"] = "basic-compiled-plan.v2"
+
+    sell_steps = copy.deepcopy(steps)
+    for step in sell_steps:
+        if step["operation"] == "COMPARE":
+            step["arguments"] = {"operator": "GT", "threshold": "70"}
+        if step["operation"] == "EMIT_ORDER_CANDIDATE":
+            step["arguments"] = dict(step["arguments"], side="SELL")
+
+    partition = document["executionSnapshot"]["partitions"][0]
+    buy_flow = partition["flows"][0]
+    buy_flow["steps"] = steps
+    sell_flow = copy.deepcopy(buy_flow)
+    sell_flow["key"] = buy_flow["key"] + "-sell"
+    sell_flow["steps"] = sell_steps
+    partition["flows"] = [buy_flow, sell_flow]
+
+    document["planChecksum"] = compute_compiled_plan_checksum(document)
+    return document
+
+
+def test_loads_one_container_per_side_from_a_version_two_plan() -> None:
+    """The ordinary Basic strategy: version 1 had no shape for it at all."""
+    plan = _runtime().load(_two_container_document())
+
+    assert plan.schema_version == "basic-compiled-plan.v2"
+    assert [flow.side for flow in plan.flows] == ["BUY", "SELL"]
+    # Each container keeps its own chain, which is what makes the two sides differ.
+    assert all(flow.condition_steps for flow in plan.flows)
+    buy, sell = plan.flows
+    assert buy.condition_steps != sell.condition_steps
+    assert sell.condition_steps[-1].arguments["operator"] == "GT"
+
+
+def test_a_version_two_plan_missing_per_flow_steps_is_refused() -> None:
+    """The version says the steps are per container; there is no fallback."""
+    document = copy.deepcopy(_document())
+    document["schemaVersion"] = "basic-compiled-plan.v2"
+    document["planChecksum"] = compute_compiled_plan_checksum(document)
+
+    with pytest.raises(BasicPlanCompatibilityError):
+        _runtime().load(document)
+
+
+def test_an_unknown_plan_schema_version_is_refused_rather_than_guessed() -> None:
+    """A plan checked against the wrong schema fails its checksum, which reads
+    like tampering. Naming the version explicitly keeps the error honest."""
+    document = copy.deepcopy(_document())
+    document["schemaVersion"] = "basic-compiled-plan.v9"
+    document["planChecksum"] = compute_compiled_plan_checksum(document)
+
+    with pytest.raises(BasicPlanCompatibilityError, match="schemaVersion"):
+        _runtime().load(document)

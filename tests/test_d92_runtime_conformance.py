@@ -356,12 +356,16 @@ def _run_case(case: dict[str, Any]) -> tuple[list[Any], _ScriptedSteps]:
     decisions: list[Any] = []
     for declared in case["flows"]:
         catalog.current_flow = str(declared["flowId"])
+        # The fixture has always declared conditionSteps per flow, because a container is
+        # what holds an AND chain. Root #202 made the runtime read them from there too,
+        # so the harness hands them to the flow rather than to the plan.
         flow = BasicPlanFlow(
             partition_key="partition-1",
             flow_id=declared["flowId"],
             budget_cap_bps=10000,
             side=declared["side"],
             instrument_ids=tuple(declared["instrumentIds"]),
+            condition_steps=tuple(_plan_step(item) for item in declared["conditionSteps"]),
         )
         plan = _ScriptedPlan(
             catalog=catalog,
