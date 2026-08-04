@@ -12,6 +12,9 @@ are unchanged; only the filename differs.
 
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
+
 import pytest
 
 from backtest_engine.persistence.contribution import superproject_root
@@ -20,6 +23,12 @@ from conftest import VENDORED_MIGRATIONS, migration_files, recorded_digests, sha
 
 CENTRAL_RELATIVE = "backend/db-migration/src/main/resources/db/migration"
 FIXTURE_SUFFIX = ".fixture"
+
+
+def canonical_sql_sha256(path: Path) -> str:
+    """Ignore only Git's platform checkout conversion when comparing SQL."""
+    canonical_bytes = path.read_bytes().replace(b"\r\n", b"\n")
+    return hashlib.sha256(canonical_bytes).hexdigest()
 
 
 def test_vendored_copy_matches_its_recorded_digests() -> None:
@@ -55,7 +64,8 @@ def test_vendored_copy_matches_the_central_bundle() -> None:
     differing = [
         name
         for name in central_names
-        if sha256_of(central / name) != sha256_of(VENDORED_MIGRATIONS / (name + FIXTURE_SUFFIX))
+        if canonical_sql_sha256(central / name)
+        != canonical_sql_sha256(VENDORED_MIGRATIONS / (name + FIXTURE_SUFFIX))
     ]
     assert differing == [], (
         f"central migration files changed: {differing}. Refresh the vendored copy and "
