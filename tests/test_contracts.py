@@ -631,13 +631,16 @@ def test_exactly_one_schema_file_exists_per_contract() -> None:
 
     duplicated = {schema_id: paths for schema_id, paths in by_id.items() if len(paths) > 1}
     assert duplicated == {}
-    assert len(by_id) == 7
+    # Eight, not seven: the compiled plan has two live shapes. Version 1 carries one
+    # plan-wide steps list, version 2 one per trade container (root #202), and both are
+    # on the wire because every plan published before version 2 exists in the old shape.
+    assert len(by_id) == 8
 
 
 def test_every_schema_declares_draft_2020_12_and_a_matching_id() -> None:
     """Validation is versioned JSON Schema, not hand-written Python `if` statements."""
     schemas = sorted(SCHEMA_ROOT.rglob("*.schema.json"))
-    assert len(schemas) == 7
+    assert len(schemas) == 8
 
     for path in schemas:
         document = json.loads(path.read_text(encoding="utf-8"))

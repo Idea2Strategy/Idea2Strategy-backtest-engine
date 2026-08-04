@@ -67,7 +67,7 @@ Three independent gates, none of them optional:
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -122,6 +122,7 @@ __all__ = [
     "COMPILER_VERSION",
     "CONTRACT_VERSION",
     "INSTRUMENT_CATALOG_VERSIONS",
+    "MULTI_CONTAINER_PLAN_SCHEMA_VERSION",
     "PLAN_SCHEMA_VERSION",
     "RUNTIME_SCHEMA_VERSION",
     "SNAPSHOT_SCHEMA_VERSION",
@@ -148,6 +149,18 @@ __all__ = [
 
 CONTRACT_VERSION = "strategy-bot.v1"
 PLAN_SCHEMA_VERSION = "basic-compiled-plan.v1"
+
+MULTI_CONTAINER_PLAN_SCHEMA_VERSION = "basic-compiled-plan.v2"
+"""The plan shape a strategy with more than one trade container arrives on.
+
+A Basic strategy is one container per side, and the blocks inside a container are an
+AND chain. Version 1 carried a single plan-wide ``steps`` list and a single side, so a
+strategy with a buy container and a sell container had no shape to be published in and
+was refused at release (root #202). Version 2 moves ``side``, ``allocation`` and
+``steps`` onto each flow. Version 1 is still read exactly as before, because every plan
+published before this exists in that shape.
+"""
+
 SNAPSHOT_SCHEMA_VERSION = "basic-launch-snapshot.v1"
 COMPILER_VERSION = "basic-compiler:1.0.0"
 
@@ -313,6 +326,13 @@ class BasicPlanFlow:
     budget_cap_bps: int
     side: str
     instrument_ids: tuple[str, ...]
+    #: This container's own AND chain. A version 1 plan has one chain for the whole
+    #: plan and every flow carries the same tuple; a version 2 plan gives each
+    #: container its own, which is what lets a buy container and a sell container
+    #: coexist (root #202).
+    condition_steps: tuple[PlanStep, ...] = ()
+    terminal_step: PlanStep | None = None
+    allocation: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -374,7 +394,11 @@ class BasicCompiledPlan:
 class BasicRuntimeCompatibility:
     """What this build implements, as C declares the same three facts."""
 
-    plan_schema_version: str
+    #: Every compiled-plan shape this build reads. Plural because two are live: a
+    #: single-container strategy still arrives on version 1, and a strategy with a buy
+    #: container and a sell container arrives on version 2 (root #202). A build that
+    #: read only the newest would refuse every bot released before it.
+    plan_schema_versions: tuple[str, ...]
     runtime_schema_version: str
     supported_feature_versions: Mapping[str, str]
 
@@ -389,7 +413,10 @@ class BasicRuntimeCompatibility:
     def implemented(cls) -> BasicRuntimeCompatibility:
         """The real capability of this build, read from the element registry."""
         return cls(
-            plan_schema_version=PLAN_SCHEMA_VERSION,
+            plan_schema_versions=(
+                PLAN_SCHEMA_VERSION,
+                MULTI_CONTAINER_PLAN_SCHEMA_VERSION,
+            ),
             runtime_schema_version=RUNTIME_SCHEMA_VERSION,
             supported_feature_versions=supported_feature_versions(),
         )
@@ -542,21 +569,38 @@ class BasicPlanRuntime:
         self._verify_request_checksum(root, compiled_plan_checksum)
 
         catalog = self._build_capability(root)
-        steps = _plan_steps(root)
-        for step in steps:
-            try:
-                catalog.validate_step(step)
-            except ElementCompatibilityError as failure:
-                raise _reject(failure.failure, failure.detail) from failure
+        snapshot = root["executionSnapshot"]
+        per_container = root["schemaVersion"] == MULTI_CONTAINER_PLAN_SCHEMA_VERSION
 
-        condition_steps, terminal_step = self._require_structure(steps, catalog)
+        # A version 2 plan states one chain per container, so every container is checked
+        # in its own right: the operand rule, the single terminal and the contiguous
+        # sequence are properties of a chain, not of the document. The first container
+        # also fills the plan-level fields, which stay for the fields that genuinely
+        # describe the whole plan (the reference series a warm-up is built from).
+        containers = (
+            [flow["steps"] for partition in snapshot["partitions"] for flow in partition["flows"]]
+            if per_container
+            else [root["steps"]]
+        )
+        chains: list[tuple[tuple[PlanStep, ...], PlanStep]] = []
+        for raw_steps in containers:
+            steps = _plan_steps({"steps": raw_steps})
+            for step in steps:
+                try:
+                    catalog.validate_step(step)
+                except ElementCompatibilityError as failure:
+                    raise _reject(failure.failure, failure.detail) from failure
+            chains.append(self._require_structure(steps, catalog))
+
+        condition_steps, terminal_step = chains[0]
         required_features = self._required_features(root, catalog)
         reference_series = self._require_declared_features(
-            condition_steps, required_features, catalog
+            tuple(step for chain, _ in chains for step in chain),
+            required_features,
+            catalog,
         )
         self._require_compatibility(root, required_features, runtime_schema_version)
 
-        snapshot = root["executionSnapshot"]
         version = snapshot["immutableStrategyVersion"]
         side = terminal_step.argument("side")
         return BasicCompiledPlan(
@@ -582,7 +626,7 @@ class BasicPlanRuntime:
             allocation=terminal_step.argument("allocation"),
             required_features=required_features,
             reference_series=reference_series,
-            flows=self._load_flows(snapshot, side),
+            flows=self._load_flows(snapshot, chains, per_container),
             catalog=catalog,
         )
 
@@ -786,12 +830,13 @@ class BasicPlanRuntime:
         runtime_schema_version: str | None,
     ) -> None:
         plan_schema_version = document["schemaVersion"]
-        expected_plan_schema = self.compatibility.plan_schema_version
-        if plan_schema_version != expected_plan_schema:
+        readable_plan_schemas = self.compatibility.plan_schema_versions
+        if plan_schema_version not in readable_plan_schemas:
             raise _reject(
                 PlanLoadFailure.PLAN_SCHEMA_VERSION_MISMATCH,
-                "the compiled plan schema version is not the one this runtime "
-                f"implements: {plan_schema_version} != {expected_plan_schema}",
+                "the compiled plan schema version is not one this runtime "
+                f"implements: {plan_schema_version} not in "
+                f"{list(readable_plan_schemas)}",
             )
 
         supported = self.compatibility.supported_feature_versions
@@ -825,9 +870,20 @@ class BasicPlanRuntime:
             )
 
     @staticmethod
-    def _load_flows(snapshot: Mapping[str, Any], side: str) -> tuple[BasicPlanFlow, ...]:
+    def _load_flows(
+        snapshot: Mapping[str, Any],
+        chains: Sequence[tuple[tuple[PlanStep, ...], PlanStep]],
+        per_container: bool,
+    ) -> tuple[BasicPlanFlow, ...]:
+        """Flatten the snapshot's flows, giving each the chain that belongs to it.
+
+        Under version 2 the chains arrive in the same order the flows are walked, so the
+        n-th chain is the n-th container's. Under version 1 there is one chain and every
+        flow shares it, which is exactly what a single-container strategy means.
+        """
         flows: list[BasicPlanFlow] = []
         seen_flow_ids: set[str] = set()
+        position = 0
         for partition in snapshot["partitions"]:
             partition_key = partition["key"]
             for flow in partition["flows"]:
@@ -846,13 +902,18 @@ class BasicPlanRuntime:
                         f"flow {flow_id!r} officialInstrumentIds must be unique: a "
                         "repeated instrument would be allocated twice"
                     )
+                condition_steps, terminal_step = chains[position if per_container else 0]
+                position += 1
                 flows.append(
                     BasicPlanFlow(
                         partition_key=partition_key,
                         flow_id=flow_id,
                         budget_cap_bps=partition["budgetCapBps"],
-                        side=side,
+                        side=terminal_step.argument("side"),
                         instrument_ids=instrument_ids,
+                        condition_steps=condition_steps,
+                        terminal_step=terminal_step,
+                        allocation=terminal_step.argument("allocation"),
                     )
                 )
         return tuple(flows)
@@ -905,7 +966,9 @@ class BasicPlanRuntime:
                         plan, flow, instrument_id, supplied, as_of, evaluations
                     )
                 )
-            decisions.extend(_allocate_equally(flow_decisions, plan.side))
+            # Each container allocates within its own side: a buy container spreads its
+            # budget across the instruments it chose, and a sell container is separate.
+            decisions.extend(_allocate_equally(flow_decisions, flow.side))
         return BasicExecutionResult(tuple(decisions), as_of, evaluations)
 
     def _evaluate_instrument(
@@ -932,7 +995,10 @@ class BasicPlanRuntime:
         evaluations[instrument_id] = evaluation
         trace: list[BasicStepTrace] = []
 
-        for step in plan.condition_steps:
+        # The container's own chain, not the plan's: under version 2 a buy container and a
+        # sell container hold different blocks, and each instrument is judged by the chain
+        # of the container it belongs to.
+        for step in flow.condition_steps:
             step_id = f"step-{step.sequence}:{step.operation}"
             try:
                 if self.on_step is not None:

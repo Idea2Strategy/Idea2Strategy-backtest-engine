@@ -101,6 +101,23 @@ OFFICIAL_BACKTEST_REQUEST_SCHEMA = (
 BASIC_COMPILED_PLAN_SCHEMA = (
     f"{SCHEMA_BASE_URI}strategy-bot/v1/basic-compiled-plan.schema.json"
 )
+#: Root #202. A Basic strategy is one container per trade side, and version 1 could
+#: express only one of them: it carried a single plan-wide ``steps`` list and a single
+#: side, so a strategy with a buy container and a sell container had no shape to be
+#: published in. Version 2 moves ``steps`` onto each flow. Version 1 is still read
+#: unchanged, because every plan published before this exists in that shape.
+BASIC_COMPILED_PLAN_V2_SCHEMA = (
+    f"{SCHEMA_BASE_URI}strategy-bot/v1/basic-compiled-plan-v2.schema.json"
+)
+BASIC_COMPILED_PLAN_SCHEMA_VERSION = "basic-compiled-plan.v1"
+BASIC_COMPILED_PLAN_V2_SCHEMA_VERSION = "basic-compiled-plan.v2"
+#: Which JSON Schema validates which declared ``schemaVersion``. A version this map
+#: does not name is refused by the version check rather than silently validated
+#: against the wrong shape.
+BASIC_COMPILED_PLAN_SCHEMAS_BY_VERSION: dict[str, str] = {
+    BASIC_COMPILED_PLAN_SCHEMA_VERSION: BASIC_COMPILED_PLAN_SCHEMA,
+    BASIC_COMPILED_PLAN_V2_SCHEMA_VERSION: BASIC_COMPILED_PLAN_V2_SCHEMA,
+}
 BACKTEST_RESULT_EVENT_SCHEMA = (
     f"{SCHEMA_BASE_URI}backtest/v1/backtest-result.schema.json"
 )
@@ -372,11 +389,32 @@ def compiled_plan_checksum_material(plan: Mapping[str, Any]) -> str:
         for flow in partition["flows"]:
             instruments = ",".join(flow["officialInstrumentIds"])
             lines.append(f"flow={flow['key']}|officialInstrumentIds={instruments}")
-    for step in plan["steps"]:
-        arguments = step["arguments"]
-        rendered = "".join(f"|{key}={arguments[key]}" for key in sorted(arguments))
-        lines.append(f"step={step['sequence']}|{step['operation']}{rendered}")
+            # A version 2 plan carries its steps per container, hashed where they live —
+            # immediately after their own flow's line, which is the order C's codec
+            # appends them in. Getting this order wrong would make every v2 plan fail
+            # its checksum on one side only.
+            if "steps" in flow:
+                lines.extend(_step_lines(flow["steps"]))
+    # A version 1 plan's single list, hashed exactly where it always was, so every
+    # already-published plan keeps the checksum it was published with.
+    if "steps" in plan:
+        lines.extend(_step_lines(plan["steps"]))
     return "\n".join(lines)
+
+
+def _step_lines(steps: Sequence[Mapping[str, Any]]) -> list[str]:
+    """One step list's contribution, shared by both plan versions.
+
+    Arguments are sorted by name because JSON object order is not part of the
+    contract: two producers writing the same arguments in a different order have to
+    agree on the digest.
+    """
+    rendered: list[str] = []
+    for step in steps:
+        arguments = step["arguments"]
+        tail = "".join(f"|{key}={arguments[key]}" for key in sorted(arguments))
+        rendered.append(f"step={step['sequence']}|{step['operation']}{tail}")
+    return rendered
 
 
 def compute_compiled_plan_checksum(plan: Mapping[str, Any]) -> str:
@@ -388,15 +426,53 @@ def compute_compiled_plan_checksum(plan: Mapping[str, Any]) -> str:
     return _sha256_prefixed(compiled_plan_checksum_material(plan))
 
 
+def _basic_compiled_plan_schema_for(document: Mapping[str, Any]) -> str:
+    """The JSON Schema URI matching a plan's declared ``schemaVersion``."""
+    declared = document.get("schemaVersion") if isinstance(document, Mapping) else None
+    schema = BASIC_COMPILED_PLAN_SCHEMAS_BY_VERSION.get(declared)  # type: ignore[arg-type]
+    if schema is None:
+        raise ContractValidationError(
+            "basic_compiled_plan.schemaVersion is not a version this build reads: "
+            f"declared {declared!r}, supported "
+            f"{sorted(BASIC_COMPILED_PLAN_SCHEMAS_BY_VERSION)}"
+        )
+    return schema
+
+
+def _every_step_list(document: Mapping[str, Any]) -> list[Sequence[Mapping[str, Any]]]:
+    """Every step list a plan carries, wherever its version puts them.
+
+    A version 1 plan has one list on the plan; a version 2 plan has one per flow,
+    because a Basic strategy is one container per side and each container is its own
+    AND chain of blocks. Both are walked so an unsupported element is reported the
+    same way regardless of which shape it arrived in.
+    """
+    found: list[Sequence[Mapping[str, Any]]] = []
+
+    def collect(candidate: Any) -> None:
+        if isinstance(candidate, Sequence) and not isinstance(candidate, (str, bytes)):
+            found.append(candidate)
+
+    collect(document.get("steps"))
+    snapshot = document.get("executionSnapshot")
+    partitions = snapshot.get("partitions") if isinstance(snapshot, Mapping) else None
+    if isinstance(partitions, Sequence) and not isinstance(partitions, (str, bytes)):
+        for partition in partitions:
+            flows = partition.get("flows") if isinstance(partition, Mapping) else None
+            if isinstance(flows, Sequence) and not isinstance(flows, (str, bytes)):
+                for flow in flows:
+                    if isinstance(flow, Mapping):
+                        collect(flow.get("steps"))
+    return found
+
+
 def _reject_unsupported_operations(document: Mapping[str, Any]) -> None:
     """Separate "cannot run this element" from "this message is malformed"."""
     if not isinstance(document, Mapping):
         return
-    steps = document.get("steps")
-    if not isinstance(steps, Sequence) or isinstance(steps, (str, bytes)):
-        return
     unsupported = [
         step["operation"]
+        for steps in _every_step_list(document)
         for step in steps
         if isinstance(step, Mapping)
         and isinstance(step.get("operation"), str)
@@ -463,6 +539,12 @@ def validate_basic_compiled_plan(document: Mapping[str, Any]) -> dict[str, Any]:
     A step naming an operation outside :data:`SUPPORTED_PLAN_OPERATIONS` raises
     :class:`UnsupportedPlanElement` rather than a generic shape error, so a caller
     can delegate wire-shape checking here and still report ``UNSUPPORTED_ELEMENT``.
+
+    The schema is chosen by the plan's own ``schemaVersion`` (root #202): version 1
+    carries one plan-wide ``steps`` list, version 2 carries one per flow. A version
+    this build does not know is refused rather than validated against the wrong
+    shape, because a plan checked against the wrong schema would fail its checksum
+    for a reason that reads like tampering.
     """
     _require_contract_version(
         document.get("contractVersion") if isinstance(document, Mapping) else None,
@@ -470,7 +552,8 @@ def validate_basic_compiled_plan(document: Mapping[str, Any]) -> dict[str, Any]:
         "basic_compiled_plan",
     )
     _reject_unsupported_operations(document)
-    plan = _validate(document, BASIC_COMPILED_PLAN_SCHEMA, "basic_compiled_plan")
+    schema = _basic_compiled_plan_schema_for(document)
+    plan = _validate(document, schema, "basic_compiled_plan")
     declared = plan["planChecksum"]
     computed = compute_compiled_plan_checksum(plan)
     if declared != computed:

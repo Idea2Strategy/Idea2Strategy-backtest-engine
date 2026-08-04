@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.idea2strategy.io/strategy-bot/v1/basic-compiled-plan-v2.schema.json",
+  "title": "strategy-bot.v1 basic-compiled-plan.v2",
+  "description": "Consumed verbatim from B. One container per trade side: side, allocation and steps belong to each flow, because a Basic strategy is a buy container and a sell container and the blocks inside a container are an AND chain. Version 1 carried a single plan-wide steps list and a single side, so a strategy with both containers could not be published at all (root #202).",
+  "type": "object",
+  "required": [
+    "contractVersion",
+    "schemaVersion",
+    "elementCatalogVersion",
+    "instrumentCatalogVersion",
+    "compilerVersion",
+    "requiredFeatureSetHash",
+    "requiredFeatures",
+    "executionSnapshot",
+    "planChecksum"
+  ],
+  "properties": {
+    "contractVersion": {"const": "strategy-bot.v1"},
+    "schemaVersion": {"const": "basic-compiled-plan.v2"},
+    "elementCatalogVersion": {"$ref": "#/$defs/text"},
+    "instrumentCatalogVersion": {"$ref": "#/$defs/text"},
+    "compilerVersion": {"$ref": "#/$defs/text"},
+    "requiredFeatureSetHash": {"$ref": "#/$defs/sha256"},
+    "requiredFeatures": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/requiredFeature"}
+    },
+    "executionSnapshot": {"$ref": "#/$defs/executionSnapshot"},
+    "planChecksum": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "text": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/nonEmptyString"},
+    "sha256": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/sha256Prefixed"},
+    "uuid": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/uuid"},
+    "requiredFeature": {
+      "type": "object",
+      "description": "Every field enters the plan checksum, so all of them are required; B normalises `instruments` (sorted, unique, non-empty) before hashing.",
+      "required": [
+        "requirementId",
+        "featureId",
+        "featureVersion",
+        "instruments",
+        "resolution",
+        "requiredObservations"
+      ],
+      "properties": {
+        "requirementId": {"$ref": "#/$defs/text"},
+        "featureId": {"$ref": "#/$defs/uuid"},
+        "featureVersion": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+        "instruments": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/uuid"}
+        },
+        "resolution": {"type": "string", "pattern": "^PT?[0-9]"},
+        "requiredObservations": {"type": "integer", "minimum": 1}
+      }
+    },
+    "immutableStrategyVersion": {
+      "type": "object",
+      "required": ["snapshotSchemaVersion", "semanticHash", "snapshotHash"],
+      "properties": {
+        "snapshotSchemaVersion": {"$ref": "#/$defs/text"},
+        "semanticHash": {"$ref": "#/$defs/sha256"},
+        "snapshotHash": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "flow": {
+      "type": "object",
+      "description": "One trade container. Its steps are its own AND chain, and its terminal EMIT_ORDER_CANDIDATE declares the side, which is what lets a buy container and a sell container coexist in one plan.",
+      "required": ["key", "officialInstrumentIds", "steps"],
+      "properties": {
+        "key": {"$ref": "#/$defs/text"},
+        "officialInstrumentIds": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/uuid"}
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/planStep"}
+        }
+      }
+    },
+    "partition": {
+      "type": "object",
+      "required": ["key", "budgetCapBps", "flows"],
+      "properties": {
+        "key": {"$ref": "#/$defs/text"},
+        "budgetCapBps": {"type": "integer", "minimum": 1, "maximum": 10000},
+        "flows": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/flow"}
+        }
+      }
+    },
+    "executionSnapshot": {
+      "type": "object",
+      "required": [
+        "immutableStrategyVersion",
+        "mode",
+        "initialCashAmount",
+        "currency",
+        "partitions"
+      ],
+      "properties": {
+        "immutableStrategyVersion": {"$ref": "#/$defs/immutableStrategyVersion"},
+        "mode": {"const": "BASIC"},
+        "initialCashAmount": {"$ref": "https://contracts.idea2strategy.io/common/v1/primitives.schema.json#/$defs/moneyAmount"},
+        "currency": {"const": "USD"},
+        "partitions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/partition"}
+        }
+      }
+    },
+    "planStep": {
+      "type": "object",
+      "required": ["sequence", "operation", "arguments"],
+      "properties": {
+        "sequence": {"type": "integer", "minimum": 1},
+        "operation": {
+          "enum": ["LOAD_FEATURE", "COMPARE", "EMIT_ORDER_CANDIDATE"]
+        },
+        "arguments": {
+          "type": "object",
+          "additionalProperties": {"type": "string"}
+        }
+      }
+    }
+  }
+}
