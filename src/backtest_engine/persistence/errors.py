@@ -24,6 +24,7 @@ __all__ = [
     "RuntimeDdlForbidden",
     "SchemaDriftError",
     "SchemaWriteForbidden",
+    "StaleAttemptClaim",
 ]
 
 
@@ -45,6 +46,10 @@ class DuplicateWorkerExecution(PersistenceError, RuntimeError):
 
 class AttemptNumberConflict(PersistenceError, RuntimeError):
     """`(run_id, attempt_number)` is already claimed by a different execution key."""
+
+
+class StaleAttemptClaim(PersistenceError, RuntimeError):
+    """An attempt mutation matched no row for the supplied attempt id and claim token."""
 
 
 class InvalidStatusTransition(PersistenceError, ValueError):

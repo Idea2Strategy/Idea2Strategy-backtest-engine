@@ -39,6 +39,7 @@ __all__ = [
     "METADATA",
     "MONEY",
     "OBJECT_STATUS_LABELS",
+    "RUN_LANE_LABELS",
     "RUN_STATUS_LABELS",
     "STORAGE_SCHEMA",
     "WORK_STATUS_LABELS",
@@ -62,7 +63,8 @@ OPERATIONS_SCHEMA = "operations"
 
 #: `backtest.run_status`. The pre-rebuild code used `COMPLETE`, which is not a label
 #: of the canonical enum and would fail at insert time.
-RUN_STATUS_LABELS: tuple[str, ...] = ("QUEUED", "RUNNING", "COMPLETED", "FAILED", "UNAVAILABLE")
+RUN_STATUS_LABELS: tuple[str, ...] = ("QUEUED", "RUNNING", "COMPLETED", "FAILED", "UNAVAILABLE", "CANCELLED")
+RUN_LANE_LABELS: tuple[str, ...] = ("BASIC", "CUSTOM", "COMPETITION")
 
 #: `operations.work_status`, used by `backtest.run_attempts.status`.
 WORK_STATUS_LABELS: tuple[str, ...] = (
@@ -94,6 +96,15 @@ def _run_status() -> ENUM:
     return ENUM(
         *RUN_STATUS_LABELS,
         name="run_status",
+        schema=BACKTEST_SCHEMA,
+        create_type=False,
+    )
+
+
+def _run_lane() -> ENUM:
+    return ENUM(
+        *RUN_LANE_LABELS,
+        name="run_lane",
         schema=BACKTEST_SCHEMA,
         create_type=False,
     )
@@ -140,7 +151,7 @@ runs = Table(
     Column("fee_policy_id", UUID(as_uuid=True), nullable=False),
     Column("slippage_rate_bps", Integer, nullable=False),
     Column("buying_power_buffer_policy_id", UUID(as_uuid=True), nullable=False),
-    Column("idempotency_key", VARCHAR(160), nullable=False, unique=True),
+    Column("idempotency_key", VARCHAR(160), nullable=False),
     Column("queued_at", TIMESTAMP(timezone=True), nullable=False),
     Column("started_at", TIMESTAMP(timezone=True)),
     Column("completed_at", TIMESTAMP(timezone=True)),
@@ -161,6 +172,18 @@ runs = Table(
     # string "null" where it expected absence.
     Column("missing_requirements", JSONB(none_as_null=True)),
     Column("owner_anonymized_at", TIMESTAMP(timezone=True)),
+    Column("lane", _run_lane(), nullable=False),
+    Column("message_id", UUID(as_uuid=True), nullable=False),
+    Column("canonical_payload_hash", VARCHAR(128), nullable=False),
+    Column("aggregate_sequence", BigInteger, nullable=False),
+    Column("execution_policy_version", VARCHAR(80), nullable=False),
+    Column("idempotency_scope", VARCHAR(160), nullable=False),
+    Column("cancellation_requested_at", TIMESTAMP(timezone=True)),
+    Column("cancellation_reason_code", VARCHAR(80)),
+    Column("cancelled_at", TIMESTAMP(timezone=True)),
+    Index("uq_backtest_run_message_id", "message_id", unique=True),
+    Index("uq_backtest_run_idempotency", "lane", "idempotency_scope", "idempotency_key", unique=True),
+    Index("ix_backtest_run_execution_policy", "execution_policy_version", "queued_at"),
     Index("ix_runs_bot_id_queued_at", "bot_id", "queued_at"),
     Index("ix_runs_status_queued_at", "status", "queued_at"),
     Index("ix_runs_owner_account_id_queued_at", "owner_account_id", "queued_at"),
@@ -185,7 +208,16 @@ run_attempts = Table(
     Column("started_at", TIMESTAMP(timezone=True), nullable=False),
     Column("completed_at", TIMESTAMP(timezone=True)),
     Column("failure_code", VARCHAR(80)),
+    Column("claim_token", UUID(as_uuid=True)),
+    Column("worker_id", VARCHAR(160)),
+    Column("claimed_at", TIMESTAMP(timezone=True)),
+    Column("claim_expires_at", TIMESTAMP(timezone=True)),
+    Column("last_heartbeat_at", TIMESTAMP(timezone=True)),
+    Column("previous_attempt_id", UUID(as_uuid=True), ForeignKey("backtest.run_attempts.id")),
+    Column("terminal_reason_code", VARCHAR(80)),
     Index("uq_run_attempts_run_id_attempt_number", "run_id", "attempt_number", unique=True),
+    Index("uq_backtest_run_attempt_claim_token", "claim_token", unique=True),
+    Index("ix_backtest_run_attempt_expiry", "run_id", "claim_expires_at"),
     schema=BACKTEST_SCHEMA,
 )
 

@@ -142,9 +142,11 @@ def test_postgresql_refuses_an_empty_requirement_list(admin_engine: Engine) -> N
                 "status, evaluation_start, evaluation_end, initial_cash_amount, "
                 "market_rules_version, accounting_rules_version, precision_rules_version, "
                 "fee_policy_id, slippage_rate_bps, buying_power_buffer_policy_id, "
-                "idempotency_key, queued_at) VALUES (:id, :bot_id, :owner, :hash, 'QUEUED', "
+                "idempotency_key, queued_at, lane, message_id, canonical_payload_hash, "
+                "aggregate_sequence, execution_policy_version, idempotency_scope) "
+                "VALUES (:id, :bot_id, :owner, :hash, 'QUEUED', "
                 ":start, :end, :cash, :market, :accounting, :precision, :fee, :slip, :buffer, "
-                ":key, :queued_at)"
+                ":key, :queued_at, :lane, :message_id, :payload_hash, 1, :policy, :scope)"
             ),
             {
                 "id": row.id,
@@ -162,6 +164,11 @@ def test_postgresql_refuses_an_empty_requirement_list(admin_engine: Engine) -> N
                 "buffer": row.buying_power_buffer_policy_id,
                 "key": row.idempotency_key,
                 "queued_at": row.queued_at,
+                "lane": row.lane,
+                "message_id": row.message_id,
+                "payload_hash": row.canonical_payload_hash,
+                "policy": row.execution_policy_version,
+                "scope": row.idempotency_scope,
             },
         )
 
@@ -192,9 +199,11 @@ def test_postgresql_refuses_a_requirement_list_of_non_strings(admin_engine: Engi
                 "status, evaluation_start, evaluation_end, initial_cash_amount, "
                 "market_rules_version, accounting_rules_version, precision_rules_version, "
                 "fee_policy_id, slippage_rate_bps, buying_power_buffer_policy_id, "
-                "idempotency_key, queued_at) VALUES (:id, :bot_id, :owner, :hash, 'QUEUED', "
+                "idempotency_key, queued_at, lane, message_id, canonical_payload_hash, "
+                "aggregate_sequence, execution_policy_version, idempotency_scope) "
+                "VALUES (:id, :bot_id, :owner, :hash, 'QUEUED', "
                 ":start, :end, :cash, :market, :accounting, :precision, :fee, :slip, :buffer, "
-                ":key, :queued_at)"
+                ":key, :queued_at, :lane, :message_id, :payload_hash, 1, :policy, :scope)"
             ),
             {
                 "id": row.id,
@@ -212,6 +221,11 @@ def test_postgresql_refuses_a_requirement_list_of_non_strings(admin_engine: Engi
                 "buffer": row.buying_power_buffer_policy_id,
                 "key": row.idempotency_key,
                 "queued_at": row.queued_at,
+                "lane": row.lane,
+                "message_id": row.message_id,
+                "payload_hash": row.canonical_payload_hash,
+                "policy": row.execution_policy_version,
+                "scope": row.idempotency_scope,
             },
         )
 

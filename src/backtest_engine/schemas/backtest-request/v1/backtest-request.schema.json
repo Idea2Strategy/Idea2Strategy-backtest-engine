@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.idea2strategy.io/backtest-request/v1/backtest-request.schema.json",
+  "title": "Backtest request v1",
+  "oneOf": [
+    { "$ref": "#/$defs/custom" },
+    { "$ref": "#/$defs/competition" }
+  ],
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "uuid": { "type": "string", "format": "uuid" },
+    "metadata": {
+      "type": "object",
+      "required": ["contractVersion", "messageType", "messageId", "occurredAt", "correlationId", "idempotencyKey"],
+      "properties": {
+        "contractVersion": { "const": "backtest-request.v1" },
+        "messageType": { "enum": ["CUSTOM_BACKTEST_REQUESTED", "COMPETITION_BACKTEST_REQUESTED"] },
+        "messageId": { "$ref": "#/$defs/uuid" },
+        "occurredAt": { "type": "string", "format": "date-time" },
+        "correlationId": { "$ref": "#/$defs/uuid" },
+        "idempotencyKey": { "$ref": "#/$defs/sha256" }
+      },
+      "additionalProperties": false
+    },
+    "custom": {
+      "type": "object",
+      "required": ["metadata", "requestReason", "requestHash", "botId", "expectedSnapshotHash", "compiledPlanChecksum", "datasetManifestId", "periodStart", "periodEnd", "assumptionsVersion"],
+      "properties": {
+        "metadata": {
+          "allOf": [
+            { "$ref": "#/$defs/metadata" },
+            { "type": "object", "properties": { "messageType": { "const": "CUSTOM_BACKTEST_REQUESTED" } } }
+          ]
+        },
+        "requestReason": { "const": "USER_PERIOD" },
+        "requestHash": { "$ref": "#/$defs/sha256" },
+        "botId": { "$ref": "#/$defs/uuid" },
+        "expectedSnapshotHash": { "$ref": "#/$defs/sha256" },
+        "compiledPlanChecksum": { "$ref": "#/$defs/sha256" },
+        "datasetManifestId": { "$ref": "#/$defs/uuid" },
+        "periodStart": { "type": "string", "format": "date" },
+        "periodEnd": { "type": "string", "format": "date" },
+        "assumptionsVersion": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "competition": {
+      "type": "object",
+      "required": ["metadata", "requestReason", "requestHash", "roomId", "participationId", "botId", "planVersion", "planHash", "expectedSnapshotHash", "compiledPlanChecksum", "assumptionsVersion"],
+      "properties": {
+        "metadata": {
+          "allOf": [
+            { "$ref": "#/$defs/metadata" },
+            { "type": "object", "properties": { "messageType": { "const": "COMPETITION_BACKTEST_REQUESTED" } } }
+          ]
+        },
+        "requestReason": { "const": "COMPETITION_EVALUATION" },
+        "requestHash": { "$ref": "#/$defs/sha256" },
+        "roomId": { "$ref": "#/$defs/uuid" },
+        "participationId": { "$ref": "#/$defs/uuid" },
+        "botId": { "$ref": "#/$defs/uuid" },
+        "planVersion": { "type": "string", "minLength": 1 },
+        "planHash": { "$ref": "#/$defs/sha256" },
+        "expectedSnapshotHash": { "$ref": "#/$defs/sha256" },
+        "compiledPlanChecksum": { "$ref": "#/$defs/sha256" },
+        "assumptionsVersion": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    }
+  }
+}

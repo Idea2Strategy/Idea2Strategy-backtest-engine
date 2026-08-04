@@ -630,9 +630,13 @@ def test_a_retryable_failure_is_redelivered_and_the_api_sees_the_delivery_count(
         "SELECT attempt_number, status FROM backtest.run_attempts WHERE run_id = :id",
         id=run_id,
     )
-    # One message, one attempt row: `worker_execution_key` is UNIQUE, so the
-    # redelivery re-claimed the same row rather than forking the history.
-    assert attempts == [{"attempt_number": 1, "status": "SUCCEEDED"}]
+    # A retry closes the failed lease and creates a fenced successor. Preserving
+    # both rows is what makes the redelivery and its result auditable; mutating the
+    # first attempt back to SUCCEEDED would erase the CPU_LIMIT history.
+    assert attempts == [
+        {"attempt_number": 1, "status": "FAILED"},
+        {"attempt_number": 2, "status": "SUCCEEDED"},
+    ]
     assert stack.visible(stack.dead_letter_queue) == 0
 
 

@@ -24,6 +24,7 @@ from backtest_engine.persistence import (
     MonthlyJudgmentSummaryRow,
     PerformanceSummaryRow,
     RunAttemptRow,
+    RunLane,
     RunRow,
     RunStatus,
     WorkStatus,
@@ -76,6 +77,12 @@ def make_run(
         "buying_power_buffer_policy_id": BUFFER_POLICY_ID,
         "idempotency_key": idempotency_key,
         "queued_at": QUEUED_AT,
+        "lane": RunLane.CUSTOM,
+        "message_id": uuid4(),
+        "canonical_payload_hash": HASH_A,
+        "aggregate_sequence": 1,
+        "execution_policy_version": "test-policy-v1",
+        "idempotency_scope": str(owner_account_id),
     }
     values.update(overrides)
     return RunRow(**values)

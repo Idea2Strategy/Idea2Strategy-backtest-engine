@@ -43,6 +43,7 @@ pytestmark = pytest.mark.docker
 T0 = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
 BODY = b"PAR1-fixture-object-body"
 OTHER_BODY = b"PAR1-a-completely-different-object"
+LEASE = timedelta(minutes=1)
 
 
 @pytest.fixture
@@ -84,15 +85,16 @@ def test_the_first_claim_writes_a_durable_attempt_row(
 ) -> None:
     key = worker_execution_key_for(str(run_id), "OFFICIAL_BACKTEST:first")
 
-    claim = store.claim(key, run_id=str(run_id), owner="worker-a", now=T0)
+    claim = store.claim(key, run_id=str(run_id), owner="worker-a", now=T0, lease_duration=LEASE)
 
     assert claim.acquired is True
     assert claim.attempt_number == 1
-    assert attempt_rows(admin_engine, run_id) == [
+    rows = attempt_rows(admin_engine, run_id)
+    assert rows == [
         {
             "attempt_number": 1,
             "status": "RUNNING",
-            "worker_execution_key": key,
+            "worker_execution_key": f"{key}:1",
             "completed_at": None,
         }
     ]
@@ -109,7 +111,7 @@ def test_only_one_of_many_concurrent_workers_wins_the_durable_cas(
         # A separate store per thread, as separate worker processes would have.
         local = PersistenceExecutionKeyStore(persistence)
         barrier.wait()
-        return local.claim(key, run_id=str(run_id), owner=f"worker-{index}", now=T0).acquired
+        return local.claim(key, run_id=str(run_id), owner=f"worker-{index}", now=T0, lease_duration=LEASE).acquired
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = list(pool.map(claim, range(8)))
@@ -118,48 +120,50 @@ def test_only_one_of_many_concurrent_workers_wins_the_durable_cas(
     assert len(attempt_rows(admin_engine, run_id)) == 1
 
 
-def test_a_second_worker_sees_the_first_as_in_progress(
-    store: PersistenceExecutionKeyStore, run_id: uuid.UUID
-) -> None:
+def test_a_second_worker_sees_the_first_as_in_progress(store: PersistenceExecutionKeyStore, run_id: uuid.UUID) -> None:
     key = worker_execution_key_for(str(run_id), "OFFICIAL_BACKTEST:held")
-    store.claim(key, run_id=str(run_id), owner="worker-a", now=T0)
+    store.claim(key, run_id=str(run_id), owner="worker-a", now=T0, lease_duration=LEASE)
 
-    second = store.claim(key, run_id=str(run_id), owner="worker-b", now=T0)
+    second = store.claim(key, run_id=str(run_id), owner="worker-b", now=T0, lease_duration=LEASE)
 
     assert second.acquired is False
     assert second.existing_status is ExecutionRecordStatus.IN_PROGRESS
     assert second.attempt_number == 1
 
 
-def test_a_released_attempt_is_reclaimable_and_keeps_its_number(
+def test_a_released_attempt_is_closed_and_retry_gets_a_fresh_fence(
     store: PersistenceExecutionKeyStore, run_id: uuid.UUID, admin_engine: Engine
 ) -> None:
-    """`worker_execution_key` is UNIQUE, so a retry re-claims the row it already has.
-
-    The in-memory reference allocates a *new* attempt number on release. It
-    cannot here, and must not: one message has one attempt row forever, and the
-    number identifies the message rather than the delivery.
-    """
+    """A retry never reuses the predecessor's fencing token or attempt row."""
     key = worker_execution_key_for(str(run_id), "OFFICIAL_BACKTEST:retried")
-    first = store.claim(key, run_id=str(run_id), owner="worker-a", now=T0)
+    first = store.claim(key, run_id=str(run_id), owner="worker-a", now=T0, lease_duration=LEASE)
 
-    store.release(key, now=T0 + timedelta(seconds=5))
-    assert attempt_rows(admin_engine, run_id)[0]["status"] == "PENDING"
-    assert store.status(key) is ExecutionRecordStatus.IN_PROGRESS
+    store.release(key, now=T0 + timedelta(seconds=5), claim=first)
+    assert attempt_rows(admin_engine, run_id)[0]["status"] == "FAILED"
+    assert store.status(key) is ExecutionRecordStatus.FAILED
 
     reclaimed = store.claim(
-        key, run_id=str(run_id), owner="worker-b", now=T0 + timedelta(seconds=6)
+        key, run_id=str(run_id), owner="worker-b", now=T0 + timedelta(seconds=6), lease_duration=LEASE
     )
 
     assert first.acquired and reclaimed.acquired
-    assert reclaimed.attempt_number == first.attempt_number == 1
-    assert attempt_rows(admin_engine, run_id) == [
+    assert first.attempt_number == 1
+    assert reclaimed.attempt_number == 2
+    rows = attempt_rows(admin_engine, run_id)
+    assert rows[0]["completed_at"] is not None
+    assert [{**row, "completed_at": None} for row in rows] == [
         {
             "attempt_number": 1,
-            "status": "RUNNING",
-            "worker_execution_key": key,
+            "status": "FAILED",
+            "worker_execution_key": f"{key}:1",
             "completed_at": None,
-        }
+        },
+        {
+            "attempt_number": 2,
+            "status": "RUNNING",
+            "worker_execution_key": f"{key}:2",
+            "completed_at": None,
+        },
     ]
 
 
@@ -167,14 +171,14 @@ def test_only_one_worker_wins_a_release_race(
     persistence: BacktestPersistence, store: PersistenceExecutionKeyStore, run_id: uuid.UUID
 ) -> None:
     key = worker_execution_key_for(str(run_id), "OFFICIAL_BACKTEST:reclaim-race")
-    store.claim(key, run_id=str(run_id), owner="worker-a", now=T0)
-    store.release(key, now=T0)
+    first = store.claim(key, run_id=str(run_id), owner="worker-a", now=T0, lease_duration=LEASE)
+    store.release(key, now=T0, claim=first)
     barrier = Barrier(6)
 
     def reclaim(index: int) -> bool:
         local = PersistenceExecutionKeyStore(persistence)
         barrier.wait()
-        return local.claim(key, run_id=str(run_id), owner=f"worker-{index}", now=T0).acquired
+        return local.claim(key, run_id=str(run_id), owner=f"worker-{index}", now=T0, lease_duration=LEASE).acquired
 
     with ThreadPoolExecutor(max_workers=6) as pool:
         results = list(pool.map(reclaim, range(6)))
@@ -196,33 +200,29 @@ def test_a_finished_key_is_never_reclaimable(
     expected: ExecutionRecordStatus,
 ) -> None:
     key = worker_execution_key_for(str(run_id), f"OFFICIAL_BACKTEST:{finished.value}")
-    store.claim(key, run_id=str(run_id), owner="worker-a", now=T0)
-    store.finish(key, finished, now=T0 + timedelta(seconds=1))
+    claim = store.claim(key, run_id=str(run_id), owner="worker-a", now=T0, lease_duration=LEASE)
+    store.finish(key, finished, now=T0 + timedelta(seconds=1), claim=claim)
 
-    again = store.claim(key, run_id=str(run_id), owner="worker-b", now=T0 + timedelta(seconds=2))
+    again = store.claim(key, run_id=str(run_id), owner="worker-b", now=T0 + timedelta(seconds=2), lease_duration=LEASE)
 
     assert again.acquired is False
     assert again.existing_status is expected
     assert store.status(key) is expected
 
 
-def test_finish_refuses_a_non_terminal_status(
-    store: PersistenceExecutionKeyStore, run_id: uuid.UUID
-) -> None:
+def test_finish_refuses_a_non_terminal_status(store: PersistenceExecutionKeyStore, run_id: uuid.UUID) -> None:
     key = worker_execution_key_for(str(run_id), "OFFICIAL_BACKTEST:in-progress")
-    store.claim(key, run_id=str(run_id), owner="worker-a", now=T0)
+    store.claim(key, run_id=str(run_id), owner="worker-a", now=T0, lease_duration=LEASE)
 
     with pytest.raises(ValueError, match="terminal status"):
         store.finish(key, ExecutionRecordStatus.IN_PROGRESS, now=T0)
 
 
-def test_the_status_of_an_unknown_key_is_none(
-    store: PersistenceExecutionKeyStore, run_id: uuid.UUID
-) -> None:
+def test_the_status_of_an_unknown_key_is_none(store: PersistenceExecutionKeyStore, run_id: uuid.UUID) -> None:
     assert store.status(worker_execution_key_for(str(run_id), "never-claimed")) is None
 
 
-def test_two_different_messages_for_one_run_take_successive_attempt_numbers(
+def test_a_second_message_cannot_fork_a_live_run(
     store: PersistenceExecutionKeyStore, run_id: uuid.UUID, admin_engine: Engine
 ) -> None:
     first = store.claim(
@@ -230,16 +230,19 @@ def test_two_different_messages_for_one_run_take_successive_attempt_numbers(
         run_id=str(run_id),
         owner="worker-a",
         now=T0,
+        lease_duration=LEASE,
     )
     second = store.claim(
         worker_execution_key_for(str(run_id), "message-two"),
         run_id=str(run_id),
         owner="worker-a",
         now=T0,
+        lease_duration=LEASE,
     )
 
-    assert (first.attempt_number, second.attempt_number) == (1, 2)
-    assert [row["attempt_number"] for row in attempt_rows(admin_engine, run_id)] == [1, 2]
+    assert first.acquired is True
+    assert second.acquired is False
+    assert [row["attempt_number"] for row in attempt_rows(admin_engine, run_id)] == [1]
 
 
 # ===========================================================================
@@ -324,9 +327,7 @@ def test_republishing_the_same_object_is_idempotent_not_a_second_row(
     assert count == 1
 
 
-def test_reusing_an_object_id_for_different_bytes_is_refused(
-    persistence: BacktestPersistence, tmp_path: Path
-) -> None:
+def test_reusing_an_object_id_for_different_bytes_is_refused(persistence: BacktestPersistence, tmp_path: Path) -> None:
     """The object id is what a detail manifest points at; it cannot be re-aimed."""
     port = PersistenceStorageObjectWritePort(persistence)
     object_id = uuid.uuid4()

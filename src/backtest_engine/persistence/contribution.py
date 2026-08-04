@@ -32,14 +32,14 @@ __all__ = [
 # backend/db-migration/src/main/java/com/idea2strategy/backend/migration/MigrationOwner.java
 CENTRAL_MIGRATION_OWNERS: tuple[str, ...] = ("backend", "trading", "backtest", "pipeline", "shared")
 
-# Mirrors `DatabaseAccessPolicy.SCHEMA_OWNERS` in the same package. `storage` is
-# registered SHARED there even though the implementation checklist calls it D-owned;
-# that contradiction is unresolved, so this repository authors no `storage` DDL.
+# Mirrors `DatabaseAccessPolicy.SCHEMA_OWNERS` in the same package. Pipeline owns
+# storage DDL while backtest has runtime row-write obligations, so this repository
+# authors no `storage` DDL.
 CENTRAL_SCHEMA_OWNERS: dict[str, str] = {
     "identity": "backend",
     "strategy": "backend",
     "bot": "backend",
-    "storage": "shared",
+    "storage": "pipeline",
     "market_data": "pipeline",
     "trading": "trading",
     "backtest": "backtest",
@@ -51,9 +51,8 @@ CENTRAL_SCHEMA_OWNERS: dict[str, str] = {
 #: Schemas this repository writes rows to but authors no DDL for.
 #:
 #: `storage` only. Spec rule 2 lists it among D's writable schemas and spec 2.5 makes
-#: `storage.objects` registration mandatory, but spec 2.4 forbids D from adding
-#: `storage` DDL while the central ownership registration says SHARED. Row writes and
-#: schema changes are separate permissions and this constant is where they diverge.
+#: `storage.objects` registration mandatory, while Pipeline owns its DDL. Row writes
+#: and schema changes are separate permissions and this constant is where they diverge.
 RUNTIME_ROW_ONLY_SCHEMAS: frozenset[str] = frozenset({"storage"})
 
 _REQUIRED_KEYS = (
@@ -146,7 +145,12 @@ def superproject_root() -> Path | None:
 
 
 def _is_superproject(candidate: Path) -> bool:
-    return (candidate / "db" / "schema.dbml").is_file() and (candidate / "backend").is_dir()
+    try:
+        return (candidate / "db" / "schema.dbml").is_file() and (candidate / "backend").is_dir()
+    except OSError:
+        # Containerized tests may mount the repository below an unreadable home
+        # directory. Such a parent is not a usable superproject candidate.
+        return False
 
 
 def load_contribution(root: Path | None = None) -> MigrationContribution:

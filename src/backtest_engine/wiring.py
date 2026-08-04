@@ -61,7 +61,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import ROUND_FLOOR, Decimal, localcontext
 from typing import Any, Protocol, cast
 
-from sqlalchemy import update
+from sqlalchemy import select
 
 from .api import create_app
 from .attempt_coordinator import (
@@ -142,7 +142,6 @@ from .persistence import (
     MonthlyJudgmentSummaryRow,
     ObjectStatus,
     PerformanceSummaryRow,
-    RunAttemptRow,
     RunPublication,
     StorageObjectRow,
     WorkStatus,
@@ -150,7 +149,7 @@ from .persistence import (
     publish_completed_run,
 )
 from .persistence.errors import InvalidStatusTransition as PersistedInvalidStatusTransition
-from .persistence.errors import PersistenceError, PublishConflict, RowNotFound
+from .persistence.errors import PublishConflict, RowNotFound
 from .persistence.tables import run_attempts as _run_attempts_table
 from .result_query import BacktestResultQueryService, DurableBacktestResultQueryStore
 from .result_snapshot import (
@@ -285,9 +284,7 @@ class BasicPlanReplayFactory:
     runtime: BasicPlanRuntime
     plan: BasicCompiledPlan
 
-    def __call__(
-        self, *, clock: MarketEventClock, assessment: AvailabilityAssessment
-    ) -> PlanReplay:
+    def __call__(self, *, clock: MarketEventClock, assessment: AvailabilityAssessment) -> PlanReplay:
         # Declared as the orchestrator's Protocol rather than the concrete class:
         # the orchestrator is the consumer and this is its contract.
         #
@@ -301,9 +298,7 @@ class BasicPlanReplayFactory:
         # `orchestrator.py` would remove the cast; that module is BT-d's.
         return cast(
             "PlanReplay",
-            BasicPlanReplay(
-                runtime=self.runtime, plan=self.plan, clock=clock, assessment=assessment
-            ),
+            BasicPlanReplay(runtime=self.runtime, plan=self.plan, clock=clock, assessment=assessment),
         )
 
 
@@ -378,8 +373,7 @@ class ExecutionModelEngine:
         order_id = str(
             uuid.uuid5(
                 _ORDER_ID_NAMESPACE,
-                f"{self._run.snapshot_id}|{candidate.evaluation_id}|"
-                f"{candidate.flow_id}|{instrument_id}",
+                f"{self._run.snapshot_id}|{candidate.evaluation_id}|{candidate.flow_id}|{instrument_id}",
             )
         )
         request = OrderRequest(
@@ -388,9 +382,7 @@ class ExecutionModelEngine:
             side=side,
             order_type=OrderType(candidate.order_type),
             quantity=quantity,
-            quantity_mode=(
-                QuantityMode.FRACTIONAL_SHARES if fractional else QuantityMode.WHOLE_SHARES
-            ),
+            quantity_mode=(QuantityMode.FRACTIONAL_SHARES if fractional else QuantityMode.WHOLE_SHARES),
             time_in_force=TimeInForce.DAY,
             submitted_at=candidate.decided_at,
             eligible_at=candidate.eligible_at,
@@ -399,9 +391,7 @@ class ExecutionModelEngine:
         )
         order = self._model.submit(request)
         self._records.append(
-            order_result_record(
-                self._run, order, candidate.decided_at, self._model.cash, self._positions()
-            )
+            order_result_record(self._run, order, candidate.decided_at, self._model.cash, self._positions())
         )
         return order_id if order.status is OrderStatus.ACCEPTED else None
 
@@ -409,9 +399,7 @@ class ExecutionModelEngine:
         bar = self._bar_of(event)
         for expired in self._model.advance_time(bar.starts_at):
             self._records.append(
-                order_result_record(
-                    self._run, expired, bar.starts_at, self._model.cash, self._positions()
-                )
+                order_result_record(self._run, expired, bar.starts_at, self._model.cash, self._positions())
             )
         fills = self._model.process_bar(bar)
         for fill in fills:
@@ -430,9 +418,7 @@ class ExecutionModelEngine:
         return ExecutionSummary(
             cash=self._model.cash,
             fill_count=len(self._model.fills),
-            ledger_entry_count=sum(
-                len(transaction.entries) for transaction in self._model.ledger_transactions
-            ),
+            ledger_entry_count=sum(len(transaction.entries) for transaction in self._model.ledger_transactions),
             positions={
                 instrument_id: self._model.position(instrument_id).quantity
                 for instrument_id in sorted(self._instruments)
@@ -452,8 +438,7 @@ class ExecutionModelEngine:
         allocation = candidate.allocation
         if allocation is None:
             raise WiringError(
-                "a BUY candidate must carry an allocation share; sizing one without "
-                "it would invent a position size"
+                "a BUY candidate must carry an allocation share; sizing one without it would invent a position size"
             )
         budget = apply_rate(
             self._model.buying_power,
@@ -470,9 +455,7 @@ class ExecutionModelEngine:
             reference_price + apply_rate(reference_price, self._policy.slippage_rate, "slippage"),
             "unit_price",
         )
-        unit_cash = quantize_money(
-            unit_price + apply_rate(unit_price, self._policy.fee_rate, "unit_fee"), "unit_cash"
-        )
+        unit_cash = quantize_money(unit_price + apply_rate(unit_price, self._policy.fee_rate, "unit_fee"), "unit_cash")
         if unit_cash <= _ZERO:  # pragma: no cover - reference_price is positive by contract
             raise WiringError("a candidate's reference price must produce a positive unit cost")
         with localcontext() as context:
@@ -508,9 +491,7 @@ class ExecutionModelEngine:
         for instrument_id in sorted(self._instruments):
             snapshot = self._model.position(instrument_id)
             if snapshot.quantity > _ZERO:
-                held.append(
-                    PositionAfter(instrument_id, snapshot.quantity, snapshot.cost_basis)
-                )
+                held.append(PositionAfter(instrument_id, snapshot.quantity, snapshot.cost_basis))
         return tuple(held)
 
 
@@ -616,104 +597,97 @@ class PersistenceExecutionKeyStore:
     because the arbiter is the column's unique index rather than a process-local
     dictionary.
 
-    One deliberate difference from the reference. ``worker_execution_key`` is
-    ``UNIQUE`` across the whole table, so a redelivery of the same message can
-    never become a *second* attempt row -- there is exactly one row per message,
-    forever. ``release`` therefore returns that row to ``PENDING`` instead of
-    allocating a new attempt number, and ``claim`` re-acquires a ``PENDING`` row
-    with a conditional update whose affected row count is the CAS result. The
-    attempt number is stable because it identifies the message, not the delivery.
+    Claims are leased with database time. Every retry gets a fresh attempt row and
+    fencing token; a late heartbeat or completion from an expired worker therefore
+    cannot mutate the successor attempt.
     """
 
     def __init__(self, persistence: BacktestPersistence) -> None:
         self._persistence = persistence
 
     def claim(
-        self, key: str, *, run_id: str, owner: str, now: datetime
+        self,
+        key: str,
+        *,
+        run_id: str,
+        owner: str,
+        now: datetime,
+        lease_duration: timedelta | None = None,
     ) -> ExecutionClaim:
+        if lease_duration is None:
+            raise ValueError("persistent execution claims require a lease duration")
         run_uuid = uuid.UUID(run_id)
         with self._persistence.unit_of_work() as uow:
-            existing = uow.attempts.find_by_execution_key(key)
-            if existing is None:
-                candidate = RunAttemptRow(
-                    id=uuid.uuid5(_ATTEMPT_ID_NAMESPACE, key),
-                    run_id=run_uuid,
-                    attempt_number=uow.attempts.next_attempt_number(run_uuid),
-                    worker_execution_key=key,
-                    status=WorkStatus.RUNNING,
-                    started_at=now,
+            attempt = uow.attempts.claim_fenced(
+                run_uuid,
+                worker_id=owner,
+                execution_key=key,
+                lease_duration=lease_duration,
+            )
+            if attempt is not None:
+                return ExecutionClaim(
+                    acquired=True,
+                    attempt_number=attempt.attempt_number,
+                    attempt_id=str(attempt.id),
+                    claim_token=str(attempt.claim_token),
                 )
-                try:
-                    attempt, created = uow.attempts.claim(candidate)
-                except PersistenceError:
-                    # Another worker took this attempt slot between the count and
-                    # the insert. Leave the message for redelivery rather than
-                    # guessing a free number inside somebody else's race.
-                    return ExecutionClaim(
-                        acquired=False,
-                        attempt_number=candidate.attempt_number,
-                        existing_status=ExecutionRecordStatus.IN_PROGRESS,
-                    )
-                if created:
-                    return ExecutionClaim(acquired=True, attempt_number=attempt.attempt_number)
-                existing = attempt
-
-            if existing.status is WorkStatus.PENDING:
-                reclaimed = uow.connection.execute(
-                    update(_run_attempts_table)
-                    .where(
-                        _run_attempts_table.c.worker_execution_key == key,
-                        _run_attempts_table.c.status == WorkStatus.PENDING.value,
-                    )
-                    .values(
-                        status=WorkStatus.RUNNING.value,
-                        started_at=now,
-                        completed_at=None,
-                        failure_code=None,
-                    )
-                    .returning(_run_attempts_table.c.attempt_number)
-                ).all()
-                if reclaimed:
-                    return ExecutionClaim(
-                        acquired=True, attempt_number=int(reclaimed[0][0])
-                    )
-                existing = uow.attempts.find_by_execution_key(key)
-                if existing is None:  # pragma: no cover - only on a torn write
-                    raise WiringError(f"run attempt {key} vanished during the re-claim")
-
+            existing = uow.attempts.latest_for_run(run_uuid)
             return ExecutionClaim(
                 acquired=False,
-                attempt_number=existing.attempt_number,
-                existing_status=_execution_status(existing.status),
+                attempt_number=0 if existing is None else existing.attempt_number,
+                existing_status=None if existing is None else _execution_status(existing.status),
             )
 
-    def release(self, key: str, *, now: datetime) -> None:
+    @staticmethod
+    def _claim_ids(claim: ExecutionClaim | None) -> tuple[uuid.UUID, uuid.UUID]:
+        if claim is None or claim.attempt_id is None or claim.claim_token is None:
+            raise ValueError("persistent execution mutation requires its fencing claim")
+        return uuid.UUID(claim.attempt_id), uuid.UUID(claim.claim_token)
+
+    def heartbeat(self, key: str, claim: ExecutionClaim, *, lease_duration: timedelta) -> None:
+        attempt_id, claim_token = self._claim_ids(claim)
         with self._persistence.unit_of_work() as uow:
-            uow.connection.execute(
-                update(_run_attempts_table)
-                .where(_run_attempts_table.c.worker_execution_key == key)
-                .values(
-                    status=WorkStatus.PENDING.value,
-                    completed_at=None,
-                    failure_code=None,
-                )
-            )
+            uow.attempts.heartbeat_fenced(attempt_id, claim_token, lease_duration=lease_duration)
 
-    def finish(self, key: str, status: ExecutionRecordStatus, *, now: datetime) -> None:
+    def release(self, key: str, *, now: datetime, claim: ExecutionClaim | None = None) -> None:
+        attempt_id, claim_token = self._claim_ids(claim)
+        with self._persistence.unit_of_work() as uow:
+            uow.attempts.release_fenced(attempt_id, claim_token, terminal_reason_code="RETRY_RELEASED")
+
+    def finish(
+        self,
+        key: str,
+        status: ExecutionRecordStatus,
+        *,
+        now: datetime,
+        claim: ExecutionClaim | None = None,
+    ) -> None:
         if status is ExecutionRecordStatus.IN_PROGRESS:
             raise ValueError("finish requires a terminal status")
-        work_status = (
-            WorkStatus.SUCCEEDED
-            if status is ExecutionRecordStatus.SUCCEEDED
-            else WorkStatus.FAILED
-        )
+        attempt_id, claim_token = self._claim_ids(claim)
+        work_status = WorkStatus.SUCCEEDED if status is ExecutionRecordStatus.SUCCEEDED else WorkStatus.FAILED
         with self._persistence.unit_of_work() as uow:
-            uow.attempts.complete(key, status=work_status, completed_at=now)
+            uow.attempts.close_fenced(
+                attempt_id,
+                claim_token,
+                status=work_status,
+                terminal_reason_code=status.value,
+                failure_code=None if work_status is WorkStatus.SUCCEEDED else "EXECUTION_FAILED",
+            )
 
     def status(self, key: str) -> ExecutionRecordStatus | None:
         with self._persistence.read_only() as uow:
-            attempt = uow.attempts.find_by_execution_key(key)
-        return None if attempt is None else _execution_status(attempt.status)
+            attempt = (
+                uow.connection.execute(
+                    select(_run_attempts_table)
+                    .where(_run_attempts_table.c.worker_execution_key.startswith(f"{key}:", autoescape=True))
+                    .order_by(_run_attempts_table.c.attempt_number.desc())
+                    .limit(1)
+                )
+                .mappings()
+                .first()
+            )
+        return None if attempt is None else _execution_status(WorkStatus(attempt["status"]))
 
 
 def _execution_status(status: WorkStatus) -> ExecutionRecordStatus:
@@ -776,6 +750,8 @@ class JobBinding:
 
     envelope: JobEnvelope
     worker_execution_key: str
+    attempt_id: uuid.UUID | None
+    claim_token: uuid.UUID | None
     manifest: Mapping[str, Any]
     policy: ExecutionPolicy
     plan: BasicCompiledPlan
@@ -875,12 +851,9 @@ class DurableResultPublisher:
     def _publish(self, request: PublishRequest) -> PublishedManifests:
         binding = self._binding
         snapshot = binding.run_snapshot
-        result = ResultSnapshotBuilder().build(
-            snapshot, self._engine.records, request.completed_at
-        )
+        result = ResultSnapshotBuilder().build(snapshot, self._engine.records, request.completed_at)
         ledger = tuple(
-            ReplayLedgerDetail(snapshot.snapshot_id, transaction)
-            for transaction in self._engine.ledger_transactions
+            ReplayLedgerDetail(snapshot.snapshot_id, transaction) for transaction in self._engine.ledger_transactions
         )
         points = tuple(
             PerformancePoint(
@@ -900,9 +873,9 @@ class DurableResultPublisher:
         bundle = DetailObjectBuilder().build(result, ledger, points, request.completed_at)
 
         self._publish_result_object(result, request.completed_at)
-        published = DetailObjectPublisher(
-            self._store, storage_write_port=self._port
-        ).publish(bundle, verified_at=request.completed_at)
+        published = DetailObjectPublisher(self._store, storage_write_port=self._port).publish(
+            bundle, verified_at=request.completed_at
+        )
 
         monthly = MonthlyJudgmentBuilder().build(
             snapshot.snapshot_id,
@@ -955,9 +928,7 @@ class DurableResultPublisher:
     ) -> None:
         binding = self._binding
         performance = result.performance_row()
-        bundle_id = uuid.uuid5(
-            _RESULT_OBJECT_NAMESPACE, f"input-bundle|{binding.run_id}"
-        )
+        bundle_id = uuid.uuid5(_RESULT_OBJECT_NAMESPACE, f"input-bundle|{binding.run_id}")
         with self._persistence.unit_of_work() as uow:
             uow.inputs.lock(
                 InputBundleRow(
@@ -992,11 +963,11 @@ class DurableResultPublisher:
                         result_hash=performance.result_hash,
                         calculated_at=performance.calculated_at,
                     ),
-                    monthly=tuple(
-                        _monthly_judgment(binding.run_id, summary) for summary in monthly
-                    ),
+                    monthly=tuple(_monthly_judgment(binding.run_id, summary) for summary in monthly),
                     detail_manifests=tuple(manifest_rows),
                     worker_execution_key=binding.worker_execution_key,
+                    attempt_id=binding.attempt_id,
+                    claim_token=binding.claim_token,
                 ),
             )
 
@@ -1033,9 +1004,7 @@ def _monthly_judgment(run_id: uuid.UUID, summary: MonthlyJudgmentSummary) -> Mon
     )
 
 
-def _judgment_evaluations(
-    run_snapshot_id: str, evaluations: Sequence[Any]
-) -> tuple[JudgmentEvaluation, ...]:
+def _judgment_evaluations(run_snapshot_id: str, evaluations: Sequence[Any]) -> tuple[JudgmentEvaluation, ...]:
     """Reduce the replay's plan evaluations to the transient monthly inputs.
 
     ``data_gap`` and ``trade_occurred`` are stated, never inferred: a skipped
@@ -1070,19 +1039,13 @@ def _condition_outcomes(evaluation: PlanEvaluation) -> tuple[ConditionOutcome, .
     outcomes: list[ConditionOutcome] = []
     for decision in evaluation.decisions:
         for trace in decision.trace:
-            outcomes.append(
-                ConditionOutcome(f"{decision.instrument_id}|{trace.step_id}", trace.passed)
-            )
+            outcomes.append(ConditionOutcome(f"{decision.instrument_id}|{trace.step_id}", trace.passed))
         if decision.status is BasicDecisionStatus.INPUT_MISSING and not decision.trace:
             # An instrument the plan never received data for produced no step
             # trace at all; without this the month would report "no failures" for
             # an evaluation that never ran. A warm-up shortfall *does* leave a
             # trace entry, and that entry is already the failure.
-            outcomes.append(
-                ConditionOutcome(
-                    f"{decision.instrument_id}|{decision.first_failure_step_id}", False
-                )
-            )
+            outcomes.append(ConditionOutcome(f"{decision.instrument_id}|{decision.first_failure_step_id}", False))
     return tuple(outcomes)
 
 
@@ -1110,9 +1073,7 @@ def dataset_coverage(manifest: Mapping[str, Any]) -> tuple[datetime, datetime]:
     return min(starts), max(ends)
 
 
-def evaluation_window(
-    manifest: Mapping[str, Any], plan: BasicCompiledPlan
-) -> tuple[datetime, datetime]:
+def evaluation_window(manifest: Mapping[str, Any], plan: BasicCompiledPlan) -> tuple[datetime, datetime]:
     """Where warm-up ends and evaluation begins, for this plan on this dataset.
 
     The pinned dataset is the reproducibility boundary, so it -- not a separate
@@ -1302,9 +1263,7 @@ class OrchestratorJobHandler:
             wall_clock=self._wall_clock,
             publication_lag=self._publication_lag,
         )
-        outcome = orchestrator.run(
-            binding.job, coordinator=coordinator, lease=lease, monitor=self._monitor
-        )
+        outcome = orchestrator.run(binding.job, coordinator=coordinator, lease=lease, monitor=self._monitor)
         self.last_outcome = outcome
         return self._report(binding, outcome, coordinator, context)
 
@@ -1373,6 +1332,8 @@ class OrchestratorJobHandler:
         return JobBinding(
             envelope=envelope,
             worker_execution_key=context.worker_execution_key,
+            attempt_id=(uuid.UUID(context.attempt_id) if context.attempt_id is not None else None),
+            claim_token=(uuid.UUID(context.claim_token) if context.claim_token is not None else None),
             manifest=manifest,
             policy=policy,
             plan=plan,
@@ -1394,9 +1355,7 @@ class OrchestratorJobHandler:
         envelope = binding.envelope
         if outcome.status is ReplayStatus.COMPLETED:
             if outcome.result_hash is None or outcome.result_manifest_id is None:
-                raise WiringError(
-                    "a COMPLETED outcome must carry the manifests it published"
-                )
+                raise WiringError("a COMPLETED outcome must carry the manifests it published")
             self._publish(
                 envelope,
                 binding.correlation_id,
@@ -1585,8 +1544,7 @@ def build_api_runtime(environ: Mapping[str, str]) -> ApiRuntime:
     object_store = resolved["BACKTEST_OBJECT_STORE"]
     if not isinstance(object_store, ObjectStore):
         raise WiringError(
-            "BACKTEST_OBJECT_STORE must produce an object_store.ObjectStore, got "
-            f"{type(object_store).__name__}"
+            f"BACKTEST_OBJECT_STORE must produce an object_store.ObjectStore, got {type(object_store).__name__}"
         )
 
     persistence = BacktestPersistence(create_backtest_engine(environ["BACKTEST_DATABASE_URL"]))

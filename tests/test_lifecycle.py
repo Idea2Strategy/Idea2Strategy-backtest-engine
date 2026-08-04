@@ -41,7 +41,7 @@ from backtest_engine.lifecycle import (
     StaticOwnerDirectory,
     run_id_for,
 )
-from backtest_engine.persistence.rows import RunStatus
+from backtest_engine.persistence.rows import RunLane, RunStatus
 
 
 FIXTURES = Path(__file__).parent / "fixtures/contracts/strategy-bot/v1"
@@ -71,9 +71,7 @@ def _locate_backend_contracts() -> Path | None:
     if override:
         candidate = Path(override)
         return candidate if candidate.is_dir() else None
-    suffix = Path(
-        "backend/modules/backend-messaging/src/main/resources/contracts/strategy-bot/v1"
-    )
+    suffix = Path("backend/modules/backend-messaging/src/main/resources/contracts/strategy-bot/v1")
     for ancestor in Path(__file__).resolve().parents:
         for candidate in (ancestor / suffix, ancestor / "Idea2Strategy" / suffix):
             if candidate.is_dir():
@@ -165,6 +163,36 @@ def test_accept_creates_a_queued_run_and_publishes_one_job(
     assert accepted.run.status is RunStatus.QUEUED
     assert accepted.run.run.owner_account_id == OWNER_ID
     assert len(service.queue.messages) == 1  # type: ignore[attr-defined]
+
+
+def test_official_acceptance_records_the_basic_lane_envelope_identity(
+    service: BacktestLifecycleService, official_request: dict[str, Any]
+) -> None:
+    accepted = service.accept(official_request)
+    row = accepted.run.run
+
+    assert row.lane is RunLane.BASIC
+    assert row.message_id == UUID(official_request["metadata"]["messageId"])
+    assert row.canonical_payload_hash is not None
+    assert len(row.canonical_payload_hash) == 64
+    assert row.aggregate_sequence == 1
+    assert row.execution_policy_version == POLICY_2026Q3.version
+    assert row.idempotency_scope == official_request["botId"]
+
+
+def test_official_acceptance_uses_the_run_identity_registered_by_the_producer(
+    service: BacktestLifecycleService, official_request: dict[str, Any]
+) -> None:
+    registered_run_id = UUID("00000000-0000-4000-8000-000000000299")
+    official_request["runId"] = str(registered_run_id)
+    official_request["lane"] = "BASIC"
+    official_request["aggregateSequence"] = 1
+    official_request["executionPolicyVersion"] = POLICY_2026Q3.version
+
+    accepted = service.accept(official_request)
+
+    assert accepted.run.backtest_run_id == registered_run_id
+    assert service.queue.messages[0]["backtestRunId"] == str(registered_run_id)  # type: ignore[attr-defined]
 
 
 def test_the_published_job_carries_the_identity_the_worker_needs(
@@ -340,9 +368,7 @@ def test_the_same_key_with_different_content_is_a_conflict(
         service.ingest_result(forged)
 
 
-def test_a_terminal_run_cannot_be_reopened(
-    service: BacktestLifecycleService, official_request: dict[str, Any]
-) -> None:
+def test_a_terminal_run_cannot_be_reopened(service: BacktestLifecycleService, official_request: dict[str, Any]) -> None:
     service.accept(official_request)
     service.ingest_result(_event(service, "RUNNING", startedAt="2026-07-31T12:05:00Z", attempt=1))
     service.ingest_result(
@@ -357,9 +383,7 @@ def test_a_terminal_run_cannot_be_reopened(
     )
 
     with pytest.raises(InvalidStatusTransition):
-        service.ingest_result(
-            _event(service, "RUNNING", startedAt="2026-08-01T09:00:00Z", attempt=2)
-        )
+        service.ingest_result(_event(service, "RUNNING", startedAt="2026-08-01T09:00:00Z", attempt=2))
 
 
 def test_unavailable_records_the_reason_code(
