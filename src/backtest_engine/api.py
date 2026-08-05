@@ -298,16 +298,40 @@ def _input_model_payload(view: InputModelView, overview: BacktestOverview) -> di
     The model versions stay `null` in that case rather than being filled with a
     plausible-looking default.
     """
+    market_bars = tuple(item for item in view.datasets if item.purpose_code == "MARKET_BARS")
+    if len(market_bars) != 1:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="canonical input bundle must contain exactly one MARKET_BARS dataset",
+        )
+    primary = market_bars[0]
     return {
         "backtestRunId": view.run_id,
         "botId": view.bot_id,
         "status": overview.status,
         "strategySnapshotHash": view.strategy_snapshot_hash,
         "compiledPlanChecksum": view.compiled_plan_checksum,
-        "datasetManifestId": view.dataset_manifest_id,
-        "datasetHash": view.dataset_hash,
+        # Kept for client compatibility; both values are projections of the one
+        # canonical MARKET_BARS child, never duplicate pin-row columns.
+        "datasetManifestId": primary.dataset_manifest_id,
+        "datasetHash": primary.locked_dataset_hash,
+        "datasets": [
+            {
+                "datasetManifestId": item.dataset_manifest_id,
+                "purposeCode": item.purpose_code,
+                "lockedDatasetHash": item.locked_dataset_hash,
+            }
+            for item in view.datasets
+        ],
+        "featureMaterializations": [
+            {
+                "featureMaterializationId": item.feature_materialization_id,
+                "lockedResultHash": item.locked_result_hash,
+            }
+            for item in view.feature_materializations
+        ],
         "inputBundleFingerprint": view.input_bundle_fingerprint,
-        "featureMaterializationVersion": view.feature_materialization_version,
+        "inputContractVersion": view.input_contract_version,
         "executionPolicyVersion": view.execution_policy_version,
         "precisionRulesVersion": view.precision_rules_version,
         "calculationModelVersion": view.calculation_model_version,
@@ -359,6 +383,8 @@ def create_app(
     lifecycle: BacktestLifecycleService,
     authenticator: Authenticator,
     results: BacktestResultQueryService | None = None,
+    *,
+    allow_test_provider_creation: bool = False,
 ) -> FastAPI:
     """Build the `/api/v1` application.
 
@@ -398,12 +424,21 @@ def create_app(
         response: Response,
         principal: Principal = Auth,
     ) -> dict[str, Any]:
-        """Accept B's `OFFICIAL_BACKTEST_REQUESTED`.
+        """Test-only compatibility path for B's `OFFICIAL_BACKTEST_REQUESTED`.
 
         The body is `{"request": <strategy-bot.v1 message>, "compiledPlan": <plan>}`.
-        The plan is optional: when omitted it is resolved through the configured
+        Production always returns 405 because Backend owns Run creation. In explicitly
+        enabled test fixtures the plan is optional: when omitted it is resolved through the configured
         `CompiledPlanSource`, and the request is rejected if neither supplies it.
         """
+        if not allow_test_provider_creation:
+            raise HTTPException(
+                status_code=status.HTTP_405_METHOD_NOT_ALLOWED,
+                detail=(
+                    "Run identity and immutable input pins are created by the Backend "
+                    "provider transaction; the Backtest API is consumer-only"
+                ),
+            )
         request_document = body.get("request", body)
         compiled_plan = body.get("compiledPlan")
         try:

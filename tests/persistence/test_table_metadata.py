@@ -51,12 +51,15 @@ CENTRAL_BASELINE = CENTRAL_MIGRATIONS / "V1__initial_schema.sql.fixture"
 #: like an invention. `tests/conftest.py` applies exactly these files to the
 #: container after the bundle, so the two halves cannot drift apart.
 #:
-#: Two kinds of contribution are folded in, because this repository has one of each:
-#: `V20260802094500__backtest_run_input_pins` adds a whole table (parsed by
+#: Two kinds of schema delta are folded in:
+#: the pending provider-owned `V20260805130000__backtest_run_input_pins` fixture adds a
+#: whole table (parsed by
 #: `_parse_baseline`, like any `CREATE TABLE`), and
 #: `V20260802143000__backtest_run_outcome_detail` adds columns to an applied table
 #: (folded in by `_apply_contributions`).
 CONTRIBUTED_MIGRATIONS = CONTRIBUTION_ROOT / "migrations"
+PENDING_ROOT_MIGRATIONS = CONTRIBUTION_ROOT / "fixtures" / "pending-root"
+SUPERSEDED_PIN_MIGRATION = "V20260802094500__backtest_run_input_pins.sql"
 
 EXPECTED_TABLES = {
     "backtest.runs",
@@ -179,9 +182,13 @@ def _parse_baseline(sql: str) -> dict[str, _DdlTable]:
 
 
 def contributed_migration_files() -> list[Path]:
-    """This repository's contributed migrations, in filename (= timestamp) order."""
+    """Active consumer contribution plus pending provider schema target."""
 
-    return sorted(CONTRIBUTED_MIGRATIONS.glob("V*.sql"))
+    active = [path for path in CONTRIBUTED_MIGRATIONS.glob("V*.sql") if path.name != SUPERSEDED_PIN_MIGRATION]
+    return sorted(
+        [*active, *PENDING_ROOT_MIGRATIONS.glob("V*.sql.fixture")],
+        key=lambda path: int(path.name.split("__", 1)[0].removeprefix("V")),
+    )
 
 
 def central_migration_files() -> list[Path]:
@@ -344,8 +351,8 @@ ALL_TABLES = [
 ]
 
 
-def test_both_contributed_migrations_are_present_in_timestamp_order() -> None:
-    """Both contributions exist and apply in the order the central assembler uses.
+def test_active_schema_deltas_are_present_in_timestamp_order() -> None:
+    """Provider target and outcome contribution apply in canonical timestamp order.
 
     Named explicitly rather than counted: the two migrations were authored on
     separate branches, and the failure mode a merge introduces is that one of them
@@ -354,9 +361,16 @@ def test_both_contributed_migrations_are_present_in_timestamp_order() -> None:
     """
 
     assert [path.name for path in contributed_migration_files()] == [
-        "V20260802094500__backtest_run_input_pins.sql",
         "V20260802143000__backtest_run_outcome_detail.sql",
+        "V20260805130000__backtest_run_input_pins.sql.fixture",
     ]
+
+
+def test_legacy_consumer_owned_pin_migration_is_preserved_but_superseded() -> None:
+    legacy = CONTRIBUTED_MIGRATIONS / SUPERSEDED_PIN_MIGRATION
+
+    assert legacy.is_file()
+    assert legacy not in contributed_migration_files()
 
 
 def test_the_contributed_migration_is_the_only_new_backtest_table() -> None:

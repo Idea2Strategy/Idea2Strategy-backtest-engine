@@ -7,9 +7,8 @@ never touches Docker.
 The container is migrated with the **canonical** SQL: the vendored byte-for-byte copy
 of the applied central Flyway bundle under
 `db/migration-contributions/fixtures/central-migration/`, followed by this
-repository's own contributed migrations from
-`db/migration-contributions/migrations/`, in exactly the order the central assembler
-applies them. No DDL is hand-written in the suite, so a persistence layer that
+repository's active outcome contribution and the pending provider-owned pin fixture,
+in exact Flyway version order. No DDL is hand-written in the suite, so a persistence layer that
 disagrees with the canonical schema fails here rather than in production.
 
 The LocalStack fixtures (`localstack`, `sqs`, `s3`, `queues`, `bucket`) live here
@@ -40,6 +39,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CONTRIBUTION_ROOT = REPO_ROOT / "db" / "migration-contributions"
 VENDORED_MIGRATIONS = CONTRIBUTION_ROOT / "fixtures" / "central-migration"
 CONTRIBUTED_MIGRATIONS = CONTRIBUTION_ROOT / "migrations"
+PENDING_ROOT_MIGRATIONS = CONTRIBUTION_ROOT / "fixtures" / "pending-root"
+SUPERSEDED_PIN_MIGRATION = "V20260802094500__backtest_run_input_pins.sql"
 VENDORED_DIGESTS = CONTRIBUTION_ROOT / "fixtures" / "central-migration.sha256"
 REFERENCE_SEED = CONTRIBUTION_ROOT / "fixtures" / "backtest_reference_seed.sql.fixture"
 
@@ -125,7 +126,7 @@ def postgres_url() -> Iterator[str]:
 
 
 def contributed_migration_files() -> list[Path]:
-    """This repository's own contributions, in filename (= timestamp) order.
+    """Active outcome contribution plus provider-owned pending target fixture.
 
     They are not part of the vendored central bundle: the bundle is a byte-for-byte
     copy of what has *already been applied* centrally, and a contribution has by
@@ -134,14 +135,24 @@ def contributed_migration_files() -> list[Path]:
     actually asking for. Without this step a contributed column would be invisible
     to every integration test and the contribution would be untested SQL.
 
-    Filename order is timestamp order, which is what makes two independently
-    contributed migrations -- `V20260802094500__backtest_run_input_pins` and
-    `V20260802143000__backtest_run_outcome_detail` -- apply in the same sequence
-    here as centrally.
+    The historical consumer-owned input-pin migration remains on disk for audit but
+    is deliberately excluded: current code consumes the normalized provider bundle.
     """
 
-    files = [path for path in CONTRIBUTED_MIGRATIONS.glob("V*.sql") if path.is_file()]
-    return sorted(files, key=lambda path: path.name)
+    files = [
+        path
+        for path in CONTRIBUTED_MIGRATIONS.glob("V*.sql")
+        if path.is_file() and path.name != SUPERSEDED_PIN_MIGRATION
+    ]
+    files.extend(PENDING_ROOT_MIGRATIONS.glob("V*.sql.fixture"))
+
+    def order(path: Path) -> int:
+        match = _VERSION.match(path.name)
+        if match is None:
+            raise AssertionError(f"unversioned migration file: {path.name}")
+        return int(match.group("version"))
+
+    return sorted(files, key=order)
 
 
 def _apply_canonical_migrations(url: str) -> None:

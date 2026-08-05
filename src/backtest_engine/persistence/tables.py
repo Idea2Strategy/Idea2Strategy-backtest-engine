@@ -221,11 +221,9 @@ run_attempts = Table(
     schema=BACKTEST_SCHEMA,
 )
 
-#: Contributed by this repository, not by the applied baseline:
-#: `db/migration-contributions/migrations/V20260802094500__backtest_run_input_pins.sql`
-#: plus the change request beside it. `input_bundle_fingerprint` is independent from the bot
-#: launch `runs.configuration_hash`. Written once, in the acceptance
-#: transaction, so the route answers at `QUEUED` and `UNAVAILABLE` too.
+#: Provider-owned normalized acceptance evidence. The Backend writes this row,
+#: `input_bundles`, every dataset/feature child and the Outbox event atomically.
+#: Backtest only verifies and consumes it.
 run_input_pins = Table(
     "run_input_pins",
     METADATA,
@@ -235,14 +233,17 @@ run_input_pins = Table(
         ForeignKey(runs.c.id, deferrable=True, initially="IMMEDIATE"),
         primary_key=True,
     ),
+    Column(
+        "input_bundle_id",
+        UUID(as_uuid=True),
+        ForeignKey("backtest.input_bundles.id", deferrable=True, initially="IMMEDIATE"),
+        nullable=False,
+        unique=True,
+    ),
     Column("input_bundle_fingerprint", VARCHAR(128), nullable=False),
+    Column("input_contract_version", VARCHAR(80), nullable=False),
     Column("compiled_plan_checksum", VARCHAR(128), nullable=False),
     Column("strategy_snapshot_hash", VARCHAR(128), nullable=False),
-    # `market_data.dataset_manifests.id`: read-only upstream reference, declared in the
-    # migration exactly as `input_datasets.dataset_manifest_id` is.
-    Column("dataset_manifest_id", UUID(as_uuid=True), nullable=False),
-    Column("dataset_hash", VARCHAR(128), nullable=False),
-    Column("feature_materialization_version", VARCHAR(80), nullable=False),
     Column("execution_policy_version", VARCHAR(80), nullable=False),
     Column("pinned_at", TIMESTAMP(timezone=True), nullable=False),
     schema=BACKTEST_SCHEMA,

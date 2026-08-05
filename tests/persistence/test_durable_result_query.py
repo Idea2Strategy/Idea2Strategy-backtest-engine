@@ -20,6 +20,7 @@ which is storage-adapter agnostic by construction.
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -89,6 +90,7 @@ NOVEMBER_RECORD_ID = "00000000-0000-4000-8000-0000000041a7"
 COMPLETED_AT = datetime(2025, 11, 2, 4, 10, tzinfo=UTC)
 COMPILED_PLAN_CHECKSUM = "sha256:" + "b" * 64
 STRATEGY_SNAPSHOT_HASH = "sha256:" + "e" * 64
+PIN_FINGERPRINT = "sha256:" + HASH_A
 
 
 def _instant(value: str) -> datetime:
@@ -178,6 +180,7 @@ class Published:
         self.result: Any = None
         self.details: Any = None
         self.monthly: Any = None
+        self.bundle: Any = None
 
     def accept(self, *, queued_at: datetime | None = None) -> None:
         overrides: dict[str, Any] = {} if queued_at is None else {"queued_at": queued_at}
@@ -186,20 +189,31 @@ class Published:
             idempotency_key=f"OFFICIAL_BACKTEST:{self.run_id}",
             **overrides,
         )
+        self.bundle = replace(make_input_bundle(self.run_id), bundle_hash=PIN_FINGERPRINT)
         with self.persistence.unit_of_work() as uow:
             uow.runs.accept(run)
+            uow.inputs.lock(
+                self.bundle,
+                datasets=(
+                    InputDatasetRow(
+                        input_bundle_id=self.bundle.id,
+                        dataset_manifest_id=DATASET_MANIFEST_ID,
+                        purpose_code="MARKET_BARS",
+                        locked_dataset_hash=HASH_A,
+                    ),
+                ),
+            )
             uow.pins.pin(self.pins())
 
     def pins(self) -> RunInputPinRow:
         return RunInputPinRow(
             run_id=self.run_id,
-            input_bundle_fingerprint=HASH_A,
+            input_bundle_id=self.bundle.id,
+            input_bundle_fingerprint=PIN_FINGERPRINT,
+            input_contract_version="backtest-request.v1",
             compiled_plan_checksum=COMPILED_PLAN_CHECKSUM,
             strategy_snapshot_hash=STRATEGY_SNAPSHOT_HASH,
-            dataset_manifest_id=DATASET_MANIFEST_ID,
-            dataset_hash=HASH_A,
-            feature_materialization_version="market-bars-v2",
-            execution_policy_version="official-backtest-policy-v2",
+            execution_policy_version="test-policy-v1",
             pinned_at=datetime(2025, 10, 31, 12, 0, tzinfo=UTC),
         )
 
@@ -233,7 +247,7 @@ class Published:
         )
 
         performance = self.result.performance_row()
-        bundle = make_input_bundle(self.run_id)
+        bundle = self.bundle
         with self.persistence.unit_of_work() as uow:
             uow.runs.mark_running(self.run_id, datetime(2025, 11, 2, 4, 0, tzinfo=UTC))
             uow.inputs.lock(
@@ -242,7 +256,7 @@ class Published:
                     InputDatasetRow(
                         input_bundle_id=bundle.id,
                         dataset_manifest_id=DATASET_MANIFEST_ID,
-                        purpose_code="MARKET_INPUT",
+                        purpose_code="MARKET_BARS",
                         locked_dataset_hash=HASH_A,
                     ),
                 ),
@@ -333,11 +347,11 @@ def test_a_published_run_is_readable_back_from_rows_and_objects_alone(
     inputs = service.inputs_and_models(owner, run_id)
     assert inputs.compiled_plan_checksum == COMPILED_PLAN_CHECKSUM
     assert inputs.strategy_snapshot_hash == STRATEGY_SNAPSHOT_HASH
-    assert inputs.dataset_manifest_id == str(DATASET_MANIFEST_ID)
-    assert inputs.dataset_hash == HASH_A
-    assert inputs.input_bundle_fingerprint == HASH_A
-    assert inputs.feature_materialization_version == "market-bars-v2"
-    assert inputs.execution_policy_version == "official-backtest-policy-v2"
+    assert inputs.datasets[0].dataset_manifest_id == str(DATASET_MANIFEST_ID)
+    assert inputs.datasets[0].locked_dataset_hash == HASH_A
+    assert inputs.input_bundle_fingerprint == PIN_FINGERPRINT
+    assert inputs.input_contract_version == "backtest-request.v1"
+    assert inputs.execution_policy_version == "test-policy-v1"
     assert inputs.precision_rules_version == "precision:1.0.0"
     assert inputs.calculation_model_version == "calculation-v9"
     assert inputs.cost_model_version == "cost-v3"

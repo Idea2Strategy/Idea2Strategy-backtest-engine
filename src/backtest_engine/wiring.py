@@ -786,6 +786,7 @@ class JobEnvelope:
     bot_id: uuid.UUID
     owner_account_id: uuid.UUID
     idempotency_key: str
+    input_bundle_id: uuid.UUID
     input_bundle_fingerprint: str
     execution_policy_version: str
     compiled_plan_checksum: str
@@ -794,7 +795,6 @@ class JobEnvelope:
     expected_snapshot_hash: str
     datasets: tuple[DatasetPin, ...]
     feature_materializations: tuple[FeatureMaterializationPin, ...]
-    feature_materialization_version: str
     evaluation_period_id: uuid.UUID | None
     input_set_hash: str | None
 
@@ -843,6 +843,7 @@ class JobEnvelope:
                 bot_id=uuid.UUID(str(job["botId"])),
                 owner_account_id=uuid.UUID(str(job["ownerAccountId"])),
                 idempotency_key=str(job["idempotencyKey"]),
+                input_bundle_id=uuid.UUID(str(job["inputBundleId"])),
                 input_bundle_fingerprint=_pinned_hash(job["inputBundleFingerprint"]),
                 execution_policy_version=str(job["executionPolicyVersion"]),
                 compiled_plan_checksum=_pinned_hash(job["compiledPlanChecksum"]),
@@ -855,9 +856,6 @@ class JobEnvelope:
                 expected_snapshot_hash=_pinned_hash(job["expectedSnapshotHash"]),
                 datasets=datasets,
                 feature_materializations=features,
-                feature_materialization_version=str(
-                    job.get("featureMaterializationVersion", "legacy-unspecified")
-                ),
                 evaluation_period_id=(
                     uuid.UUID(str(job["evaluationPeriodId"]))
                     if job.get("evaluationPeriodId") is not None
@@ -1062,7 +1060,7 @@ class DurableResultPublisher:
     ) -> None:
         binding = self._binding
         performance = result.performance_row()
-        bundle_id = uuid.uuid5(_RESULT_OBJECT_NAMESPACE, f"input-bundle|{binding.run_id}")
+        bundle_id = binding.envelope.input_bundle_id
         with self._persistence.unit_of_work() as uow:
             uow.inputs.lock(
                 InputBundleRow(
