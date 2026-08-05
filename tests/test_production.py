@@ -16,10 +16,12 @@ from backtest_engine.backtest_request_intake import RequestLane
 from backtest_engine.production import (
     ConfigurationError,
     PostgresCompiledPlanSource,
+    PostgresFeatureMaterializationSource,
     PostgresOwnerDirectory,
     PostgresQueuedRunSource,
     PostgresSessionAuthenticator,
     S3ParquetMarketDataReader,
+    S3VersionedFeatureObjectReader,
     SqsExecutionJobQueue,
     load_execution_policy_catalog,
 )
@@ -77,6 +79,78 @@ def test_compiled_plan_source_returns_the_immutable_launch_contract_document() -
     source = PostgresCompiledPlanSource(_Engine({"plan_document": plan}))  # type: ignore[arg-type]
 
     assert source.by_checksum(plan["planChecksum"]) == plan
+
+
+def test_feature_materialization_source_returns_definition_manifest_and_object_evidence() -> None:
+    materialization_id = UUID("10000000-0000-4000-8000-000000000001")
+    objects = [{"object_key": "features/rsi.parquet", "provider_version_id": "v1"}]
+    source = PostgresFeatureMaterializationSource(
+        _Engine(
+            {
+                "id": materialization_id,
+                "status": "SUCCEEDED",
+                "feature_definition_id": UUID("0f1b0000-0000-4000-8000-000000000001"),
+                "objects": objects,
+            }
+        )  # type: ignore[arg-type]
+    )
+
+    resolved = source.by_id(materialization_id)
+
+    assert resolved is not None
+    assert resolved["objects"] == tuple(objects)
+    assert source._engine.connection.params == {"materialization_id": materialization_id}  # type: ignore[attr-defined]
+
+
+def test_feature_object_reader_requests_the_exact_s3_version_and_closes_the_body() -> None:
+    class Body:
+        closed = False
+
+        def read(self) -> bytes:
+            return b"versioned-feature-bytes"
+
+        def close(self) -> None:
+            self.closed = True
+
+    class S3:
+        kwargs: dict[str, str] | None = None
+        body = Body()
+
+        def get_object(self, **kwargs: str) -> dict[str, object]:
+            self.kwargs = kwargs
+            return {"Body": self.body}
+
+    s3 = S3()
+    reader = S3VersionedFeatureObjectReader(s3)
+
+    body = reader.read_version(
+        "S3_COMPATIBLE", "feature-bucket", "features/rsi.parquet", "version-7"
+    )
+
+    assert body == b"versioned-feature-bytes"
+    assert s3.kwargs == {
+        "Bucket": "feature-bucket",
+        "Key": "features/rsi.parquet",
+        "VersionId": "version-7",
+    }
+    assert s3.body.closed
+
+
+@pytest.mark.docker
+def test_feature_materialization_projection_executes_against_postgresql_16(
+    runtime_engine,
+) -> None:
+    source = PostgresFeatureMaterializationSource(runtime_engine)
+
+    resolved = source.by_id(UUID("00000000-0000-4000-8000-0000000000e1"))
+
+    assert resolved is not None
+    assert resolved["status"] == "SUCCEEDED"
+    assert resolved["feature_definition_id"] == UUID(
+        "00000000-0000-4000-8000-000000000095"
+    )
+    assert resolved["output_dataset_status"] == "AVAILABLE"
+    assert resolved["objects"] == ()
 
 
 def test_session_authenticator_accepts_valid_customer_and_separate_worker_token() -> None:

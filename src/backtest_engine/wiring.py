@@ -89,6 +89,7 @@ from .detail_object_manifest import (
     PerformancePoint,
     ReplayLedgerDetail,
 )
+from .elements import PinnedFeatureSeries
 from .event_clock import MarketDataEvent, MarketEventClock
 from .execution_model import (
     BacktestExecutionModel,
@@ -104,6 +105,11 @@ from .execution_model import (
     TimeInForce,
 )
 from .execution_policy import BASIS_POINTS, ExecutionPolicy, ExecutionPolicyCatalog, ExecutionPolicyUnavailable
+from .feature_outputs import (
+    FeatureObjectReader,
+    FeatureOutputBindingError,
+    resolve_feature_materialization_pins,
+)
 from .lifecycle import BacktestLifecycleService, PersistenceRunGateway, SqsBacktestJobQueue
 from .money import PRECISION_RULES_VERSION, QUANTITY_QUANTUM, apply_rate, quantize_money, quantize_quantity
 from .monthly_judgment import (
@@ -292,6 +298,8 @@ class BasicPlanReplayFactory:
 
     runtime: BasicPlanRuntime
     plan: BasicCompiledPlan
+    feature_series: tuple[PinnedFeatureSeries, ...] = ()
+    require_pinned_features: bool = False
 
     def __call__(self, *, clock: MarketEventClock, assessment: AvailabilityAssessment) -> PlanReplay:
         # Declared as the orchestrator's Protocol rather than the concrete class:
@@ -307,7 +315,14 @@ class BasicPlanReplayFactory:
         # `orchestrator.py` would remove the cast; that module is BT-d's.
         return cast(
             "PlanReplay",
-            BasicPlanReplay(runtime=self.runtime, plan=self.plan, clock=clock, assessment=assessment),
+            BasicPlanReplay(
+                runtime=self.runtime,
+                plan=self.plan,
+                clock=clock,
+                assessment=assessment,
+                feature_series=self.feature_series,
+                require_pinned_features=self.require_pinned_features,
+            ),
         )
 
 
@@ -876,6 +891,7 @@ class JobBinding:
     job: BacktestJob
     correlation_id: str
     manifests: tuple[tuple[DatasetPin, Mapping[str, Any]], ...]
+    feature_series: tuple[PinnedFeatureSeries, ...] = ()
 
     @property
     def run_id(self) -> uuid.UUID:
@@ -1282,6 +1298,7 @@ class OrchestratorJobHandler:
         plans: Any,
         manifests: Any,
         feature_materializations: Any | None = None,
+        feature_object_reader: FeatureObjectReader | None = None,
         reader: Any,
         calendar: SessionCalendar,
         object_store: ObjectStore,
@@ -1308,6 +1325,7 @@ class OrchestratorJobHandler:
         self._plans = plans
         self._manifests = manifests
         self._feature_materializations = feature_materializations
+        self._feature_object_reader = feature_object_reader
         self._reader = reader
         self._calendar = calendar
         self._store = object_store
@@ -1386,7 +1404,12 @@ class OrchestratorJobHandler:
         orchestrator = BacktestOrchestrator(
             reader=self._reader,
             calendar=self._calendar,
-            replay_factory=BasicPlanReplayFactory(self._runtime, binding.plan),
+            replay_factory=BasicPlanReplayFactory(
+                self._runtime,
+                binding.plan,
+                feature_series=binding.feature_series,
+                require_pinned_features=bool(binding.feature_series),
+            ),
             engine=engine,
             publisher=publisher,
             wall_clock=self._wall_clock,
@@ -1431,12 +1454,28 @@ class OrchestratorJobHandler:
                 reason_code="REQUIRED_INPUT_UNAVAILABLE",
             )
         manifest = primary[0][1]
-        verify_feature_materialization_pins(
-            envelope.feature_materializations, self._feature_materializations
-        )
-
         plan = self._runtime.load(plan_document, compiled_plan_checksum=plan_checksum)
         evaluation_from, evaluation_through = evaluation_window(manifest, plan)
+        feature_series: tuple[PinnedFeatureSeries, ...] = ()
+        if self._feature_materializations is not None or envelope.feature_materializations:
+            if self._feature_materializations is None or self._feature_object_reader is None:
+                raise JobNotSatisfiable(
+                    "feature materialization binding is unavailable",
+                    reason_code="REQUIRED_INPUT_UNAVAILABLE",
+                )
+            try:
+                feature_series = resolve_feature_materialization_pins(
+                    plan=plan,
+                    pins=envelope.feature_materializations,
+                    source=self._feature_materializations,
+                    reader=self._feature_object_reader,
+                    evaluation_from=evaluation_from,
+                    evaluation_through=evaluation_through,
+                )
+            except FeatureOutputBindingError as exc:
+                raise JobNotSatisfiable(
+                    str(exc), reason_code="REQUIRED_INPUT_UNAVAILABLE"
+                ) from exc
         requirements = derive_data_requirements(
             plan, evaluation_from=evaluation_from, evaluation_through=evaluation_through
         )
@@ -1486,6 +1525,7 @@ class OrchestratorJobHandler:
             job=backtest_job,
             correlation_id=self._correlation_id,
             manifests=tuple(resolved_manifests),
+            feature_series=feature_series,
         )
 
     # -- reporting ---------------------------------------------------------
