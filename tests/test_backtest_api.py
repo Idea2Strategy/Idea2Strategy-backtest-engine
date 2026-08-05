@@ -7,16 +7,14 @@ Coverage required by spec section 4: unauthenticated 401, wrong-owner 403, dupli
 request, retry, idempotency, at-least-once redelivery, DLQ, and 412 / lost-response
 reconciliation.
 
-The request and plan documents are loaded from B's own published copies under
-`backend/modules/backend-messaging/.../strategy-bot/v1/` whenever the superproject is
-reachable, so a stale vendored copy can never become the thing under test.
+The request and plan documents are frozen behaviour vectors. Cross-repository
+parity with B's authoritative copies is covered separately by ``test_contracts``.
 """
 
 from __future__ import annotations
 
 import copy
 import json
-import os
 from collections.abc import Iterator
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -107,26 +105,8 @@ AUGUST_ORDER_ID = "00000000-0000-4000-8000-000000002921"
 AUGUST_FILL_ID = "00000000-0000-4000-8000-000000002922"
 
 
-def _locate_backend_contracts() -> Path | None:
-    override = os.environ.get("IDEA2STRATEGY_BACKEND_CONTRACTS")
-    if override:
-        candidate = Path(override)
-        return candidate if candidate.is_dir() else None
-    suffix = Path(
-        "backend/modules/backend-messaging/src/main/resources/contracts/strategy-bot/v1"
-    )
-    for ancestor in Path(__file__).resolve().parents:
-        for candidate in (ancestor / suffix, ancestor / "Idea2Strategy" / suffix):
-            if candidate.is_dir():
-                return candidate
-    return None
-
-
 def _load(name: str) -> dict[str, Any]:
-    """B's own copy is authoritative; the vendored copy is the offline fallback."""
-    upstream = _locate_backend_contracts()
-    if upstream is not None and (upstream / name).is_file():
-        return json.loads((upstream / name).read_text(encoding="utf-8"))
+    """Load the frozen vector for deterministic API behaviour tests."""
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
