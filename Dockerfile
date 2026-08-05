@@ -11,10 +11,11 @@ COPY src ./src
 RUN pip install --no-cache-dir .
 
 # The runtime does not invoke Perl. Debian marks perl-base Essential, but this
-# slim image has no installed reverse dependency on it; removing it after the
-# Python installation keeps the deployed attack surface free of unfixed Perl
-# vulnerabilities without affecting package installation during the build.
-RUN dpkg --remove --force-remove-essential perl-base
+# slim image has no installed reverse dependency on it. Purge it after the
+# Python installation and remove dpkg's previous-status snapshot so scanners
+# cannot treat the removed source package as part of the final filesystem.
+RUN dpkg --purge --force-remove-essential perl-base \
+    && rm -f /var/lib/dpkg/status-old
 
 RUN useradd --create-home --uid 10001 app
 USER app
