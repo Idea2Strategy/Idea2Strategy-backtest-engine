@@ -51,12 +51,10 @@ CENTRAL_BASELINE = CENTRAL_MIGRATIONS / "V1__initial_schema.sql.fixture"
 #: like an invention. `tests/conftest.py` applies exactly these files to the
 #: container after the bundle, so the two halves cannot drift apart.
 #:
-#: Two kinds of schema delta are folded in:
-#: the pending provider-owned `V20260805130000__backtest_run_input_pins` fixture adds a
-#: whole table (parsed by
-#: `_parse_baseline`, like any `CREATE TABLE`), and
-#: `V20260805170000__backtest_run_outcome_detail` adds columns to an applied table
-#: (folded in by `_apply_contributions`).
+#: The provider-owned `V20260805130000__backtest_run_input_pins` table is now part
+#: of the central bundle. The remaining active consumer contribution,
+#: `V20260805170000__backtest_run_outcome_detail`, adds columns to an applied table
+#: and is folded in by `_apply_contributions`.
 CONTRIBUTED_MIGRATIONS = CONTRIBUTION_ROOT / "migrations"
 PENDING_ROOT_MIGRATIONS = CONTRIBUTION_ROOT / "fixtures" / "pending-root"
 SUPERSEDED_PIN_MIGRATION = (
@@ -91,7 +89,7 @@ _TYPE_ALIASES = {
 }
 
 _COLUMN_LINE = re.compile(
-    r'^\s*"(?P<name>[a-z0-9_]+)"\s+'
+    r'^\s*"?(?P<name>[a-z0-9_]+)"?\s+'
     r"(?P<type>[a-z_]+(?:\.[a-z_]+)?(?:\s*\(\s*[0-9]+(?:\s*,\s*[0-9]+)?\s*\))?)"
     r"(?P<rest>.*?),?\s*$"
 )
@@ -139,7 +137,7 @@ class _DdlTable:
 def _parse_baseline(sql: str) -> dict[str, _DdlTable]:
     tables: dict[str, _DdlTable] = {}
     for match in re.finditer(
-        r'CREATE TABLE "(?P<schema>[a-z_]+)"\."(?P<name>[a-z_]+)" \((?P<body>.*?)\n\);',
+        r'CREATE TABLE "?(?P<schema>[a-z_]+)"?\."?(?P<name>[a-z_]+)"? \((?P<body>.*?)\n\);',
         sql,
         re.S,
     ):
@@ -151,6 +149,8 @@ def _parse_baseline(sql: str) -> dict[str, _DdlTable]:
             if not line:
                 continue
             if line.upper().startswith("CONSTRAINT ") or line.upper().startswith("CHECK ("):
+                continue
+            if line.upper().startswith("REFERENCES "):
                 continue
             if line.upper().startswith("PRIMARY KEY ("):
                 table.primary_key = tuple(re.findall(r'"([a-z0-9_]+)"', line))
@@ -188,7 +188,7 @@ def _parse_baseline(sql: str) -> dict[str, _DdlTable]:
 
 
 def contributed_migration_files() -> list[Path]:
-    """Active consumer contribution plus pending provider schema target."""
+    """Active consumer contributions plus any not-yet-central provider target."""
 
     active = list(CONTRIBUTED_MIGRATIONS.glob("V*.sql"))
     return sorted(
@@ -358,18 +358,13 @@ ALL_TABLES = [
 
 
 def test_active_schema_deltas_are_present_in_timestamp_order() -> None:
-    """Provider target and outcome contribution apply in canonical timestamp order.
+    """Only not-yet-central deltas remain in the contribution sequence.
 
-    Named explicitly rather than counted: the two migrations were authored on
-    separate branches, and the failure mode a merge introduces is that one of them
-    quietly disappears while every other assertion in this module still passes,
-    because each half is individually self-consistent.
+    Named explicitly so a merge cannot quietly remove the remaining forward
+    migration while every other assertion stays individually self-consistent.
     """
 
-    assert [path.name for path in contributed_migration_files()] == [
-        "V20260805130000__backtest_run_input_pins.sql.fixture",
-        FORWARD_OUTCOME_MIGRATION,
-    ]
+    assert [path.name for path in contributed_migration_files()] == [FORWARD_OUTCOME_MIGRATION]
 
 
 def test_legacy_consumer_owned_pin_migration_is_preserved_but_superseded() -> None:
@@ -399,19 +394,19 @@ def test_forward_outcome_contribution_adds_only_the_three_approved_columns() -> 
     }.isdisjoint(set(added))
 
 
-def test_the_contributed_migration_is_the_only_new_backtest_table() -> None:
-    """A contributed migration may add tables; it may never redefine an applied one."""
+def test_no_active_contribution_redefines_an_applied_table() -> None:
+    """The promoted input-pin table must no longer appear as an active delta."""
 
     contributed = _parse_baseline(
         "\n\n".join(path.read_text(encoding="utf-8") for path in contributed_migration_files())
     )
-    applied = _parse_baseline(CENTRAL_BASELINE.read_text(encoding="utf-8"))
+    applied = _parse_baseline(canonical_sql())
 
-    # Only the input-pins contribution creates a table; the outcome-detail
-    # contribution is `ALTER TABLE ... ADD COLUMN` only, which `_parse_baseline`
-    # does not see and `_apply_contributions` folds in instead.
-    assert set(contributed) == {"backtest.run_input_pins"}
-    assert set(contributed) & set(applied) == set()
+    # The remaining outcome-detail contribution is `ALTER TABLE ... ADD COLUMN`
+    # only, which `_parse_baseline` does not see and `_apply_contributions` folds
+    # in instead.
+    assert contributed == {}
+    assert "backtest.run_input_pins" in applied
 
 
 def test_metadata_declares_exactly_the_canonical_tables() -> None:
