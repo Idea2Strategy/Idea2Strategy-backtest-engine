@@ -24,3 +24,10 @@ def test_dockerfile_purges_runtime_unused_perl_and_package_metadata_after_instal
 
     assert purge_position > install_position
     assert "rm -f /var/lib/dpkg/status-old" in dockerfile
+
+
+def test_dockerfile_carries_the_migration_contract_runtime_verification_needs() -> None:
+    dockerfile = (REPOSITORY_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "COPY db ./db" in dockerfile
+    assert "I2S_MIGRATION_CONTRIBUTION_ROOT=/app/db/migration-contributions" in dockerfile

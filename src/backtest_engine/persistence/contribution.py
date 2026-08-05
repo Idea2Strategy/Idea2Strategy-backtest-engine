@@ -66,6 +66,7 @@ _REQUIRED_KEYS = (
 )
 
 _SUPERPROJECT_ENV = "I2S_SUPERPROJECT_ROOT"
+_CONTRIBUTION_ROOT_ENV = "I2S_MIGRATION_CONTRIBUTION_ROOT"
 _SUPERPROJECT_SEARCH_DEPTH = 6
 
 
@@ -111,6 +112,9 @@ class MigrationContribution:
 def default_contribution_root() -> Path:
     """`<repo>/db/migration-contributions`, resolved from this module's location."""
 
+    override = os.environ.get(_CONTRIBUTION_ROOT_ENV)
+    if override:
+        return Path(override).expanduser().resolve()
     return Path(__file__).resolve().parents[3] / "db" / "migration-contributions"
 
 

@@ -1,12 +1,14 @@
 FROM python:3.12.13-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    I2S_MIGRATION_CONTRIBUTION_ROOT=/app/db/migration-contributions
 
 WORKDIR /app
 
 COPY pyproject.toml README.md ./
 COPY src ./src
+COPY db ./db
 
 RUN pip install --no-cache-dir .
 
