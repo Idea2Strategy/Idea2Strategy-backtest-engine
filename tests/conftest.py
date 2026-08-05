@@ -40,7 +40,6 @@ CONTRIBUTION_ROOT = REPO_ROOT / "db" / "migration-contributions"
 VENDORED_MIGRATIONS = CONTRIBUTION_ROOT / "fixtures" / "central-migration"
 CONTRIBUTED_MIGRATIONS = CONTRIBUTION_ROOT / "migrations"
 PENDING_ROOT_MIGRATIONS = CONTRIBUTION_ROOT / "fixtures" / "pending-root"
-SUPERSEDED_PIN_MIGRATION = "V20260802094500__backtest_run_input_pins.sql"
 VENDORED_DIGESTS = CONTRIBUTION_ROOT / "fixtures" / "central-migration.sha256"
 REFERENCE_SEED = CONTRIBUTION_ROOT / "fixtures" / "backtest_reference_seed.sql.fixture"
 
@@ -135,15 +134,12 @@ def contributed_migration_files() -> list[Path]:
     actually asking for. Without this step a contributed column would be invisible
     to every integration test and the contribution would be untested SQL.
 
-    The historical consumer-owned input-pin migration remains on disk for audit but
-    is deliberately excluded: current code consumes the normalized provider bundle.
+    The historical consumer-owned input-pin migration is preserved outside the active
+    directory under fixtures/superseded-proposals. Current code consumes the normalized
+    provider bundle fixture instead.
     """
 
-    files = [
-        path
-        for path in CONTRIBUTED_MIGRATIONS.glob("V*.sql")
-        if path.is_file() and path.name != SUPERSEDED_PIN_MIGRATION
-    ]
+    files = [path for path in CONTRIBUTED_MIGRATIONS.glob("V*.sql") if path.is_file()]
     files.extend(PENDING_ROOT_MIGRATIONS.glob("V*.sql.fixture"))
 
     def order(path: Path) -> int:

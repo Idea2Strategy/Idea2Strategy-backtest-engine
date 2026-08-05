@@ -59,7 +59,9 @@ CENTRAL_BASELINE = CENTRAL_MIGRATIONS / "V1__initial_schema.sql.fixture"
 #: (folded in by `_apply_contributions`).
 CONTRIBUTED_MIGRATIONS = CONTRIBUTION_ROOT / "migrations"
 PENDING_ROOT_MIGRATIONS = CONTRIBUTION_ROOT / "fixtures" / "pending-root"
-SUPERSEDED_PIN_MIGRATION = "V20260802094500__backtest_run_input_pins.sql"
+SUPERSEDED_PIN_MIGRATION = (
+    CONTRIBUTION_ROOT / "fixtures" / "superseded-proposals" / "V20260802094500__backtest_run_input_pins.sql.fixture"
+)
 FORWARD_OUTCOME_MIGRATION = "V20260805170000__backtest_run_outcome_detail.sql"
 SUPERSEDED_OUTCOME_MIGRATION = (
     CONTRIBUTION_ROOT / "fixtures" / "superseded-proposals" / "V20260802143000__backtest_run_outcome_detail.sql.fixture"
@@ -188,7 +190,7 @@ def _parse_baseline(sql: str) -> dict[str, _DdlTable]:
 def contributed_migration_files() -> list[Path]:
     """Active consumer contribution plus pending provider schema target."""
 
-    active = [path for path in CONTRIBUTED_MIGRATIONS.glob("V*.sql") if path.name != SUPERSEDED_PIN_MIGRATION]
+    active = list(CONTRIBUTED_MIGRATIONS.glob("V*.sql"))
     return sorted(
         [*active, *PENDING_ROOT_MIGRATIONS.glob("V*.sql.fixture")],
         key=lambda path: int(path.name.split("__", 1)[0].removeprefix("V")),
@@ -371,10 +373,12 @@ def test_active_schema_deltas_are_present_in_timestamp_order() -> None:
 
 
 def test_legacy_consumer_owned_pin_migration_is_preserved_but_superseded() -> None:
-    legacy = CONTRIBUTED_MIGRATIONS / SUPERSEDED_PIN_MIGRATION
+    assert SUPERSEDED_PIN_MIGRATION.is_file()
+    assert SUPERSEDED_PIN_MIGRATION not in contributed_migration_files()
 
-    assert legacy.is_file()
-    assert legacy not in contributed_migration_files()
+
+def test_only_the_forward_outcome_migration_is_bundle_eligible() -> None:
+    assert sorted(path.name for path in CONTRIBUTED_MIGRATIONS.glob("V*.sql")) == [FORWARD_OUTCOME_MIGRATION]
 
 
 def test_out_of_order_outcome_proposal_is_preserved_outside_the_active_bundle() -> None:

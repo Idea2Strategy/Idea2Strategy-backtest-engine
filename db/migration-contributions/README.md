@@ -29,15 +29,21 @@ migrations are immutable, so this repository never restates them; it contributes
 later changes, and both files below leave those nine tables exactly as the baseline
 defines them.
 
-`migrations/` contains two files, applied in timestamp order:
+`migrations/` contains exactly one bundle-eligible file:
 
 | file | adds | why |
 |---|---|---|
-| `V20260802094500__backtest_run_input_pins.sql` | the new table `backtest.run_input_pins` | Four of the eight values `GET /api/v1/backtests/{id}/inputs` reports are *arguments* of the SHA-256 in `runs.configuration_hash` and exist in no column. A digest cannot be inverted, so the read model had to invent them, report null, or refuse the route. |
 | `V20260805170000__backtest_run_outcome_detail.sql` | three nullable columns on `backtest.runs` — `result_manifest_id`, `retryable`, `missing_requirements` | Forward, globally ordered adoption of the approved outcome projection. It deliberately contains none of the retired legacy input-pin fields. |
 
-The first adds a table the baseline does not declare; the second alters a baseline
-table by adding columns only. Neither re-declares applied DDL.
+The active contribution alters a baseline table by adding columns only. The normalized
+`run_input_pins` table comes from the root provider-owned `V20260805130000` migration,
+mirrored here only as `fixtures/pending-root/*.sql.fixture` for integration tests.
+
+The historical consumer-owned `V20260802094500__backtest_run_input_pins.sql` is
+preserved byte-for-byte as
+`fixtures/superseded-proposals/V20260802094500__backtest_run_input_pins.sql.fixture`.
+Keeping it outside `migrations/` prevents a fresh central bundle from creating the
+provider-owned table twice.
 
 The original `V20260802143000__backtest_run_outcome_detail.sql` proposal is preserved
 byte-for-byte as
