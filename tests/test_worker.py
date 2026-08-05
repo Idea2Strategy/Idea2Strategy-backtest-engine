@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import boto3
 import pytest
 
 from backtest_engine.worker import (
@@ -37,6 +38,7 @@ from backtest_engine.worker import (
     MessageDisposition,
     WorkerConfig,
     WorkerConfigurationError,
+    _runtime_sqs_client,
     worker_execution_key_for,
 )
 
@@ -44,6 +46,29 @@ from backtest_engine.worker import (
 SQS_ENDPOINT = os.environ.get("BACKTEST_TEST_SQS_ENDPOINT", "http://127.0.0.1:24566")
 RUN_ID = "55555555-5555-4555-8555-555555555555"
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def test_sqs_client_uses_the_explicit_runtime_region(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def client(service: str, **kwargs: object) -> object:
+        captured.update(service=service, **kwargs)
+        return object()
+
+    monkeypatch.setattr(boto3, "client", client)
+
+    _runtime_sqs_client(
+        {
+            "AWS_REGION": "ap-northeast-2",
+            "AWS_ENDPOINT_URL_SQS": "http://localstack:4566",
+        }
+    )
+
+    assert captured == {
+        "service": "sqs",
+        "endpoint_url": "http://localstack:4566",
+        "region_name": "ap-northeast-2",
+    }
 
 
 def _body(run_id: str = RUN_ID, idempotency_key: str = "OFFICIAL_BACKTEST:bt4") -> str:

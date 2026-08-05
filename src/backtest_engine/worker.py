@@ -891,6 +891,17 @@ def load_factory(target: str, setting: str) -> Any:
     return factory()
 
 
+def _runtime_sqs_client(environ: Mapping[str, str]) -> Any:
+    import boto3
+
+    return boto3.client(
+        "sqs",
+        endpoint_url=environ.get("AWS_ENDPOINT_URL_SQS")
+        or environ.get("AWS_ENDPOINT_URL"),
+        region_name=environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION"),
+    )
+
+
 def run() -> None:
     lane_mode = any(os.environ.get(f"BACKTEST_{lane.value.upper()}_QUEUE_URL") for lane in BacktestLane)
     if lane_mode:
@@ -904,13 +915,7 @@ def run() -> None:
     # two workers would execute the same message twice.
     store: ExecutionKeyStore = load_factory(os.environ["BACKTEST_EXECUTION_KEY_STORE"], "BACKTEST_EXECUTION_KEY_STORE")
 
-    import boto3
-
-    client = boto3.client(
-        "sqs",
-        endpoint_url=os.environ.get("AWS_ENDPOINT_URL_SQS")
-        or os.environ.get("AWS_ENDPOINT_URL"),
-    )
+    client = _runtime_sqs_client(os.environ)
     request_intake_stop = threading.Event()
     request_threads: list[threading.Thread] = []
     request_mode = any(
@@ -947,6 +952,8 @@ def run() -> None:
     scale_down_thread: threading.Thread | None = None
     scale_down_engine = None
     if os.environ.get("BACKTEST_SCALE_DOWN_ENABLED", "false").strip().lower() not in {"", "false"}:
+        import boto3
+
         if not lane_mode:
             raise WorkerConfigurationError("instance scale-down requires the three-lane worker mode")
         from .persistence import create_backtest_engine
