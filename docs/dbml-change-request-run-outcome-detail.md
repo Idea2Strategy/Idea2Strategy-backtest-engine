@@ -5,7 +5,11 @@ file of this repository, so this repository cannot make the change; this documen
 the exact text the change must apply, so the migration and the model land together.
 
 **Migration this pairs with:**
-`db/migration-contributions/migrations/V20260802143000__backtest_run_outcome_detail.sql`
+`db/migration-contributions/migrations/V20260805170000__backtest_run_outcome_detail.sql`
+
+The original `V20260802143000` SQL remains under
+`db/migration-contributions/fixtures/superseded-proposals/` as a non-deployable
+history fixture because newer central Flyway versions made that timestamp unsafe.
 
 ## Why
 

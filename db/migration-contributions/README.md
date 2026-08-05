@@ -34,10 +34,16 @@ defines them.
 | file | adds | why |
 |---|---|---|
 | `V20260802094500__backtest_run_input_pins.sql` | the new table `backtest.run_input_pins` | Four of the eight values `GET /api/v1/backtests/{id}/inputs` reports are *arguments* of the SHA-256 in `runs.configuration_hash` and exist in no column. A digest cannot be inverted, so the read model had to invent them, report null, or refuse the route. |
-| `V20260802143000__backtest_run_outcome_detail.sql` | three nullable columns on `backtest.runs` — `result_manifest_id`, `retryable`, `missing_requirements` | The COMPLETED event's `resultManifestId`, the FAILED event's `retryable` and the UNAVAILABLE event's `missingRequirements`. All three are fields the `backtest.v1` result contract already declares **required** in their branch and that the server previously validated and then discarded, because the baseline had nowhere to put them. |
+| `V20260805170000__backtest_run_outcome_detail.sql` | three nullable columns on `backtest.runs` — `result_manifest_id`, `retryable`, `missing_requirements` | Forward, globally ordered adoption of the approved outcome projection. It deliberately contains none of the retired legacy input-pin fields. |
 
 The first adds a table the baseline does not declare; the second alters a baseline
 table by adding columns only. Neither re-declares applied DDL.
+
+The original `V20260802143000__backtest_run_outcome_detail.sql` proposal is preserved
+byte-for-byte as
+`fixtures/superseded-proposals/V20260802143000__backtest_run_outcome_detail.sql.fixture`.
+Its fixture suffix keeps it out of fresh Flyway bundle assembly after newer central
+versions made the original timestamp unsafe.
 
 **Canonical model.** The root superproject's `db/schema.dbml` is authoritative and is
 not part of this repository, so it cannot be edited from here. Each migration

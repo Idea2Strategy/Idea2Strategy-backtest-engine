@@ -157,8 +157,18 @@ runs = Table(
     Column("completed_at", TIMESTAMP(timezone=True)),
     Column("failure_code", VARCHAR(80)),
     Column("result_hash", VARCHAR(128)),
-    # Contributed by `db/migration-contributions/migrations/
-    # V20260802143000__backtest_run_outcome_detail.sql`. Each belongs to exactly one
+    Column("owner_anonymized_at", TIMESTAMP(timezone=True)),
+    Column("lane", _run_lane(), nullable=False),
+    Column("message_id", UUID(as_uuid=True), nullable=False),
+    Column("canonical_payload_hash", VARCHAR(128), nullable=False),
+    Column("aggregate_sequence", BigInteger, nullable=False),
+    Column("execution_policy_version", VARCHAR(80), nullable=False),
+    Column("idempotency_scope", VARCHAR(160), nullable=False),
+    Column("cancellation_requested_at", TIMESTAMP(timezone=True)),
+    Column("cancellation_reason_code", VARCHAR(80)),
+    Column("cancelled_at", TIMESTAMP(timezone=True)),
+    # Appended by the globally ordered forward contribution
+    # `V20260805170000__backtest_run_outcome_detail.sql`. Each belongs to exactly one
     # terminal status and is NULL in every other, so absence stays distinguishable
     # from a decision: `retryable IS NULL` means "this run has not failed", which is
     # not the same fact as `retryable = false`.
@@ -171,16 +181,6 @@ runs = Table(
     # this column would reject every ordinary insert, and a reader would see the
     # string "null" where it expected absence.
     Column("missing_requirements", JSONB(none_as_null=True)),
-    Column("owner_anonymized_at", TIMESTAMP(timezone=True)),
-    Column("lane", _run_lane(), nullable=False),
-    Column("message_id", UUID(as_uuid=True), nullable=False),
-    Column("canonical_payload_hash", VARCHAR(128), nullable=False),
-    Column("aggregate_sequence", BigInteger, nullable=False),
-    Column("execution_policy_version", VARCHAR(80), nullable=False),
-    Column("idempotency_scope", VARCHAR(160), nullable=False),
-    Column("cancellation_requested_at", TIMESTAMP(timezone=True)),
-    Column("cancellation_reason_code", VARCHAR(80)),
-    Column("cancelled_at", TIMESTAMP(timezone=True)),
     Index("uq_backtest_run_message_id", "message_id", unique=True),
     Index("uq_backtest_run_idempotency", "lane", "idempotency_scope", "idempotency_key", unique=True),
     Index("ix_backtest_run_execution_policy", "execution_policy_version", "queued_at"),

@@ -55,11 +55,18 @@ CENTRAL_BASELINE = CENTRAL_MIGRATIONS / "V1__initial_schema.sql.fixture"
 #: the pending provider-owned `V20260805130000__backtest_run_input_pins` fixture adds a
 #: whole table (parsed by
 #: `_parse_baseline`, like any `CREATE TABLE`), and
-#: `V20260802143000__backtest_run_outcome_detail` adds columns to an applied table
+#: `V20260805170000__backtest_run_outcome_detail` adds columns to an applied table
 #: (folded in by `_apply_contributions`).
 CONTRIBUTED_MIGRATIONS = CONTRIBUTION_ROOT / "migrations"
 PENDING_ROOT_MIGRATIONS = CONTRIBUTION_ROOT / "fixtures" / "pending-root"
 SUPERSEDED_PIN_MIGRATION = "V20260802094500__backtest_run_input_pins.sql"
+FORWARD_OUTCOME_MIGRATION = "V20260805170000__backtest_run_outcome_detail.sql"
+SUPERSEDED_OUTCOME_MIGRATION = (
+    CONTRIBUTION_ROOT
+    / "fixtures"
+    / "superseded-proposals"
+    / "V20260802143000__backtest_run_outcome_detail.sql.fixture"
+)
 
 EXPECTED_TABLES = {
     "backtest.runs",
@@ -361,8 +368,8 @@ def test_active_schema_deltas_are_present_in_timestamp_order() -> None:
     """
 
     assert [path.name for path in contributed_migration_files()] == [
-        "V20260802143000__backtest_run_outcome_detail.sql",
         "V20260805130000__backtest_run_input_pins.sql.fixture",
+        FORWARD_OUTCOME_MIGRATION,
     ]
 
 
@@ -371,6 +378,24 @@ def test_legacy_consumer_owned_pin_migration_is_preserved_but_superseded() -> No
 
     assert legacy.is_file()
     assert legacy not in contributed_migration_files()
+
+
+def test_out_of_order_outcome_proposal_is_preserved_outside_the_active_bundle() -> None:
+    assert SUPERSEDED_OUTCOME_MIGRATION.is_file()
+    assert SUPERSEDED_OUTCOME_MIGRATION not in contributed_migration_files()
+
+
+def test_forward_outcome_contribution_adds_only_the_three_approved_columns() -> None:
+    migration = CONTRIBUTED_MIGRATIONS / FORWARD_OUTCOME_MIGRATION
+    sql = migration.read_text(encoding="utf-8")
+    added = re.findall(r'ADD COLUMN\s+"([a-z0-9_]+)"', sql, re.I)
+
+    assert added == ["result_manifest_id", "retryable", "missing_requirements"]
+    assert {
+        "dataset_manifest_id",
+        "dataset_hash",
+        "feature_materialization_version",
+    }.isdisjoint(set(added))
 
 
 def test_the_contributed_migration_is_the_only_new_backtest_table() -> None:

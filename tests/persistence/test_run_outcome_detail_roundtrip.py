@@ -2,7 +2,7 @@
 
 `tests/test_run_outcome_detail.py` proves the lifecycle keeps the three fields.
 This module proves the *database* does: the columns exist because
-`db/migration-contributions/migrations/V20260802143000__backtest_run_outcome_detail.sql`
+`db/migration-contributions/migrations/V20260805170000__backtest_run_outcome_detail.sql`
 was applied to the container alongside the central bundle, they round-trip through
 psycopg with their Python types intact, and the CHECK that mirrors the contract's
 `minItems: 1` is enforced by PostgreSQL rather than only by the row dataclass.
