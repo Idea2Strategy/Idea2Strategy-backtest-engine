@@ -62,6 +62,19 @@ def _required(environ: Mapping[str, str], name: str) -> str:
     return value
 
 
+def service_endpoint(environ: Mapping[str, str], service: str) -> str | None:
+    """Resolve an emulator endpoint without coupling S3 and SQS together.
+
+    ``AWS_ENDPOINT_URL`` remains the backwards-compatible fallback used by a
+    single-service emulator. Local development uses MinIO for S3 and LocalStack
+    for SQS, so the service-specific variables must win when present.
+    """
+
+    return environ.get(f"AWS_ENDPOINT_URL_{service.upper()}") or environ.get(
+        "AWS_ENDPOINT_URL"
+    )
+
+
 def _engine(environ: Mapping[str, str] = os.environ) -> Engine:
     return create_backtest_engine(_required(environ, "BACKTEST_DATABASE_URL"))
 
@@ -682,7 +695,7 @@ def s3_object_store(environ: Mapping[str, str] = os.environ) -> S3ObjectStore:
     return S3ObjectStore(
         _required(environ, "BACKTEST_RESULTS_BUCKET"),
         prefix=environ.get("BACKTEST_RESULTS_PREFIX", "backtest-results"),
-        endpoint_url=environ.get("AWS_ENDPOINT_URL"),
+        endpoint_url=service_endpoint(environ, "S3"),
     )
 
 
@@ -715,7 +728,7 @@ def sqs_dead_letter_sink(environ: Mapping[str, str] = os.environ) -> SqsDeadLett
 
     client = boto3.client(
         "sqs",
-        endpoint_url=environ.get("AWS_ENDPOINT_URL"),
+        endpoint_url=service_endpoint(environ, "SQS"),
         region_name=environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION"),
     )
     return SqsDeadLetterSink(client, _required(environ, "BACKTEST_API_DLQ_URL"))
@@ -744,7 +757,7 @@ def backtest_request_handler(
 
     client = boto3.client(
         "sqs",
-        endpoint_url=environ.get("AWS_ENDPOINT_URL"),
+        endpoint_url=service_endpoint(environ, "SQS"),
         region_name=environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION"),
     )
     return BacktestRequestJobPublisher(
@@ -767,7 +780,7 @@ def _market_reader(environ: Mapping[str, str]) -> S3ParquetMarketDataReader:
 
     client = boto3.client(
         "s3",
-        endpoint_url=environ.get("AWS_ENDPOINT_URL"),
+        endpoint_url=service_endpoint(environ, "S3"),
         region_name=environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION"),
     )
     return S3ParquetMarketDataReader(
@@ -783,7 +796,7 @@ def _feature_object_reader(environ: Mapping[str, str]) -> S3VersionedFeatureObje
 
     client = boto3.client(
         "s3",
-        endpoint_url=environ.get("AWS_ENDPOINT_URL"),
+        endpoint_url=service_endpoint(environ, "S3"),
         region_name=environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION"),
     )
     return S3VersionedFeatureObjectReader(client)
