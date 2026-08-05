@@ -237,20 +237,91 @@ class PostgresFeatureMaterializationSource:
     def by_id(self, materialization_id: uuid.UUID) -> Mapping[str, Any] | None:
         statement = text(
             """
-            SELECT f.id, f.status::text, f.result_hash, f.output_dataset_manifest_id,
+            SELECT f.id, f.status::text, f.result_hash, f.feature_definition_id,
+                   fd.feature_code, fd.calculator_version, fd.resolution,
+                   fd.definition_hash, f.instrument_id, f.input_dataset_set_hash,
+                   f.period_start, f.period_end, f.output_dataset_manifest_id,
                    d.status::text AS output_dataset_status,
-                   d.dataset_hash AS output_dataset_hash
+                   d.data_layer AS output_dataset_layer,
+                   d.instrument_id AS output_dataset_instrument_id,
+                   d.schema_version AS output_dataset_schema,
+                   d.resolution AS output_dataset_resolution,
+                   COALESCE(
+                     jsonb_agg(
+                       jsonb_build_object(
+                         'object_kind', rel.object_kind,
+                         'status', obj.status::text,
+                         'storage_provider', obj.storage_provider,
+                         'bucket_name', obj.bucket_name,
+                         'object_key', obj.object_key,
+                         'provider_version_id', obj.provider_version_id,
+                         'content_hash', obj.content_hash,
+                         'byte_size', obj.byte_size,
+                         'file_format', obj.file_format,
+                         'schema_version', obj.schema_version,
+                         'row_count', rel.row_count
+                       ) ORDER BY rel.part_number
+                     ) FILTER (WHERE rel.id IS NOT NULL),
+                     '[]'::jsonb
+                   ) AS objects
               FROM market_data.feature_materializations f
+              JOIN market_data.feature_definitions fd
+                ON fd.id = f.feature_definition_id
               LEFT JOIN market_data.dataset_manifests d
                 ON d.id = f.output_dataset_manifest_id
+              LEFT JOIN market_data.dataset_objects rel
+                ON rel.dataset_manifest_id = d.id
+              LEFT JOIN storage.objects obj
+                ON obj.id = rel.object_id
              WHERE f.id = :materialization_id
+             GROUP BY f.id, fd.id, d.id
             """
         )
         with self._engine.connect() as connection:
             row = connection.execute(
                 statement, {"materialization_id": materialization_id}
             ).mappings().first()
-        return None if row is None else dict(row)
+        if row is None:
+            return None
+        resolved = dict(row)
+        objects = resolved.get("objects")
+        if isinstance(objects, str):
+            try:
+                objects = json.loads(objects)
+            except json.JSONDecodeError as exc:
+                raise ConfigurationError(
+                    f"feature materialization {materialization_id} has invalid object evidence"
+                ) from exc
+        resolved["objects"] = tuple(objects or ())
+        return resolved
+
+
+class S3VersionedFeatureObjectReader:
+    """Read the exact immutable S3 version named by ``storage.objects``."""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    def read_version(
+        self, provider: str, bucket: str, key: str, version_id: str
+    ) -> bytes:
+        if provider != "S3_COMPATIBLE":
+            raise ConfigurationError(
+                f"S3 feature reader cannot read storage provider {provider!r}"
+            )
+        response = self._client.get_object(
+            Bucket=bucket,
+            Key=key,
+            VersionId=version_id,
+        )
+        body = response["Body"]
+        try:
+            payload = body.read()
+        finally:
+            body.close()
+        if not isinstance(payload, bytes):
+            raise ConfigurationError("S3 feature object body did not return bytes")
+        return payload
 
 
 class PostgresQueuedRunSource:
@@ -707,6 +778,17 @@ def _market_reader(environ: Mapping[str, str]) -> S3ParquetMarketDataReader:
     )
 
 
+def _feature_object_reader(environ: Mapping[str, str]) -> S3VersionedFeatureObjectReader:
+    import boto3
+
+    client = boto3.client(
+        "s3",
+        endpoint_url=environ.get("AWS_ENDPOINT_URL"),
+        region_name=environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION"),
+    )
+    return S3VersionedFeatureObjectReader(client)
+
+
 def orchestrator_job_handler(
     environ: Mapping[str, str] = os.environ,
 ) -> OrchestratorJobHandler:
@@ -720,6 +802,7 @@ def orchestrator_job_handler(
         plans=PostgresCompiledPlanSource(engine),
         manifests=PostgresDatasetManifestSource(engine),
         feature_materializations=PostgresFeatureMaterializationSource(engine),
+        feature_object_reader=_feature_object_reader(environ),
         reader=_market_reader(environ),
         calendar=XNYS_CALENDAR,
         object_store=s3_object_store(environ),

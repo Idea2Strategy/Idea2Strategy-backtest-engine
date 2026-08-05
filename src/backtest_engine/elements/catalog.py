@@ -119,6 +119,33 @@ def _evaluate_load_feature(step: PlanStep, evaluation: ElementEvaluation) -> Ste
             f"feature {feature_id!r} is not implemented by this build",
         )
 
+    if evaluation.inputs.require_pinned_features:
+        pinned = evaluation.inputs.feature_series_for(feature_id, resolution)
+        if pinned is None:
+            raise ElementInputMissing(
+                f"instrument {evaluation.instrument_id} has no pinned "
+                f"{feature_id}/{resolution} feature series",
+                input_reason="FEATURE_SERIES_MISSING",
+                evidence={
+                    "feature": feature_id,
+                    "resolution": resolution,
+                    "asOf": evaluation.as_of.isoformat(),
+                },
+            )
+        value = pinned.value_at(evaluation.as_of)
+        evaluation.record(feature_id, value)
+        return StepOutcome.passed(
+            "FEATURE_LOADED",
+            {
+                "feature": feature_id,
+                "featureVersion": definition.definition_version,
+                "resolution": resolution,
+                "value": f"{value:f}",
+                "asOf": evaluation.as_of.isoformat(),
+                "source": "PINNED_FEATURE_OUTPUT",
+            },
+        )
+
     series = evaluation.inputs.series_for(definition.data_kind, resolution)
     if series is None:
         raise ElementInputMissing(
@@ -357,7 +384,9 @@ _BASIC_ELEMENTS_2026_07_31 = ElementCatalog(
     ),
     canonical_feature_ids=MappingProxyType(
         {
-            # Transcribed from B's published fixture requiredFeatures[0].
+            # Production definition seeded by the shared pipeline catalog.
+            "0f1b0000-0000-4000-8000-000000000001": "RSI_14",
+            # Published cross-runtime conformance fixture.
             "00000000-0000-4000-8000-000000000401": "RSI_14",
         }
     ),

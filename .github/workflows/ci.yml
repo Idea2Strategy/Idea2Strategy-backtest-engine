@@ -410,7 +410,8 @@ jobs:
           AWS_SECRET_ACCESS_KEY: test
           AWS_DEFAULT_REGION: us-east-1
         run: >-
-          python -m pytest tests/test_object_store.py -p no:cacheprovider -rs
+          python -m pytest tests/test_object_store.py tests/test_feature_outputs.py
+          -m docker -p no:cacheprovider -rs
           --junitxml=objectstore-results.xml
       - name: The S3 leg actually ran (a skip is not a pass)
         if: always()

@@ -50,6 +50,8 @@ __all__ = [
     "ElementInputMissing",
     "InstrumentInput",
     "InstrumentSeries",
+    "PinnedFeatureSeries",
+    "PinnedFeatureValue",
     "PlanLoadFailure",
     "PlanStep",
     "SeriesBar",
@@ -374,11 +376,84 @@ class InstrumentSeries:
 
 
 @dataclass(frozen=True, slots=True)
+class PinnedFeatureValue:
+    """One decoded value from an immutable historical feature object."""
+
+    bar_start_at: datetime
+    value: Decimal
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "bar_start_at", _utc(self.bar_start_at, "bar_start_at"))
+        value = _decimal(self.value, "value")
+        if value.as_tuple().exponent != -8:
+            raise ElementEvaluationError("pinned feature values must have decimal scale 8")
+        object.__setattr__(self, "value", value)
+
+
+@dataclass(frozen=True, slots=True)
+class PinnedFeatureSeries:
+    """A version-verified feature series injected into ``LOAD_FEATURE``.
+
+    A value belongs to the source bar beginning at ``bar_start_at`` and becomes
+    visible only when that bar has completed. The exact preceding instant is
+    required so a missing bar cannot silently reuse a stale value.
+    """
+
+    feature_id: str
+    instrument_id: str
+    resolution: str
+    values: tuple[PinnedFeatureValue, ...]
+
+    def __post_init__(self) -> None:
+        if not self.feature_id:
+            raise ElementEvaluationError("feature_id must not be empty")
+        object.__setattr__(self, "instrument_id", _uuid(self.instrument_id, "instrument_id"))
+        resolution_period(self.resolution)
+        values = tuple(self.values)
+        previous: PinnedFeatureValue | None = None
+        for item in values:
+            if not isinstance(item, PinnedFeatureValue):
+                raise ElementEvaluationError("values must contain PinnedFeatureValue entries")
+            if previous is not None and item.bar_start_at <= previous.bar_start_at:
+                raise ElementEvaluationError(
+                    "feature values must be strictly increasing and unique by bar_start_at"
+                )
+            previous = item
+        object.__setattr__(self, "values", values)
+
+    @property
+    def identity(self) -> tuple[str, str]:
+        return self.feature_id, self.resolution
+
+    def value_at(self, as_of: datetime) -> Decimal:
+        boundary = _utc(as_of, "as_of")
+        expected_start = boundary - resolution_period(self.resolution)
+        for item in reversed(self.values):
+            if item.bar_start_at == expected_start:
+                return item.value
+            if item.bar_start_at < expected_start:
+                break
+        raise ElementInputMissing(
+            f"pinned {self.feature_id}/{self.resolution} has a data gap at "
+            f"{boundary.isoformat()}",
+            input_reason="FEATURE_SERIES_DATA_GAP",
+            evidence={
+                "feature": self.feature_id,
+                "resolution": self.resolution,
+                "asOf": boundary.isoformat(),
+                "expectedBarStartAt": expected_start.isoformat(),
+            },
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class InstrumentInput:
     """Everything one instrument contributes to one evaluation."""
 
     instrument_id: str
     series: tuple[InstrumentSeries, ...]
+    feature_series: tuple[PinnedFeatureSeries, ...] = ()
+    require_pinned_features: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "instrument_id", _uuid(self.instrument_id, "instrument_id"))
@@ -393,10 +468,29 @@ class InstrumentInput:
                 "every series must belong to the input instrument"
             )
         object.__setattr__(self, "series", series)
+        feature_series = tuple(self.feature_series)
+        feature_identities = [item.identity for item in feature_series]
+        if len(set(feature_identities)) != len(feature_identities):
+            raise ElementEvaluationError(
+                "(feature_id, resolution) must be unique within an instrument input"
+            )
+        if any(item.instrument_id != self.instrument_id for item in feature_series):
+            raise ElementEvaluationError(
+                "every feature series must belong to the input instrument"
+            )
+        object.__setattr__(self, "feature_series", feature_series)
 
     def series_for(self, data_kind: str, resolution: str) -> InstrumentSeries | None:
         for item in self.series:
             if item.identity == (data_kind, resolution):
+                return item
+        return None
+
+    def feature_series_for(
+        self, feature_id: str, resolution: str
+    ) -> PinnedFeatureSeries | None:
+        for item in self.feature_series:
+            if item.identity == (feature_id, resolution):
                 return item
         return None
 

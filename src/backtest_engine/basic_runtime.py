@@ -98,6 +98,7 @@ from backtest_engine.elements import (
     InstrumentInput,
     InstrumentSeries,
     OrderCandidate,
+    PinnedFeatureSeries,
     PlanLoadFailure,
     PlanStep,
     SeriesBar,
@@ -1262,7 +1263,11 @@ def bar_closed_event(
 
 
 def _instrument_inputs(
-    events: Iterable[MarketDataEvent], as_of: datetime
+    events: Iterable[MarketDataEvent],
+    as_of: datetime,
+    *,
+    feature_series: Sequence[PinnedFeatureSeries] = (),
+    require_pinned_features: bool = False,
 ) -> dict[str, InstrumentInput]:
     """Group the bars available at ``as_of`` into one input per instrument."""
     grouped: dict[tuple[str, str, str], list[SeriesBar]] = {}
@@ -1283,9 +1288,18 @@ def _instrument_inputs(
                 bars=tuple(sorted(bars, key=lambda bar: bar.starts_at)),
             )
         )
+    features_by_instrument: dict[str, list[PinnedFeatureSeries]] = {}
+    for feature in feature_series:
+        features_by_instrument.setdefault(feature.instrument_id, []).append(feature)
+    instrument_ids = set(by_instrument) | set(features_by_instrument)
     return {
-        instrument_id: InstrumentInput(instrument_id=instrument_id, series=tuple(series))
-        for instrument_id, series in by_instrument.items()
+        instrument_id: InstrumentInput(
+            instrument_id=instrument_id,
+            series=tuple(by_instrument.get(instrument_id, ())),
+            feature_series=tuple(features_by_instrument.get(instrument_id, ())),
+            require_pinned_features=require_pinned_features,
+        )
+        for instrument_id in instrument_ids
     }
 
 
@@ -1370,6 +1384,8 @@ class BasicPlanReplay:
         plan: BasicCompiledPlan,
         clock: MarketEventClock,
         assessment: AvailabilityAssessment,
+        feature_series: Sequence[PinnedFeatureSeries] = (),
+        require_pinned_features: bool = False,
     ) -> None:
         if assessment.status is AvailabilityStatus.UNAVAILABLE:
             raise ReplayUnavailableError(_unavailable_fields(assessment))
@@ -1377,6 +1393,8 @@ class BasicPlanReplay:
         self.plan = plan
         self.clock = clock
         self.assessment = assessment
+        self.feature_series = tuple(feature_series)
+        self.require_pinned_features = require_pinned_features
         self.gate = ExecutionGate(clock.schedule, assessment)
         self._evaluations: tuple[PlanEvaluation, ...] | None = None
 
@@ -1415,7 +1433,14 @@ class BasicPlanReplay:
             )
 
         result = self.runtime.execute(
-            self.plan, _instrument_inputs(visible_events, instant), as_of=instant
+            self.plan,
+            _instrument_inputs(
+                visible_events,
+                instant,
+                feature_series=self.feature_series,
+                require_pinned_features=self.require_pinned_features,
+            ),
+            as_of=instant,
         )
         candidates: tuple[OrderCandidate, ...] = ()
         if session is not None:
