@@ -62,10 +62,7 @@ PENDING_ROOT_MIGRATIONS = CONTRIBUTION_ROOT / "fixtures" / "pending-root"
 SUPERSEDED_PIN_MIGRATION = "V20260802094500__backtest_run_input_pins.sql"
 FORWARD_OUTCOME_MIGRATION = "V20260805170000__backtest_run_outcome_detail.sql"
 SUPERSEDED_OUTCOME_MIGRATION = (
-    CONTRIBUTION_ROOT
-    / "fixtures"
-    / "superseded-proposals"
-    / "V20260802143000__backtest_run_outcome_detail.sql.fixture"
+    CONTRIBUTION_ROOT / "fixtures" / "superseded-proposals" / "V20260802143000__backtest_run_outcome_detail.sql.fixture"
 )
 
 EXPECTED_TABLES = {
