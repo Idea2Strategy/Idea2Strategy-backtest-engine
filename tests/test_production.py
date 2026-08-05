@@ -24,11 +24,24 @@ from backtest_engine.production import (
     S3VersionedFeatureObjectReader,
     SqsExecutionJobQueue,
     load_execution_policy_catalog,
+    service_endpoint,
 )
 
 
 ACCOUNT_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 BOT_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+
+
+def test_service_specific_aws_endpoint_overrides_the_legacy_shared_endpoint() -> None:
+    environment = {
+        "AWS_ENDPOINT_URL": "http://legacy:4566",
+        "AWS_ENDPOINT_URL_S3": "http://minio:9000",
+        "AWS_ENDPOINT_URL_SQS": "http://localstack:4566",
+    }
+
+    assert service_endpoint(environment, "S3") == "http://minio:9000"
+    assert service_endpoint(environment, "SQS") == "http://localstack:4566"
+    assert service_endpoint({"AWS_ENDPOINT_URL": "http://legacy:4566"}, "S3") == "http://legacy:4566"
 
 
 class _Rows:

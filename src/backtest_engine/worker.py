@@ -906,7 +906,11 @@ def run() -> None:
 
     import boto3
 
-    client = boto3.client("sqs", endpoint_url=os.environ.get("AWS_ENDPOINT_URL"))
+    client = boto3.client(
+        "sqs",
+        endpoint_url=os.environ.get("AWS_ENDPOINT_URL_SQS")
+        or os.environ.get("AWS_ENDPOINT_URL"),
+    )
     request_intake_stop = threading.Event()
     request_threads: list[threading.Thread] = []
     request_mode = any(

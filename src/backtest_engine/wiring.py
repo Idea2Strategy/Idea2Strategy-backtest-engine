@@ -1746,7 +1746,8 @@ def build_api_runtime(environ: Mapping[str, str]) -> ApiRuntime:
             # endpoint the deployment is on.
             boto3.client(
                 "sqs",
-                endpoint_url=environ.get("AWS_ENDPOINT_URL"),
+                endpoint_url=environ.get("AWS_ENDPOINT_URL_SQS")
+                or environ.get("AWS_ENDPOINT_URL"),
                 region_name=environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION"),
             ),
             environ["BACKTEST_QUEUE_URL"],

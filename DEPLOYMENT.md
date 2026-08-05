@@ -118,7 +118,10 @@ The worker also requires:
 
 AWS credentials are resolved by the SDK credential chain. On EC2, use the
 instance profile; do not inject access keys. `AWS_REGION` selects the region and
-`AWS_ENDPOINT_URL` is only for a local S3/SQS emulator.
+`AWS_ENDPOINT_URL` is only for a local S3/SQS emulator. When local S3 and SQS
+use different emulators, set `AWS_ENDPOINT_URL_S3` and
+`AWS_ENDPOINT_URL_SQS`; each service-specific value takes precedence over the
+shared fallback. For example, Compose points S3 at MinIO and SQS at LocalStack.
 
 ## Required policy document shapes
 
