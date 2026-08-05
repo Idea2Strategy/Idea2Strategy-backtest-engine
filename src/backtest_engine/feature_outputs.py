@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from itertools import pairwise
@@ -34,6 +35,7 @@ __all__ = [
 
 
 FEATURE_SERIES_SCHEMA_VERSION = "feature-series.parquet.v1"
+PROJECT_UUID_NAMESPACE = uuid.UUID("05a27d5a-75d8-4d57-bc9a-31cedf90d791")
 FEATURE_SERIES_SCHEMA = pa.schema(
     [
         pa.field("bar_start_at", pa.timestamp("us", tz="UTC"), nullable=False),
@@ -80,11 +82,30 @@ def _hash(value: Any, label: str) -> str:
 
 def _uuid_text(value: Any, label: str) -> str:
     try:
-        import uuid
-
         return str(uuid.UUID(str(value)))
     except (TypeError, ValueError) as exc:
         raise FeatureOutputBindingError(f"{label} must be a UUID") from exc
+
+
+def _expected_feature_feed_id(record: Mapping[str, Any]) -> str:
+    definition_hash = str(record.get("definition_hash") or "")
+    _hash(definition_hash, "definition hash")
+    calculator_version = str(record.get("calculator_version") or "")
+    resolution = str(record.get("resolution") or "")
+    if not calculator_version or not resolution:
+        raise FeatureOutputBindingError(
+            "feature feed identity requires calculator version and resolution"
+        )
+    identity = "|".join(
+        (
+            "feature-output-feed",
+            definition_hash,
+            calculator_version,
+            resolution,
+            FEATURE_SERIES_SCHEMA_VERSION,
+        )
+    )
+    return str(uuid.uuid5(PROJECT_UUID_NAMESPACE, identity))
 
 
 def _canonical_result_hash(record: Mapping[str, Any], values: Sequence[PinnedFeatureValue]) -> str:
@@ -131,7 +152,11 @@ def _require_metadata(
         raise FeatureOutputBindingError("feature definition does not match the compiled plan")
     if str(record.get("feature_code")) != requirement.feature_key:
         raise FeatureOutputBindingError("feature code does not match the compiled plan")
-    if str(record.get("calculator_version")) != requirement.feature_version:
+    calculator_version = str(record.get("calculator_version"))
+    if calculator_version not in {
+        requirement.feature_version,
+        requirement.definition_version,
+    }:
         raise FeatureOutputBindingError("feature semantic version does not match the compiled plan")
     if str(record.get("resolution")) != requirement.bar_resolution:
         raise FeatureOutputBindingError("feature resolution does not match the compiled plan")
@@ -147,6 +172,12 @@ def _require_metadata(
 
     if record.get("output_dataset_manifest_id") is None:
         raise FeatureOutputBindingError("feature output dataset manifest is missing")
+    if _uuid_text(record.get("output_dataset_feed_id"), "output dataset feed id") != (
+        _expected_feature_feed_id(record)
+    ):
+        raise FeatureOutputBindingError(
+            "feature output dataset feed identity does not match the definition"
+        )
     if _uuid_text(
         record.get("output_dataset_instrument_id"), "output dataset instrument id"
     ) != instrument_id:

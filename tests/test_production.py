@@ -175,6 +175,9 @@ def test_feature_materialization_projection_executes_against_postgresql_16(
         "00000000-0000-4000-8000-000000000095"
     )
     assert resolved["output_dataset_status"] == "AVAILABLE"
+    assert resolved["output_dataset_feed_id"] == UUID(
+        "00000000-0000-4000-8000-000000000092"
+    )
     assert resolved["objects"] == ()
 
 

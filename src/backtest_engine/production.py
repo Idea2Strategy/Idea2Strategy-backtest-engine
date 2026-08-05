@@ -256,6 +256,7 @@ class PostgresFeatureMaterializationSource:
                    fd.feature_code, fd.calculator_version, fd.resolution,
                    fd.definition_hash, f.instrument_id, f.input_dataset_set_hash,
                    f.period_start, f.period_end, f.output_dataset_manifest_id,
+                   d.feed_id AS output_dataset_feed_id,
                    d.status::text AS output_dataset_status,
                    d.data_layer AS output_dataset_layer,
                    d.instrument_id AS output_dataset_instrument_id,
