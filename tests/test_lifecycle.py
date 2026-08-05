@@ -9,7 +9,6 @@ and transient failure, and the outbound `backtest.v1` event.
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,24 +65,14 @@ POLICY_2026Q3 = replace(
 )
 
 
-def _locate_backend_contracts() -> Path | None:
-    override = os.environ.get("IDEA2STRATEGY_BACKEND_CONTRACTS")
-    if override:
-        candidate = Path(override)
-        return candidate if candidate.is_dir() else None
-    suffix = Path("backend/modules/backend-messaging/src/main/resources/contracts/strategy-bot/v1")
-    for ancestor in Path(__file__).resolve().parents:
-        for candidate in (ancestor / suffix, ancestor / "Idea2Strategy" / suffix):
-            if candidate.is_dir():
-                return candidate
-    return None
-
-
 def _load(name: str) -> dict[str, Any]:
-    """B's own copy is authoritative; the vendored copy is the offline fallback."""
-    upstream = _locate_backend_contracts()
-    if upstream is not None and (upstream / name).is_file():
-        return json.loads((upstream / name).read_text(encoding="utf-8"))
+    """Load the frozen behaviour vector used by this suite.
+
+    Cross-repository contract parity is verified in ``test_contracts.py``.  A
+    lifecycle unit test must not silently select a different request merely
+    because it happens to run below a superproject checkout; doing so changes
+    the policy fixture without changing this suite's policy catalog.
+    """
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 

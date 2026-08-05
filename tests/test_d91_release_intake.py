@@ -80,12 +80,6 @@ B_SNAPSHOT_HASH = "sha256:" + "1" * 64
 #: B's fixture is released at 2026-07-31T12:00:00Z, which is ET 2026-Q3.
 B_RELEASE_QUARTER = "2026-Q3"
 
-#: `uuid5(RUN_ID_NAMESPACE, B_IDEMPOTENCY_KEY)`, derived from the two literals
-#: below rather than from a run this suite produced. `run_id_for` is a pure
-#: function of them, so pinning the output pins the addressing scheme: changing
-#: the namespace would re-address every run B has ever requested, and this
-#: literal is what makes that impossible to do by accident.
-B_RUN_ID = UUID("f876f259-4158-5a9a-8973-db21764024dc")
 EXPECTED_RUN_ID_NAMESPACE = UUID("a8eac5b9-0335-5d8c-b32a-1d969dec25ac")
 
 
@@ -98,8 +92,14 @@ def b_plan() -> dict[str, Any]:
     return strategy_bot_fixture("basic-compiled-plan.valid.json")
 
 
+B_EXECUTION_POLICY_VERSION = str(
+    b_request().get("executionPolicyVersion", "official-backtest-policy-2026q3")
+)
+B_RUN_ID = UUID(str(b_request().get("runId", run_id_for(B_IDEMPOTENCY_KEY))))
+
+
 B_RELEASE_POLICY = policy_with(
-    version="official-backtest-policy-2026q3",
+    version=B_EXECUTION_POLICY_VERSION,
     release_quarter=B_RELEASE_QUARTER,
     period_start=et_quarter_start(2026, 3),
     period_end=et_quarter_start(2026, 4),
@@ -246,7 +246,12 @@ def harness() -> Harness:
 
 def test_the_run_id_namespace_and_derivation_are_pinned() -> None:
     assert RUN_ID_NAMESPACE == EXPECTED_RUN_ID_NAMESPACE
-    assert run_id_for(B_IDEMPOTENCY_KEY) == B_RUN_ID
+    assert run_id_for(B_IDEMPOTENCY_KEY) == UUID("f876f259-4158-5a9a-8973-db21764024dc")
+    request = b_request()
+    if "runId" in request:
+        assert B_RUN_ID == UUID(str(request["runId"]))
+    else:
+        assert B_RUN_ID == run_id_for(B_IDEMPOTENCY_KEY)
     # A different release addresses a different run; the derivation is not a constant.
     assert run_id_for(B_IDEMPOTENCY_KEY.replace("c6dd", "c6de")) != B_RUN_ID
 
@@ -281,16 +286,17 @@ def test_the_run_takes_its_slippage_from_the_policy_not_from_a_literal(
     harness.deliver(b_request())
     assert harness.runs[0].slippage_rate_bps == B_RELEASE_POLICY.slippage_rate_bps == 5
 
-    other = Harness(
-        policies=ExecutionPolicyCatalog([policy_with(
-            version="official-backtest-policy-2026q3-slip7",
-            release_quarter=B_RELEASE_QUARTER,
-            period_start=et_quarter_start(2026, 3),
-            period_end=et_quarter_start(2026, 4),
-            slippage_rate_bps=7,
-        )])
+    other_policy = policy_with(
+        version="official-backtest-policy-2026q3-slip7",
+        release_quarter=B_RELEASE_QUARTER,
+        period_start=et_quarter_start(2026, 3),
+        period_end=et_quarter_start(2026, 4),
+        slippage_rate_bps=7,
     )
-    other.deliver(b_request())
+    other = Harness(policies=ExecutionPolicyCatalog([other_policy]))
+    request = b_request()
+    request["executionPolicyVersion"] = other_policy.version
+    other.deliver(request)
 
     assert other.runs[0].slippage_rate_bps == 7
 
@@ -380,6 +386,7 @@ def release_request_for(plan: Mapping[str, Any]) -> dict[str, Any]:
         snapshot_hash=request["expectedSnapshotHash"],
         operation_key=official_backtest_operation_key(request),
     )
+    request["runId"] = str(run_id_for(request["metadata"]["idempotencyKey"]))
     return request
 
 
