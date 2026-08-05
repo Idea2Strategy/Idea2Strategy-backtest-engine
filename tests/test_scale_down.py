@@ -7,6 +7,7 @@ from typing import Any
 from backtest_engine.scale_down import (
     BacktestActivity,
     InstanceScaleDownController,
+    PostgresSqsActivityProbe,
     QueueActivity,
     ScaleDownConfigurationError,
     controller_from_env,
@@ -95,6 +96,7 @@ def test_environment_gate_is_disabled_by_default() -> None:
             sqs_client=object(),
             autoscaling_client=object(),
             queue_urls=(),
+            request_queue_urls=(),
         )
         is None
     )
@@ -110,6 +112,97 @@ def test_invalid_environment_gate_fails_closed() -> None:
             sqs_client=object(),
             autoscaling_client=object(),
             queue_urls=(),
+            request_queue_urls=(),
+        )
+
+
+class FakeResult:
+    def mappings(self) -> FakeResult:
+        return self
+
+    def one(self) -> dict[str, int]:
+        return {"queued_runs": 0, "running_runs": 0, "live_claims": 0}
+
+
+class FakeConnection:
+    def __enter__(self) -> FakeConnection:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def execute(self, _statement: object) -> FakeResult:
+        return FakeResult()
+
+
+class FakeEngine:
+    def connect(self) -> FakeConnection:
+        return FakeConnection()
+
+
+class FakeSqs:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def get_queue_attributes(self, **kwargs: Any) -> dict[str, dict[str, str]]:
+        self.calls.append(kwargs)
+        return {
+            "Attributes": {
+                "ApproximateNumberOfMessages": "1" if kwargs["QueueUrl"] == "request-custom" else "0",
+                "ApproximateNumberOfMessagesNotVisible": "0",
+                "ApproximateNumberOfMessagesDelayed": "0",
+            }
+        }
+
+
+def test_probe_observes_all_execution_and_request_queue_depth_dimensions() -> None:
+    sqs = FakeSqs()
+    probe = PostgresSqsActivityProbe(
+        engine=FakeEngine(),  # type: ignore[arg-type]
+        sqs_client=sqs,
+        queue_urls=("job-basic", "job-custom", "job-competition"),
+        request_queue_urls=("request-basic", "request-custom", "request-competition"),
+    )
+
+    observation = probe.observe()
+
+    assert len(observation.queues) == 6
+    assert observation.idle is False
+    assert [call["QueueUrl"] for call in sqs.calls] == [
+        "job-basic",
+        "job-custom",
+        "job-competition",
+        "request-basic",
+        "request-custom",
+        "request-competition",
+    ]
+    assert all(
+        call["AttributeNames"]
+        == [
+            "ApproximateNumberOfMessages",
+            "ApproximateNumberOfMessagesNotVisible",
+            "ApproximateNumberOfMessagesDelayed",
+        ]
+        for call in sqs.calls
+    )
+
+
+def test_scale_down_requires_three_distinct_request_queues_separate_from_jobs() -> None:
+    import pytest
+
+    with pytest.raises(ScaleDownConfigurationError, match="exactly three request queue URLs"):
+        PostgresSqsActivityProbe(
+            engine=FakeEngine(),  # type: ignore[arg-type]
+            sqs_client=FakeSqs(),
+            queue_urls=("job-basic", "job-custom", "job-competition"),
+            request_queue_urls=(),
+        )
+    with pytest.raises(ScaleDownConfigurationError, match="must be distinct from execution"):
+        PostgresSqsActivityProbe(
+            engine=FakeEngine(),  # type: ignore[arg-type]
+            sqs_client=FakeSqs(),
+            queue_urls=("job-basic", "job-custom", "job-competition"),
+            request_queue_urls=("request-basic", "request-custom", "job-basic"),
         )
 
 
