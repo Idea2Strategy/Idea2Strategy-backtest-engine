@@ -105,15 +105,31 @@ class PostgresSqsActivityProbe:
         "ApproximateNumberOfMessagesDelayed",
     )
 
-    def __init__(self, *, engine: Engine, sqs_client: Any, queue_urls: Sequence[str]) -> None:
-        urls = tuple(queue_url.strip() for queue_url in queue_urls)
-        if len(urls) != 3 or any(not queue_url for queue_url in urls):
+    def __init__(
+        self,
+        *,
+        engine: Engine,
+        sqs_client: Any,
+        queue_urls: Sequence[str],
+        request_queue_urls: Sequence[str],
+    ) -> None:
+        execution_urls = tuple(queue_url.strip() for queue_url in queue_urls)
+        request_urls = tuple(queue_url.strip() for queue_url in request_queue_urls)
+        if len(execution_urls) != 3 or any(not queue_url for queue_url in execution_urls):
             raise ScaleDownConfigurationError("scale-down requires exactly three lane queue URLs")
-        if len(set(urls)) != 3:
+        if len(set(execution_urls)) != 3:
             raise ScaleDownConfigurationError("scale-down lane queue URLs must be distinct")
+        if len(request_urls) != 3 or any(not queue_url for queue_url in request_urls):
+            raise ScaleDownConfigurationError("scale-down requires exactly three request queue URLs")
+        if len(set(request_urls)) != 3:
+            raise ScaleDownConfigurationError("scale-down request queue URLs must be distinct")
+        if set(execution_urls) & set(request_urls):
+            raise ScaleDownConfigurationError(
+                "scale-down request queue URLs must be distinct from execution queue URLs"
+            )
         self._engine = engine
         self._sqs = sqs_client
-        self._queue_urls = urls
+        self._queue_urls = execution_urls + request_urls
 
     def observe(self) -> BacktestActivity:
         with self._engine.connect() as connection:
@@ -175,6 +191,7 @@ def controller_from_env(
     sqs_client: Any,
     autoscaling_client: Any,
     queue_urls: Sequence[str],
+    request_queue_urls: Sequence[str],
 ) -> InstanceScaleDownController | None:
     enabled = environ.get("BACKTEST_SCALE_DOWN_ENABLED", "false").strip().lower()
     if enabled in {"", "false"}:
@@ -187,7 +204,12 @@ def controller_from_env(
     except ValueError as exc:
         raise ScaleDownConfigurationError("BACKTEST_SCALE_DOWN_POLL_SECONDS must be numeric") from exc
     return InstanceScaleDownController(
-        probe=PostgresSqsActivityProbe(engine=engine, sqs_client=sqs_client, queue_urls=queue_urls),
+        probe=PostgresSqsActivityProbe(
+            engine=engine,
+            sqs_client=sqs_client,
+            queue_urls=queue_urls,
+            request_queue_urls=request_queue_urls,
+        ),
         capacity=Boto3DesiredCapacityPort(autoscaling_client),
         asg_name=asg_name,
         poll_seconds=poll_seconds,

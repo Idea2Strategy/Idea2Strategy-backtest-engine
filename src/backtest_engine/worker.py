@@ -918,6 +918,7 @@ def run() -> None:
     client = _runtime_sqs_client(os.environ)
     request_intake_stop = threading.Event()
     request_threads: list[threading.Thread] = []
+    request_configs: dict[Any, Any] = {}
     request_mode = any(
         os.environ.get(f"BACKTEST_{lane}_REQUEST_QUEUE_URL")
         for lane in ("BASIC", "CUSTOM", "COMPETITION")
@@ -956,6 +957,11 @@ def run() -> None:
 
         if not lane_mode:
             raise WorkerConfigurationError("instance scale-down requires the three-lane worker mode")
+        if not request_mode:
+            raise WorkerConfigurationError(
+                "instance scale-down requires all three producer request queues"
+            )
+        from .backtest_request_intake import RequestLane
         from .persistence import create_backtest_engine
         from .scale_down import controller_from_env
 
@@ -969,6 +975,7 @@ def run() -> None:
             sqs_client=client,
             autoscaling_client=boto3.client("autoscaling", endpoint_url=os.environ.get("AWS_ENDPOINT_URL")),
             queue_urls=[configs[lane].queue_url for lane in BacktestLane],
+            request_queue_urls=[request_configs[lane].queue_url for lane in RequestLane],
         )
         assert controller is not None
         scale_down_thread = threading.Thread(
