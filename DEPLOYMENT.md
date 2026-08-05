@@ -71,6 +71,13 @@ the `_REQUEST_QUEUE_URL` queues below; keep `BACKTEST_{BASIC,CUSTOM,COMPETITION}
 for the 2/1/1 execution scheduler. The worker refuses to start if any request,
 request-DLQ or execution URL aliases another boundary.
 
+When `BACKTEST_SCALE_DOWN_ENABLED=true`, scale-down is fail-closed unless all
+three execution queues and all three producer request queues are configured.
+The idle probe reads visible, in-flight and delayed counts from all six queues;
+missing or invalid SQS telemetry resets the idle window and cannot authorize
+desired capacity zero. CloudWatch request-queue alarms must wake the ASG from
+zero before an intake worker exists.
+
 ```text
 BACKTEST_BASIC_REQUEST_QUEUE_URL=...
 BACKTEST_BASIC_REQUEST_DLQ_URL=...
