@@ -16,10 +16,11 @@ def test_dockerfile_uses_the_reproducible_bookworm_base_image() -> None:
     assert dockerfile_lines[0] == f"FROM {APPROVED_BASE_IMAGE}"
 
 
-def test_dockerfile_removes_runtime_unused_perl_after_installation() -> None:
+def test_dockerfile_purges_runtime_unused_perl_and_package_metadata_after_installation() -> None:
     dockerfile = (REPOSITORY_ROOT / "Dockerfile").read_text(encoding="utf-8")
 
     install_position = dockerfile.index("RUN pip install --no-cache-dir .")
-    removal_position = dockerfile.index("RUN dpkg --remove --force-remove-essential perl-base")
+    purge_position = dockerfile.index("RUN dpkg --purge --force-remove-essential perl-base")
 
-    assert removal_position > install_position
+    assert purge_position > install_position
+    assert "rm -f /var/lib/dpkg/status-old" in dockerfile
