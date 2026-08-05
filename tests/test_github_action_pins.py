@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+
 EXPECTED_PINS = {
     "actions/checkout": ("3d3c42e5aac5ba805825da76410c181273ba90b1", "v7.0.1"),
     "actions/setup-python": ("5fda3b95a4ea91299a34e894583c3862153e4b97", "v7.0.0"),
