@@ -10,6 +10,8 @@ import pytest
 from backtest_engine.backtest_request_intake import RequestLane, RequestProcessingError
 from backtest_engine.request_dispatch import (
     BacktestRequestJobPublisher,
+    PinnedDataset,
+    PinnedFeatureMaterialization,
     QueuedRunProjection,
 )
 from backtest_engine.wiring import (
@@ -61,22 +63,44 @@ def projection(request: dict[str, Any], lane: RequestLane) -> QueuedRunProjectio
         message_id=uuid.UUID(request["metadata"]["messageId"]),
         bot_id=uuid.UUID(request["botId"]),
         owner_account_id=ACCOUNT_ID,
+        input_bundle_id=uuid.UUID("96000000-0000-4000-8000-000000000001"),
         input_bundle_fingerprint="7" * 64,
+        input_contract_version=str(request["metadata"]["contractVersion"]),
         compiled_plan_checksum=request["compiledPlanChecksum"],
         strategy_snapshot_hash=request["expectedSnapshotHash"],
-        dataset_manifest_id=uuid.UUID(
-            request["datasetManifestId"]
-            if lane is not RequestLane.COMPETITION
-            else request["periods"][0]["datasets"][0]["datasetManifestId"]
+        datasets=tuple(
+            PinnedDataset(
+                dataset_manifest_id=uuid.UUID(str(item["datasetManifestId"])),
+                purpose_code=str(item["purposeCode"]),
+                locked_dataset_hash=str(item["expectedDatasetHash"]),
+            )
+            for item in (
+                request["periods"][0]["datasets"]
+                if lane is RequestLane.COMPETITION
+                else (
+                    {
+                        "datasetManifestId": request["datasetManifestId"],
+                        "purposeCode": "MARKET_BARS",
+                        "expectedDatasetHash": (
+                            "sha256:" + "4" * 64
+                            if lane is RequestLane.BASIC
+                            else request["expectedDatasetHash"]
+                        ),
+                    },
+                )
+            )
         ),
-        dataset_hash=(
-            "sha256:" + "4" * 64
-            if lane is RequestLane.BASIC
-            else request["expectedDatasetHash"]
-            if lane is RequestLane.CUSTOM
-            else request["periods"][0]["datasets"][0]["expectedDatasetHash"]
+        feature_materializations=tuple(
+            PinnedFeatureMaterialization(
+                feature_materialization_id=uuid.UUID(str(item["featureMaterializationId"])),
+                locked_result_hash=str(item["lockedResultHash"]),
+            )
+            for item in (
+                request["periods"][0]["featureMaterializations"]
+                if lane is RequestLane.COMPETITION
+                else ()
+            )
         ),
-        feature_materialization_version="features-v1",
         aggregate_sequence=1,
         evaluation_start=date.fromisoformat(period[0]),
         evaluation_end=date.fromisoformat(period[1]),
@@ -100,9 +124,10 @@ def test_publishes_existing_provider_created_run_as_an_execution_job(
     assert queue.jobs == [
         (
             lane,
-            {
-                "backtestRunId": request["runId"],
-                "botId": str(BOT_ID),
+                {
+                    "backtestRunId": request["runId"],
+                    "inputBundleId": "96000000-0000-4000-8000-000000000001",
+                    "botId": str(BOT_ID),
                 "ownerAccountId": str(ACCOUNT_ID),
                 "idempotencyKey": request["metadata"]["idempotencyKey"],
                 "inputBundleFingerprint": "sha256:" + "7" * 64,
@@ -127,7 +152,6 @@ def test_publishes_existing_provider_created_run_as_an_execution_job(
                     }
                 ],
                 "featureMaterializations": [],
-                "featureMaterializationVersion": "features-v1",
                 **(
                     {
                         "evaluationPeriodId": request["periods"][0]["evaluationPeriodId"],
@@ -188,8 +212,49 @@ def test_competition_preserves_every_dataset_and_feature_pin() -> None:
     job = queue.jobs[0][1]
     assert job["evaluationPeriodId"] == request["periods"][0]["evaluationPeriodId"]
     assert job["inputSetHash"] == request["periods"][0]["inputSetHash"]
-    assert job["datasets"] == request["periods"][0]["datasets"]
-    assert job["featureMaterializations"] == request["periods"][0]["featureMaterializations"]
+    assert sorted(job["datasets"], key=lambda item: item["datasetManifestId"]) == sorted(
+        request["periods"][0]["datasets"], key=lambda item: item["datasetManifestId"]
+    )
+    assert sorted(
+        job["featureMaterializations"], key=lambda item: item["featureMaterializationId"]
+    ) == sorted(
+        request["periods"][0]["featureMaterializations"],
+        key=lambda item: item["featureMaterializationId"],
+    )
+
+
+def test_competition_refuses_feature_pins_that_differ_from_the_provider_bundle() -> None:
+    request = competition_request()
+    run = projection(request, RequestLane.COMPETITION)
+    request["periods"][0]["featureMaterializations"].append(
+        {
+            "featureMaterializationId": str(uuid.uuid4()),
+            "lockedResultHash": "sha256:" + "9" * 64,
+        }
+    )
+    publisher = BacktestRequestJobPublisher(Source(run), Queue())
+
+    with pytest.raises(RequestProcessingError, match="RUN_IDENTITY_MISMATCH"):
+        publisher(request, RequestLane.COMPETITION)
+
+
+def test_basic_job_uses_provider_pinned_features_not_unpinned_message_fields() -> None:
+    request = basic_request()
+    feature = PinnedFeatureMaterialization(uuid.uuid4(), "sha256:" + "9" * 64)
+    run = replace(
+        projection(request, RequestLane.BASIC),
+        feature_materializations=(feature,),
+    )
+    queue = Queue()
+
+    BacktestRequestJobPublisher(Source(run), queue)(request, RequestLane.BASIC)
+
+    assert queue.jobs[0][1]["featureMaterializations"] == [
+        {
+            "featureMaterializationId": str(feature.feature_materialization_id),
+            "lockedResultHash": feature.locked_result_hash,
+        }
+    ]
 
 
 def test_basic_request_is_dispatched_through_the_same_pinned_two_stage_boundary() -> None:
@@ -203,9 +268,10 @@ def test_basic_request_is_dispatched_through_the_same_pinned_two_stage_boundary(
     assert queue.jobs == [
         (
             RequestLane.BASIC,
-            {
-                "backtestRunId": request["runId"],
-                "botId": request["botId"],
+                {
+                    "backtestRunId": request["runId"],
+                    "inputBundleId": "96000000-0000-4000-8000-000000000001",
+                    "botId": request["botId"],
                 "ownerAccountId": str(ACCOUNT_ID),
                 "idempotencyKey": request["metadata"]["idempotencyKey"],
                 "inputBundleFingerprint": "sha256:" + "7" * 64,
@@ -222,7 +288,6 @@ def test_basic_request_is_dispatched_through_the_same_pinned_two_stage_boundary(
                     }
                 ],
                 "featureMaterializations": [],
-                "featureMaterializationVersion": "features-v1",
             },
         )
     ]

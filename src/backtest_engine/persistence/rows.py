@@ -53,12 +53,11 @@ MONEY_SCALE = 8
 #: `pinned_at`: two acceptances of the same request pin the same inputs, but they do
 #: not happen at the same instant.
 RUN_INPUT_PIN_IDENTITY_FIELDS: tuple[str, ...] = (
+    "input_bundle_id",
     "input_bundle_fingerprint",
+    "input_contract_version",
     "compiled_plan_checksum",
     "strategy_snapshot_hash",
-    "dataset_manifest_id",
-    "dataset_hash",
-    "feature_materialization_version",
     "execution_policy_version",
 )
 
@@ -242,29 +241,28 @@ class RunAttemptRow:
 
 @dataclass(frozen=True, slots=True)
 class RunInputPinRow:
-    """`backtest.run_input_pins`. The request's pinned identifiers, written at accept.
+    """Provider-owned `backtest.run_input_pins` acceptance evidence.
 
-    Every field is required. `input_bundle_fingerprint` is the execution input fingerprint;
-    `runs.configuration_hash` independently remains the bot launch configuration hash.
+    Dataset and feature pins live under `input_bundle_id`; duplicating them here would
+    create a second source of truth. Backtest consumes this row and its normalized
+    children but never creates production Run identity.
     """
 
     run_id: UUID
+    input_bundle_id: UUID
     input_bundle_fingerprint: str
+    input_contract_version: str
     compiled_plan_checksum: str
     strategy_snapshot_hash: str
-    dataset_manifest_id: UUID
-    dataset_hash: str
-    feature_materialization_version: str
     execution_policy_version: str
     pinned_at: datetime
 
     def __post_init__(self) -> None:
         for name in (
             "input_bundle_fingerprint",
+            "input_contract_version",
             "compiled_plan_checksum",
             "strategy_snapshot_hash",
-            "dataset_hash",
-            "feature_materialization_version",
             "execution_policy_version",
         ):
             value = getattr(self, name)

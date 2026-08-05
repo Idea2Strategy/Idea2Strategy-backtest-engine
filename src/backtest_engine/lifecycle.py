@@ -57,6 +57,7 @@ from .persistence.errors import InvalidStatusTransition as PersistedInvalidStatu
 from .persistence.errors import RowNotFound
 from .persistence.rows import (
     DetailManifestRow,
+    InputBundleRow,
     MonthlyJudgmentSummaryRow,
     PerformanceSummaryRow,
     RunAttemptRow,
@@ -424,6 +425,20 @@ class PersistenceRunGateway:
         try:
             with self._write() as uow:
                 accepted, created = uow.runs.accept(row)
+                # Compatibility for explicitly enabled test/provider fixtures only.
+                # Production provider transactions create this bundle before the
+                # consumer observes the run; production HTTP creation is closed.
+                uow.inputs.lock(
+                    InputBundleRow(
+                        id=pins.input_bundle_id,
+                        run_id=row.id,
+                        bundle_hash=pins.input_bundle_fingerprint,
+                        as_of_at=pins.pinned_at,
+                        locked_at=pins.pinned_at,
+                    ),
+                    datasets=(),
+                    features=(),
+                )
                 uow.pins.pin(pins)
                 return accepted, created
         except PersistedIdempotencyConflict as exc:
@@ -770,24 +785,21 @@ class BacktestLifecycleService:
             execution_policy_version=policy.version,
             idempotency_scope=str(bot_id),
         )
-        # The four values that go into `configuration_hash` and cannot come back out of
-        # it, plus the dataset pair, so `GET /{run_id}/inputs` can answer before a
-        # worker has locked an input bundle. `dataset_hash` is stored bare, matching
-        # `input_datasets.locked_dataset_hash`; the `sha256:` prefix above belongs to
-        # B's fingerprint material, not to the column.
+        # Test-only compatibility identity. Production Backend creates this pin and
+        # normalized bundle atomically before the consumer observes the request.
         pins = RunInputPinRow(
             run_id=run_id,
+            input_bundle_id=uuid5(NAMESPACE_URL, f"backtest-input-bundle:{run_id}"),
             input_bundle_fingerprint=configuration_hash,
+            input_contract_version=str(request["metadata"]["contractVersion"]),
             compiled_plan_checksum=checksum,
             strategy_snapshot_hash=request["expectedSnapshotHash"],
-            dataset_manifest_id=manifest_id,
-            dataset_hash=str(manifest["dataset_hash"]),
-            feature_materialization_version=str(manifest["schema_id"]),
             execution_policy_version=policy.version,
             pinned_at=occurred_at,
         )
         message = {
             "backtestRunId": str(run_id),
+            "inputBundleId": str(pins.input_bundle_id),
             "botId": str(bot_id),
             "ownerAccountId": str(owner_account_id),
             "idempotencyKey": idempotency_key,

@@ -45,19 +45,22 @@ def test_service_specific_aws_endpoint_overrides_the_legacy_shared_endpoint() ->
 
 
 class _Rows:
-    def __init__(self, row: dict[str, object] | None) -> None:
-        self._row = row
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self._rows = rows
 
     def mappings(self) -> _Rows:
         return self
 
     def first(self) -> dict[str, object] | None:
-        return self._row
+        return self._rows[0] if self._rows else None
+
+    def all(self) -> list[dict[str, object]]:
+        return self._rows
 
 
 class _Connection:
-    def __init__(self, row: dict[str, object] | None) -> None:
-        self.row = row
+    def __init__(self, rows: list[list[dict[str, object]]]) -> None:
+        self.rows = rows
         self.params: dict[str, object] | None = None
 
     def __enter__(self) -> _Connection:
@@ -68,12 +71,21 @@ class _Connection:
 
     def execute(self, _statement: object, params: dict[str, object]) -> _Rows:
         self.params = params
-        return _Rows(self.row)
+        rows = self.rows[0] if len(self.rows) == 1 else self.rows.pop(0)
+        if "token_digest" in params:
+            rows = [row for row in rows if row.get("token_digest") == params["token_digest"]]
+        return _Rows(rows)
 
 
 class _Engine:
-    def __init__(self, row: dict[str, object] | None) -> None:
-        self.connection = _Connection(row)
+    def __init__(
+        self,
+        row: dict[str, object] | None,
+        *additional_rows: list[dict[str, object]],
+    ) -> None:
+        self.connection = _Connection(
+            [([] if row is None else [row]), *additional_rows]
+        )
 
     def connect(self) -> _Connection:
         return self.connection
@@ -247,17 +259,31 @@ def test_request_dispatch_reads_the_provider_created_run_and_publishes_a_small_j
                 "message_id": message_id,
                 "bot_id": BOT_ID,
                 "owner_account_id": ACCOUNT_ID,
+                "input_bundle_id": UUID("ffffffff-ffff-4fff-8fff-ffffffffffff"),
                 "input_bundle_fingerprint": "a" * 64,
+                "input_contract_version": "backtest-request.v1",
                 "compiled_plan_checksum": "sha256:" + "b" * 64,
                 "strategy_snapshot_hash": "sha256:" + "c" * 64,
-                "dataset_manifest_id": UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
-                "dataset_hash": "sha256:" + "d" * 64,
-                "feature_materialization_version": "features-v1",
                 "aggregate_sequence": 1,
                 "evaluation_start": date(2024, 1, 1),
                 "evaluation_end": date(2024, 12, 31),
                 "execution_policy_version": "policy-v1",
-            }
+            },
+            [
+                {
+                    "dataset_manifest_id": UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                    "purpose_code": "MARKET_BARS",
+                    "locked_dataset_hash": "sha256:" + "d" * 64,
+                }
+            ],
+            [
+                {
+                    "feature_materialization_id": UUID(
+                        "99999999-9999-4999-8999-999999999999"
+                    ),
+                    "locked_result_hash": "sha256:" + "e" * 64,
+                }
+            ],
         )  # type: ignore[arg-type]
     )
 
@@ -266,6 +292,10 @@ def test_request_dispatch_reads_the_provider_created_run_and_publishes_a_small_j
     assert run is not None
     assert run.lane is RequestLane.CUSTOM
     assert run.owner_account_id == ACCOUNT_ID
+    assert run.input_bundle_id == UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")
+    assert run.input_contract_version == "backtest-request.v1"
+    assert run.datasets[0].purpose_code == "MARKET_BARS"
+    assert len(run.feature_materializations) == 1
 
     class _Sqs:
         sent: dict[str, object] | None = None

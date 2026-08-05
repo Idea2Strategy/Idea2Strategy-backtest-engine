@@ -23,6 +23,8 @@ from backtest_engine.result_query import (
     QueryNotFound,
     QueryNotReady,
     QueryValidationError,
+    RunDatasetInput,
+    RunFeatureInput,
     RunInputs,
     RunProjection,
 )
@@ -64,10 +66,14 @@ def _inputs(fingerprint: str = FINGERPRINT) -> RunInputs:
     return RunInputs(
         compiled_plan_checksum="sha256:" + "b" * 64,
         strategy_snapshot_hash="sha256:" + "a" * 64,
-        dataset_manifest_id=DATASET_ID,
-        dataset_hash="c" * 64,
         input_bundle_fingerprint=fingerprint,
-        feature_materialization_version="feature-v7",
+        input_contract_version="backtest-request.v1",
+        datasets=(RunDatasetInput(DATASET_ID, "MARKET_BARS", "c" * 64),),
+        feature_materializations=(
+            RunFeatureInput(
+                "00000000-0000-4000-8000-000000002999", "e" * 64
+            ),
+        ),
         execution_policy_version="official-policy-v4",
         precision_rules_version="precision:1.0.0",
     )
@@ -91,6 +97,7 @@ def _run(
             "started_at": _instant("2025-11-01T04:01:00Z"),
             "finished_at": _instant("2025-11-01T04:02:00Z"),
             "failure_code": "WORKER_TIMEOUT",
+            "retryable": True,
         }
     elif status == "UNAVAILABLE":
         extra = {
@@ -264,6 +271,16 @@ def test_unavailable_overview_returns_explicit_reason_without_performance() -> N
         service.performance(OWNER_ID, RUN_ID)
 
 
+def test_failed_overview_preserves_provider_retryability_decision() -> None:
+    service, store = _service()
+    store.upsert_run(_run("FAILED"))
+
+    overview = service.overview(OWNER_ID, RUN_ID)
+
+    assert overview.reason_code == "WORKER_TIMEOUT"
+    assert overview.retryable is True
+
+
 # --------------------------------------------------------------------------------
 # projection preconditions
 # --------------------------------------------------------------------------------
@@ -301,6 +318,7 @@ def test_projection_rejects_states_that_cannot_be_rendered() -> None:
             queued_at=_instant(QUEUED_AT),
             inputs=_inputs(),
             failure_code="WORKER_TIMEOUT",
+            retryable=True,
         )
     with pytest.raises(QueryValidationError, match="timezone-aware"):
         RunProjection(
@@ -311,8 +329,8 @@ def test_projection_rejects_states_that_cannot_be_rendered() -> None:
             queued_at=datetime(2025, 11, 1, 4, 0),
             inputs=_inputs(),
         )
-    with pytest.raises(QueryValidationError, match="dataset_hash"):
-        replace(_inputs(), dataset_hash="")
+    with pytest.raises(QueryValidationError, match="locked_dataset_hash"):
+        RunDatasetInput(DATASET_ID, "MARKET_BARS", "")
 
 
 def test_inputs_and_models_preserve_locked_reproducibility_identity() -> None:
@@ -325,10 +343,11 @@ def test_inputs_and_models_preserve_locked_reproducibility_identity() -> None:
     assert view.bot_id == BOT_ID
     assert view.strategy_snapshot_hash == "sha256:" + "a" * 64
     assert view.compiled_plan_checksum == "sha256:" + "b" * 64
-    assert view.dataset_manifest_id == DATASET_ID
-    assert view.dataset_hash == "c" * 64
+    assert view.datasets[0].dataset_manifest_id == DATASET_ID
+    assert view.datasets[0].locked_dataset_hash == "c" * 64
     assert view.input_bundle_fingerprint == FINGERPRINT
-    assert view.feature_materialization_version == "feature-v7"
+    assert view.input_contract_version == "backtest-request.v1"
+    assert len(view.feature_materializations) == 1
     assert view.execution_policy_version == "official-policy-v4"
     assert view.precision_rules_version == "precision:1.0.0"
     assert view.calculation_model_version == "calculation-v9"
@@ -532,6 +551,7 @@ def test_terminal_status_and_running_progress_cannot_be_reversed() -> None:
                 status="UNAVAILABLE",
                 failure_code=None,
                 reason_code="REQUIRED_DATA_MISSING",
+                retryable=None,
                 version=failed.version + 1,
             )
         )

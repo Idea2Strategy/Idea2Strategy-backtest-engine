@@ -31,11 +31,10 @@ object storage, not in PostgreSQL. That is now settled.
 `result_query.DurableBacktestResultQueryStore` takes **option 2 below** and
 reconstructs the projection on read; the reasoning and the price are written down in
 that module's docstring. It stores no projection, so there is nothing here for it to
-drift from. The one row it needed that no canonical table had —
-`backtest.run_input_pins`, the request identifiers `runs.configuration_hash` hashes
-over — is an input row written in the acceptance transaction, contributed by
-`db/migration-contributions/migrations/V20260802094500__backtest_run_input_pins.sql`
-with a change request beside it.
+drift from. `backtest.run_input_pins` is now provider-owned acceptance evidence that
+names the normalized input bundle. This consumer maps that provider schema; the
+historical consumer-owned singular-pin contribution is retained only for audit and
+excluded from current schema assembly.
 
 ## What is still open: `lifecycle.BacktestRunStore`
 

@@ -537,6 +537,7 @@ def _envelope(*, pins: list[dict[str, str]]) -> JobEnvelope:
     return JobEnvelope.parse(
         {
             "backtestRunId": "40000000-0000-4000-8000-000000000001",
+            "inputBundleId": "40000000-0000-4000-8000-000000000004",
             "botId": "40000000-0000-4000-8000-000000000002",
             "ownerAccountId": "40000000-0000-4000-8000-000000000003",
             "idempotencyKey": "FEATURE_OUTPUT_CONSUMER_TEST",
@@ -554,7 +555,6 @@ def _envelope(*, pins: list[dict[str, str]]) -> JobEnvelope:
                 }
             ],
             "featureMaterializations": pins,
-            "featureMaterializationVersion": "feature-series.parquet.v1",
         }
     )
 

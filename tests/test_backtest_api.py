@@ -54,6 +54,7 @@ from backtest_engine.persistence.rows import RunAttemptRow, RunStatus, WorkStatu
 from backtest_engine.result_query import (
     BacktestResultQueryService,
     InMemoryBacktestResultQueryStore,
+    RunDatasetInput,
     RunInputs,
     RunProjection,
 )
@@ -134,10 +135,10 @@ def _query_inputs() -> RunInputs:
     return RunInputs(
         compiled_plan_checksum="sha256:" + "b" * 64,
         strategy_snapshot_hash=SNAPSHOT_HASH,
-        dataset_manifest_id=str(MANIFEST_ID),
-        dataset_hash=DATASET_HASH,
         input_bundle_fingerprint=QUERY_FINGERPRINT,
-        feature_materialization_version="market-bars-v2",
+        input_contract_version="strategy-bot.v1",
+        datasets=(RunDatasetInput(str(MANIFEST_ID), "MARKET_BARS", DATASET_HASH),),
+        feature_materializations=(),
         execution_policy_version="official-backtest-policy-v2",
         precision_rules_version="precision:1.0.0",
     )
@@ -322,7 +323,12 @@ def harness(compiled_plan: dict[str, Any], manifest: dict[str, Any]) -> Iterator
         }
     )
     results = InMemoryBacktestResultQueryStore()
-    app = create_app(service, authenticator, BacktestResultQueryService(results))
+    app = create_app(
+        service,
+        authenticator,
+        BacktestResultQueryService(results),
+        allow_test_provider_creation=True,
+    )
     with TestClient(app) as client:
         yield Harness(service, client, results)
 
@@ -331,6 +337,25 @@ def _accept(harness: Harness, request: dict[str, Any]) -> Any:
     return harness.client.post(
         "/api/v1/backtests", json={"request": request}, headers=harness.owner()
     )
+
+
+def test_production_api_refuses_to_create_provider_owned_runs(
+    harness: Harness, official_request: dict[str, Any]
+) -> None:
+    authenticator = StaticTokenAuthenticator(
+        {OWNER_TOKEN: Principal(account_id=OWNER_ID)}
+    )
+    app = create_app(harness.service, authenticator)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/backtests",
+            json={"request": official_request},
+            headers=harness.owner(),
+        )
+
+    assert response.status_code == 405
+    assert "Backend provider transaction" in response.json()["detail"]
 
 
 def _result(status: str, run_id: str = EXPECTED_RUN_ID, **detail: Any) -> dict[str, Any]:
@@ -1224,7 +1249,15 @@ def test_inputs_and_models_expose_the_locked_reproducibility_identity(
         "datasetManifestId": str(MANIFEST_ID),
         "datasetHash": DATASET_HASH,
         "inputBundleFingerprint": QUERY_FINGERPRINT,
-        "featureMaterializationVersion": "market-bars-v2",
+        "inputContractVersion": "strategy-bot.v1",
+        "datasets": [
+            {
+                "datasetManifestId": str(MANIFEST_ID),
+                "purposeCode": "MARKET_BARS",
+                "lockedDatasetHash": DATASET_HASH,
+            }
+        ],
+        "featureMaterializations": [],
         "executionPolicyVersion": "official-backtest-policy-v2",
         "precisionRulesVersion": "precision:1.0.0",
         "calculationModelVersion": "calculation-v9",

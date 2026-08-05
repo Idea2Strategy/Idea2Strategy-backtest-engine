@@ -42,6 +42,8 @@ from backtest_engine.object_store import S3ObjectStore
 from backtest_engine.persistence import BacktestPersistence, create_backtest_engine
 from backtest_engine.request_dispatch import (
     BacktestRequestJobPublisher,
+    PinnedDataset,
+    PinnedFeatureMaterialization,
     QueuedRunProjection,
 )
 from backtest_engine.wiring import (
@@ -344,35 +346,77 @@ class PostgresQueuedRunSource:
         self._engine = engine
 
     def by_id(self, run_id: uuid.UUID) -> QueuedRunProjection | None:
-        statement = text(
+        run_statement = text(
             """
             SELECT r.id, r.lane::text, r.message_id, r.bot_id, r.owner_account_id,
-                   p.input_bundle_fingerprint, p.compiled_plan_checksum,
-                   p.strategy_snapshot_hash, p.dataset_manifest_id, p.dataset_hash,
-                   p.feature_materialization_version, r.aggregate_sequence,
+                   p.input_bundle_id, p.input_bundle_fingerprint,
+                   p.input_contract_version, p.compiled_plan_checksum,
+                   p.strategy_snapshot_hash, r.aggregate_sequence,
                    r.evaluation_start, r.evaluation_end, r.execution_policy_version
               FROM backtest.runs r
               JOIN backtest.run_input_pins p ON p.run_id = r.id
              WHERE r.id = :run_id
             """
         )
+        dataset_statement = text(
+            """
+            SELECT dataset_manifest_id, purpose_code, locked_dataset_hash
+              FROM backtest.input_datasets
+             WHERE input_bundle_id = :input_bundle_id
+             ORDER BY purpose_code, dataset_manifest_id
+            """
+        )
+        feature_statement = text(
+            """
+            SELECT feature_materialization_id, locked_result_hash
+              FROM backtest.input_feature_materializations
+             WHERE input_bundle_id = :input_bundle_id
+             ORDER BY feature_materialization_id
+            """
+        )
         with self._engine.connect() as connection:
-            row = connection.execute(statement, {"run_id": run_id}).mappings().first()
-        if row is None:
-            return None
+            row = connection.execute(run_statement, {"run_id": run_id}).mappings().first()
+            if row is None:
+                return None
+            bundle_id = uuid.UUID(str(row["input_bundle_id"]))
+            dataset_rows = connection.execute(
+                dataset_statement, {"input_bundle_id": bundle_id}
+            ).mappings().all()
+            feature_rows = connection.execute(
+                feature_statement, {"input_bundle_id": bundle_id}
+            ).mappings().all()
         try:
+            datasets = tuple(
+                PinnedDataset(
+                    dataset_manifest_id=uuid.UUID(str(item["dataset_manifest_id"])),
+                    purpose_code=str(item["purpose_code"]),
+                    locked_dataset_hash=str(item["locked_dataset_hash"]),
+                )
+                for item in dataset_rows
+            )
+            if not datasets:
+                raise ValueError("the canonical input bundle has no datasets")
             return QueuedRunProjection(
                 run_id=uuid.UUID(str(row["id"])),
                 lane=RequestLane(str(row["lane"])),
                 message_id=uuid.UUID(str(row["message_id"])),
                 bot_id=uuid.UUID(str(row["bot_id"])),
                 owner_account_id=uuid.UUID(str(row["owner_account_id"])),
+                input_bundle_id=uuid.UUID(str(row["input_bundle_id"])),
                 input_bundle_fingerprint=str(row["input_bundle_fingerprint"]),
+                input_contract_version=str(row["input_contract_version"]),
                 compiled_plan_checksum=str(row["compiled_plan_checksum"]),
                 strategy_snapshot_hash=str(row["strategy_snapshot_hash"]),
-                dataset_manifest_id=uuid.UUID(str(row["dataset_manifest_id"])),
-                dataset_hash=str(row["dataset_hash"]),
-                feature_materialization_version=str(row["feature_materialization_version"]),
+                datasets=datasets,
+                feature_materializations=tuple(
+                    PinnedFeatureMaterialization(
+                        feature_materialization_id=uuid.UUID(
+                            str(item["feature_materialization_id"])
+                        ),
+                        locked_result_hash=str(item["locked_result_hash"]),
+                    )
+                    for item in feature_rows
+                ),
                 aggregate_sequence=int(row["aggregate_sequence"]),
                 evaluation_start=row["evaluation_start"],
                 evaluation_end=row["evaluation_end"],

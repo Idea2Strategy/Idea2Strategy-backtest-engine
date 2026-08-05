@@ -254,7 +254,12 @@ def build_stack(
     # this wiring did before D29 landed - leaves those two routes answering 503, and
     # no integration module can then assert that a published run is readable.
     recorder = HeaderRecorder(
-        create_app(lifecycle, authenticator, build_result_query_service(persistence, store))
+        create_app(
+            lifecycle,
+            authenticator,
+            build_result_query_service(persistence, store),
+            allow_test_provider_creation=True,
+        )
     )
     client = TestClient(recorder)
     sink = HttpResultSink(client, WORKER_TOKEN)

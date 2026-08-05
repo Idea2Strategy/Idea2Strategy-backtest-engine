@@ -11,6 +11,19 @@ from typing import Any, Protocol
 from .backtest_request_intake import RequestLane, RequestProcessingError
 
 
+@dataclass(frozen=True, slots=True, order=True)
+class PinnedDataset:
+    dataset_manifest_id: uuid.UUID
+    purpose_code: str
+    locked_dataset_hash: str
+
+
+@dataclass(frozen=True, slots=True, order=True)
+class PinnedFeatureMaterialization:
+    feature_materialization_id: uuid.UUID
+    locked_result_hash: str
+
+
 @dataclass(frozen=True, slots=True)
 class QueuedRunProjection:
     """Provider-created run facts required to authorize one queue conversion."""
@@ -20,12 +33,13 @@ class QueuedRunProjection:
     message_id: uuid.UUID
     bot_id: uuid.UUID
     owner_account_id: uuid.UUID
+    input_bundle_id: uuid.UUID
     input_bundle_fingerprint: str
+    input_contract_version: str
     compiled_plan_checksum: str
     strategy_snapshot_hash: str
-    dataset_manifest_id: uuid.UUID
-    dataset_hash: str
-    feature_materialization_version: str
+    datasets: tuple[PinnedDataset, ...]
+    feature_materializations: tuple[PinnedFeatureMaterialization, ...]
     aggregate_sequence: int
     evaluation_start: date
     evaluation_end: date
@@ -48,9 +62,24 @@ def _prefixed(value: str) -> str:
     return prefixed
 
 
-def _period(
+def _dataset_payload(pin: PinnedDataset) -> dict[str, str]:
+    return {
+        "datasetManifestId": str(pin.dataset_manifest_id),
+        "purposeCode": pin.purpose_code,
+        "expectedDatasetHash": pin.locked_dataset_hash,
+    }
+
+
+def _feature_payload(pin: PinnedFeatureMaterialization) -> dict[str, str]:
+    return {
+        "featureMaterializationId": str(pin.feature_materialization_id),
+        "lockedResultHash": pin.locked_result_hash,
+    }
+
+
+def _request_period(
     request: Mapping[str, Any], lane: RequestLane
-) -> tuple[date, date, uuid.UUID, str]:
+) -> tuple[date, date, tuple[PinnedDataset, ...], tuple[PinnedFeatureMaterialization, ...]]:
     try:
         if lane is RequestLane.BASIC:
             raise RequestProcessingError("BASIC_PERIOD_COMES_FROM_RUN", retryable=False)
@@ -58,22 +87,47 @@ def _period(
             return (
                 date.fromisoformat(str(request["periodStart"])),
                 date.fromisoformat(str(request["periodEnd"])),
-                uuid.UUID(str(request["datasetManifestId"])),
-                str(request["expectedDatasetHash"]),
+                (
+                    PinnedDataset(
+                        uuid.UUID(str(request["datasetManifestId"])),
+                        "MARKET_BARS",
+                        str(request["expectedDatasetHash"]),
+                    ),
+                ),
+                (),
             )
         periods = request["periods"]
         if not isinstance(periods, list) or len(periods) != 1:
             raise RequestProcessingError("COMPETITION_PERIOD_COUNT_INVALID", retryable=False)
         period = periods[0]
         datasets = period["datasets"]
-        market_bars = [item for item in datasets if item.get("purposeCode") == "MARKET_BARS"]
+        dataset_pins = tuple(
+            sorted(
+                PinnedDataset(
+                    uuid.UUID(str(item["datasetManifestId"])),
+                    str(item["purposeCode"]),
+                    str(item["expectedDatasetHash"]),
+                )
+                for item in datasets
+            )
+        )
+        feature_pins = tuple(
+            sorted(
+                PinnedFeatureMaterialization(
+                    uuid.UUID(str(item["featureMaterializationId"])),
+                    str(item["lockedResultHash"]),
+                )
+                for item in period["featureMaterializations"]
+            )
+        )
+        market_bars = [item for item in dataset_pins if item.purpose_code == "MARKET_BARS"]
         if len(market_bars) != 1:
             raise RequestProcessingError("MARKET_BARS_DATASET_INVALID", retryable=False)
         return (
             date.fromisoformat(str(period["evaluationStart"])),
             date.fromisoformat(str(period["evaluationEnd"])),
-            uuid.UUID(str(market_bars[0]["datasetManifestId"])),
-            str(market_bars[0]["expectedDatasetHash"]),
+            dataset_pins,
+            feature_pins,
         )
     except RequestProcessingError:
         raise
@@ -106,35 +160,37 @@ class BacktestRequestJobPublisher:
         run = self._source.by_id(run_id)
         if run is None:
             raise RequestProcessingError("RUN_NOT_FOUND", retryable=False)
+        stored_datasets = tuple(sorted(run.datasets))
+        stored_features = tuple(sorted(run.feature_materializations))
+        market_bars = tuple(item for item in stored_datasets if item.purpose_code == "MARKET_BARS")
+        if len(market_bars) != 1:
+            raise RequestProcessingError("MARKET_BARS_DATASET_INVALID", retryable=False)
+        primary = market_bars[0]
         if lane is RequestLane.BASIC:
             start, end = run.evaluation_start, run.evaluation_end
-            dataset_id = uuid.UUID(str(request["datasetManifestId"]))
-            expected_dataset_hash = run.dataset_hash
-            datasets = ({
-                "datasetManifestId": str(dataset_id),
-                "purposeCode": "MARKET_BARS",
-                "expectedDatasetHash": expected_dataset_hash,
-            },)
-            features: tuple[Mapping[str, Any], ...] = ()
+            requested_datasets: tuple[PinnedDataset, ...] = (
+                PinnedDataset(
+                    uuid.UUID(str(request["datasetManifestId"])),
+                    "MARKET_BARS",
+                    primary.locked_dataset_hash,
+                ),
+            )
+            requested_features: tuple[PinnedFeatureMaterialization, ...] = stored_features
             period_identity: dict[str, str] = {}
         else:
-            start, end, dataset_id, expected_dataset_hash = _period(request, lane)
-            if lane is RequestLane.CUSTOM:
-                datasets = ({
-                    "datasetManifestId": str(dataset_id),
-                    "purposeCode": "MARKET_BARS",
-                    "expectedDatasetHash": expected_dataset_hash,
-                },)
-                features = ()
-                period_identity = {}
-            else:
+            start, end, requested_datasets, requested_features = _request_period(request, lane)
+            if lane is RequestLane.COMPETITION:
                 period = request["periods"][0]
-                datasets = tuple(period["datasets"])
-                features = tuple(period["featureMaterializations"])
                 period_identity = {
                     "evaluationPeriodId": str(period["evaluationPeriodId"]),
                     "inputSetHash": str(period["inputSetHash"]),
                 }
+            else:
+                # CUSTOM messages name the selected market dataset. Feature pins are
+                # resolved and committed by the Backend provider, not copied into the
+                # request envelope, so the stored bundle is authoritative for them.
+                requested_features = stored_features
+                period_identity = {}
         identity_matches = all(
             (
                 run.lane is lane,
@@ -145,10 +201,11 @@ class BacktestRequestJobPublisher:
                 run.evaluation_start == start,
                 run.evaluation_end == end,
                 run.execution_policy_version == policy_version,
+                run.input_contract_version == str(request["metadata"]["contractVersion"]),
                 run.compiled_plan_checksum == str(request["compiledPlanChecksum"]),
                 run.strategy_snapshot_hash == str(request["expectedSnapshotHash"]),
-                run.dataset_manifest_id == dataset_id,
-                _prefixed(run.dataset_hash) == _prefixed(expected_dataset_hash),
+                stored_datasets == tuple(sorted(requested_datasets)),
+                stored_features == tuple(sorted(requested_features)),
             )
         )
         if not identity_matches:
@@ -156,18 +213,18 @@ class BacktestRequestJobPublisher:
 
         job = {
             "backtestRunId": str(run.run_id),
+            "inputBundleId": str(run.input_bundle_id),
             "botId": str(run.bot_id),
             "ownerAccountId": str(run.owner_account_id),
             "idempotencyKey": str(request["metadata"]["idempotencyKey"]),
             "inputBundleFingerprint": _prefixed(run.input_bundle_fingerprint),
             "executionPolicyVersion": run.execution_policy_version,
             "compiledPlanChecksum": str(request["compiledPlanChecksum"]),
-            "datasetManifestId": str(dataset_id),
-            "expectedDatasetHash": expected_dataset_hash,
+            "datasetManifestId": str(primary.dataset_manifest_id),
+            "expectedDatasetHash": primary.locked_dataset_hash,
             "expectedSnapshotHash": str(request["expectedSnapshotHash"]),
-            "datasets": [dict(item) for item in datasets],
-            "featureMaterializations": [dict(item) for item in features],
-            "featureMaterializationVersion": run.feature_materialization_version,
+            "datasets": [_dataset_payload(item) for item in stored_datasets],
+            "featureMaterializations": [_feature_payload(item) for item in stored_features],
             **period_identity,
         }
         self._queue.publish(lane, job)

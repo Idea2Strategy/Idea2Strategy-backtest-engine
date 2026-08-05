@@ -62,22 +62,18 @@ authors no result-side schema, which matters while governance is fail-closed.
   That is deliberate — it is what makes a lost or tampered object a
   `QueryIntegrityError` rather than an empty month — but it is real CPU per request,
   proportional to the run's size.
-* **Two things the canonical schema cannot answer, and this store does not fake.**
-  `RunProjection.missing_requirements` has no column anywhere (the `UNAVAILABLE`
-  event's list is not persisted; only `runs.failure_code`, which is the reason code,
-  is), so it comes back empty and the reason code carries the answer. And a *superseded*
-  detail part cannot be reassembled, because `detail_manifests` has
+* **Superseded detail lineage still fails closed.** A *superseded* detail part cannot
+  be reassembled, because `detail_manifests` has
   `supersedes_manifest_id` but not the `base_object_id` / `correction_of_object_id`
   that `detail_hash` covers; this store raises rather than reconstructing a descriptor
   with the lineage silently dropped. Both are recorded in
   `db/migration-contributions/change-requests/2026-08-02-backtest-run-input-pins.md`.
 
-The one piece of storage this card did add is `backtest.run_input_pins`, and it is an
-*input* row, not a projection: `compiled_plan_checksum`, `strategy_snapshot_hash`,
-`input_bundle_fingerprint`, `feature_materialization_version` and `execution_policy_version`
-are explicit request pins and cannot be recovered from the independent bot launch
-`runs.configuration_hash`. They are written in
-the acceptance transaction, so `GET /{run_id}/inputs` answers at every status.
+`backtest.run_input_pins` is provider-owned acceptance evidence, not a projection.
+It names the immutable normalized input bundle and its contract version alongside
+the compiled-plan, strategy-snapshot and execution-policy pins. The read model follows
+that bundle to its dataset and feature children; it never recreates legacy singular
+dataset or feature-version columns.
 """
 
 from __future__ import annotations
@@ -144,6 +140,8 @@ __all__ = [
     "QueryNotFound",
     "QueryNotReady",
     "QueryValidationError",
+    "RunDatasetInput",
+    "RunFeatureInput",
     "RunInputs",
     "RunProjection",
     "TradeDetailView",
@@ -194,15 +192,46 @@ class QueryIntegrityError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class RunDatasetInput:
+    dataset_manifest_id: str
+    purpose_code: str
+    locked_dataset_hash: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "dataset_manifest_id", _uuid(self.dataset_manifest_id, "dataset_manifest_id")
+        )
+        for name in ("purpose_code", "locked_dataset_hash"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise QueryValidationError(f"inputs.datasets.{name} must be non-empty")
+
+
+@dataclass(frozen=True, slots=True)
+class RunFeatureInput:
+    feature_materialization_id: str
+    locked_result_hash: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "feature_materialization_id",
+            _uuid(self.feature_materialization_id, "feature_materialization_id"),
+        )
+        if not isinstance(self.locked_result_hash, str) or not self.locked_result_hash.strip():
+            raise QueryValidationError("inputs.features.locked_result_hash must be non-empty")
+
+
+@dataclass(frozen=True, slots=True)
 class RunInputs:
-    """The immutable reproducibility boundary of one run, as the API reports it."""
+    """The normalized immutable reproducibility boundary of one run."""
 
     compiled_plan_checksum: str
     strategy_snapshot_hash: str
-    dataset_manifest_id: str
-    dataset_hash: str
     input_bundle_fingerprint: str
-    feature_materialization_version: str
+    input_contract_version: str
+    datasets: tuple[RunDatasetInput, ...]
+    feature_materializations: tuple[RunFeatureInput, ...]
     execution_policy_version: str
     precision_rules_version: str
 
@@ -210,16 +239,31 @@ class RunInputs:
         for name in (
             "compiled_plan_checksum",
             "strategy_snapshot_hash",
-            "dataset_manifest_id",
-            "dataset_hash",
             "input_bundle_fingerprint",
-            "feature_materialization_version",
+            "input_contract_version",
             "execution_policy_version",
             "precision_rules_version",
         ):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise QueryValidationError(f"inputs.{name} must be a non-empty string")
+        datasets = tuple(self.datasets)
+        features = tuple(self.feature_materializations)
+        if not datasets:
+            raise QueryValidationError("inputs.datasets must contain at least one pin")
+        if any(not isinstance(item, RunDatasetInput) for item in datasets):
+            raise QueryValidationError("inputs.datasets contains an invalid pin")
+        if any(not isinstance(item, RunFeatureInput) for item in features):
+            raise QueryValidationError("inputs.feature_materializations contains an invalid pin")
+        object.__setattr__(self, "datasets", datasets)
+        object.__setattr__(self, "feature_materializations", features)
+
+    @property
+    def market_bars(self) -> RunDatasetInput:
+        matches = tuple(item for item in self.datasets if item.purpose_code == "MARKET_BARS")
+        if len(matches) != 1:
+            raise QueryValidationError("inputs must contain exactly one MARKET_BARS dataset")
+        return matches[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +281,7 @@ class RunProjection:
     finished_at: datetime | None = None
     failure_code: str | None = None
     reason_code: str | None = None
+    retryable: bool | None = None
     missing_requirements: tuple[str, ...] = ()
     result_manifest_id: str | None = None
 
@@ -262,6 +307,11 @@ class RunProjection:
             raise QueryValidationError("an UNAVAILABLE run must carry a reason_code")
         if self.status == FAILED and not self.failure_code:
             raise QueryValidationError("a FAILED run must carry a failure_code")
+        if self.status == FAILED:
+            if not isinstance(self.retryable, bool):
+                raise QueryValidationError("a FAILED run must carry retryable")
+        elif self.retryable is not None:
+            raise QueryValidationError("only a FAILED run may carry retryable")
         if self.status == COMPLETED:
             object.__setattr__(
                 self, "result_manifest_id", _uuid(self.result_manifest_id, "result_manifest_id")
@@ -296,6 +346,7 @@ class BacktestOverview:
     started_at: datetime | None
     finished_at: datetime | None
     reason_code: str | None
+    retryable: bool | None
     missing_requirements: tuple[str, ...]
     result_manifest_id: str | None
 
@@ -306,10 +357,10 @@ class InputModelView:
     bot_id: str
     strategy_snapshot_hash: str
     compiled_plan_checksum: str
-    dataset_manifest_id: str
-    dataset_hash: str
+    datasets: tuple[RunDatasetInput, ...]
+    feature_materializations: tuple[RunFeatureInput, ...]
     input_bundle_fingerprint: str
-    feature_materialization_version: str
+    input_contract_version: str
     execution_policy_version: str
     precision_rules_version: str
     calculation_model_version: str | None
@@ -626,14 +677,47 @@ class DurableBacktestResultQueryStore:
         terminal one 3. It only has to be monotone, and those three transitions are the
         only ones `backtest.run_status` allows.
 
-        `missing_requirements` is empty because no column holds it - see the module
-        docstring. `reason_code` carries the `UNAVAILABLE` answer, and it is
-        `runs.failure_code`, which is exactly what the worker published.
+        Input datasets and features come from the provider-created bundle named by
+        `run_input_pins`; they are never duplicated onto the pin row.
         """
 
         status = row.status.value
+        try:
+            bundle = uow.inputs.get_by_run(row.id)
+        except RowNotFound as exc:
+            raise QueryIntegrityError(
+                f"backtest run {row.id} has no provider-created input bundle"
+            ) from exc
+        if bundle.id != pin.input_bundle_id:
+            raise QueryIntegrityError(
+                f"backtest run {row.id} pin names bundle {pin.input_bundle_id}, "
+                f"but its canonical bundle is {bundle.id}"
+            )
+        if bundle.bundle_hash != pin.input_bundle_fingerprint:
+            raise QueryIntegrityError(
+                f"backtest run {row.id} pin fingerprint {pin.input_bundle_fingerprint} "
+                f"does not match bundle hash {bundle.bundle_hash}"
+            )
+        datasets = tuple(
+            RunDatasetInput(
+                str(item.dataset_manifest_id), item.purpose_code, item.locked_dataset_hash
+            )
+            for item in uow.inputs.datasets_for(bundle.id)
+        )
+        features = tuple(
+            RunFeatureInput(str(item.feature_materialization_id), item.locked_result_hash)
+            for item in uow.inputs.features_for(bundle.id)
+        )
+        stored_manifest_id = (
+            None if row.result_manifest_id is None else str(row.result_manifest_id)
+        )
+        if result_manifest_id is not None and stored_manifest_id not in (None, result_manifest_id):
+            raise QueryIntegrityError(
+                f"backtest run {row.id} stores result manifest {stored_manifest_id}, "
+                f"but immutable result evidence names {result_manifest_id}"
+            )
         if status == COMPLETED and result_manifest_id is None:
-            result_manifest_id = self._result_manifest_id(uow, row)
+            result_manifest_id = stored_manifest_id or self._result_manifest_id(uow, row)
         try:
             return RunProjection(
                 run_id=str(row.id),
@@ -644,10 +728,10 @@ class DurableBacktestResultQueryStore:
                 inputs=RunInputs(
                     compiled_plan_checksum=pin.compiled_plan_checksum,
                     strategy_snapshot_hash=pin.strategy_snapshot_hash,
-                    dataset_manifest_id=str(pin.dataset_manifest_id),
-                    dataset_hash=pin.dataset_hash,
                     input_bundle_fingerprint=pin.input_bundle_fingerprint,
-                    feature_materialization_version=pin.feature_materialization_version,
+                    input_contract_version=pin.input_contract_version,
+                    datasets=datasets,
+                    feature_materializations=features,
                     execution_policy_version=pin.execution_policy_version,
                     precision_rules_version=row.precision_rules_version,
                 ),
@@ -656,6 +740,10 @@ class DurableBacktestResultQueryStore:
                 finished_at=row.completed_at,
                 failure_code=row.failure_code if status == FAILED else None,
                 reason_code=row.failure_code if status == UNAVAILABLE else None,
+                retryable=row.retryable if status == FAILED else None,
+                missing_requirements=(
+                    tuple(row.missing_requirements or ()) if status == UNAVAILABLE else ()
+                ),
                 result_manifest_id=result_manifest_id,
             )
         except QueryValidationError as exc:
@@ -665,7 +753,7 @@ class DurableBacktestResultQueryStore:
     def _result_manifest_id(self, uow: Any, row: RunRow) -> str:
         """The result manifest id of a completed run, without fetching an object.
 
-        `backtest.*` has no column for it, but every
+        Older schemas had no column for it, but every
         `monthly_judgment_summaries.summary_document` names it and the row's
         `summary_hash` is the document's content address, so reading it there is as
         trustworthy as a column would be. A completed run that produced no month at all
@@ -912,33 +1000,19 @@ class DurableBacktestResultQueryStore:
                 f"run {row.id} pinned {pin.input_bundle_fingerprint} but the stored evidence was "
                 f"produced from sha256:{result.run_snapshot.input_bundle_fingerprint}"
             )
-        self._check_locked_dataset(uow, row, pin)
+        self._check_locked_bundle(uow, row, pin)
 
     @staticmethod
-    def _check_locked_dataset(uow: Any, row: RunRow, pin: RunInputPinRow) -> None:
-        """The request's dataset and the bundle the worker locked must be the same one.
-
-        `run_input_pins` records what the request asked for; `input_datasets` records
-        what the run actually locked. They are written by different processes at
-        different times, so the read model states the agreement rather than assuming it.
-        """
-
+    def _check_locked_bundle(uow: Any, row: RunRow, pin: RunInputPinRow) -> None:
+        """The provider pin must identify the one immutable bundle for this run."""
         try:
             bundle = uow.inputs.get_by_run(row.id)
-        except RowNotFound:
-            # A run can complete without a bundle only if the publisher changed; that
-            # is not this read's business to police, and nothing is being reported
-            # from the missing rows.
-            return
-        locked = {
-            (dataset.dataset_manifest_id, dataset.locked_dataset_hash)
-            for dataset in uow.inputs.datasets_for(bundle.id)
-        }
-        if locked and (pin.dataset_manifest_id, pin.dataset_hash) not in locked:
+        except RowNotFound as exc:
             raise QueryIntegrityError(
-                f"run {row.id} pinned dataset {pin.dataset_manifest_id}@{pin.dataset_hash} but "
-                f"locked {sorted((str(item[0]), item[1]) for item in locked)}"
-            )
+                f"run {row.id} has no provider-created input bundle"
+            ) from exc
+        if bundle.id != pin.input_bundle_id or bundle.bundle_hash != pin.input_bundle_fingerprint:
+            raise QueryIntegrityError(f"run {row.id} pin and canonical input bundle disagree")
 
 
 # --------------------------------------------------------------------------------
@@ -987,6 +1061,7 @@ class BacktestResultQueryService:
             started_at=run.started_at,
             finished_at=run.finished_at,
             reason_code=run.reason_code if run.status == UNAVAILABLE else run.failure_code,
+            retryable=run.retryable,
             missing_requirements=run.missing_requirements,
             result_manifest_id=run.result_manifest_id,
         )
@@ -1000,10 +1075,10 @@ class BacktestResultQueryService:
             bot_id=entry.run.bot_id,
             strategy_snapshot_hash=inputs.strategy_snapshot_hash,
             compiled_plan_checksum=inputs.compiled_plan_checksum,
-            dataset_manifest_id=inputs.dataset_manifest_id,
-            dataset_hash=inputs.dataset_hash,
+            datasets=inputs.datasets,
+            feature_materializations=inputs.feature_materializations,
             input_bundle_fingerprint=inputs.input_bundle_fingerprint,
-            feature_materialization_version=inputs.feature_materialization_version,
+            input_contract_version=inputs.input_contract_version,
             execution_policy_version=inputs.execution_policy_version,
             precision_rules_version=inputs.precision_rules_version,
             calculation_model_version=(
