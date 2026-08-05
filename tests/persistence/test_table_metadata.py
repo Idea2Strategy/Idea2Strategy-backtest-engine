@@ -184,11 +184,7 @@ def _parse_baseline(sql: str) -> dict[str, _DdlTable]:
 def contributed_migration_files() -> list[Path]:
     """Active consumer contribution plus pending provider schema target."""
 
-    active = [
-        path
-        for path in CONTRIBUTED_MIGRATIONS.glob("V*.sql")
-        if path.name != SUPERSEDED_PIN_MIGRATION
-    ]
+    active = [path for path in CONTRIBUTED_MIGRATIONS.glob("V*.sql") if path.name != SUPERSEDED_PIN_MIGRATION]
     return sorted(
         [*active, *PENDING_ROOT_MIGRATIONS.glob("V*.sql.fixture")],
         key=lambda path: int(path.name.split("__", 1)[0].removeprefix("V")),

@@ -145,6 +145,7 @@ def contributed_migration_files() -> list[Path]:
         if path.is_file() and path.name != SUPERSEDED_PIN_MIGRATION
     ]
     files.extend(PENDING_ROOT_MIGRATIONS.glob("V*.sql.fixture"))
+
     def order(path: Path) -> int:
         match = _VERSION.match(path.name)
         if match is None:
