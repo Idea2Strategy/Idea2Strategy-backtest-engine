@@ -27,9 +27,7 @@ from backtest_engine.persistence.contribution import (
 CONTRIBUTION_ROOT = Path(__file__).resolve().parents[2] / "db" / "migration-contributions"
 
 
-def test_container_can_override_the_contribution_root(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_container_can_override_the_contribution_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     configured = tmp_path / "runtime-contribution"
     monkeypatch.setenv("I2S_MIGRATION_CONTRIBUTION_ROOT", str(configured))
 
