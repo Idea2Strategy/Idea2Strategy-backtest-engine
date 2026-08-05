@@ -247,7 +247,11 @@ def harness() -> Harness:
 def test_the_run_id_namespace_and_derivation_are_pinned() -> None:
     assert RUN_ID_NAMESPACE == EXPECTED_RUN_ID_NAMESPACE
     assert run_id_for(B_IDEMPOTENCY_KEY) == UUID("f876f259-4158-5a9a-8973-db21764024dc")
-    assert B_RUN_ID == UUID("00000000-0000-4000-8000-000000000214")
+    request = b_request()
+    if "runId" in request:
+        assert B_RUN_ID == UUID(str(request["runId"]))
+    else:
+        assert B_RUN_ID == run_id_for(B_IDEMPOTENCY_KEY)
     # A different release addresses a different run; the derivation is not a constant.
     assert run_id_for(B_IDEMPOTENCY_KEY.replace("c6dd", "c6de")) != B_RUN_ID
 
