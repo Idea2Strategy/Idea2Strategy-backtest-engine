@@ -13,13 +13,16 @@ legitimate contribution; re-declaring a baseline table is not.
 
 | file | change |
 |---|---|
-| `V20260802094500__backtest_run_input_pins.sql` | adds `backtest.run_input_pins`, the request identifiers `runs.configuration_hash` hashes over and cannot give back. See `../change-requests/2026-08-02-backtest-run-input-pins.md` |
 | `V20260805170000__backtest_run_outcome_detail.sql` | forward-only addition of `result_manifest_id`, `retryable` and `missing_requirements` to `backtest.runs`, plus the CHECK that mirrors the `backtest.v1` UNAVAILABLE branch's `minItems: 1` |
 
 The pending provider-owned table fixture applies at `V20260805130000`, followed by
 the active outcome columns at `V20260805170000`. The historical `V20260802143000`
 proposal is retained only under `fixtures/superseded-proposals` and is never scanned
 as production Flyway SQL.
+
+The historical consumer-owned `V20260802094500` input-pin proposal is retained in the
+same fixture directory. The active directory must not contain it: the root provider's
+normalized `V20260805130000` already creates that table.
 
 `tests/conftest.py` applies every file here to the Testcontainers PostgreSQL 16 after
 the vendored central bundle, and `tests/persistence/test_table_metadata.py` holds both

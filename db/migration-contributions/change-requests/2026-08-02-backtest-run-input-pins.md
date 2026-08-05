@@ -5,7 +5,8 @@ lives in the root superproject and is owned centrally; this repository cannot ed
 and does not claim to have.*
 
 - **Requested by**: `backtest-engine`, card D29 (`docs/backend-implementation-master-checklist.md:338`)
-- **Migration in this repository**: `db/migration-contributions/migrations/V20260802094500__backtest_run_input_pins.sql`
+- **Historical proposal fixture**: `db/migration-contributions/fixtures/superseded-proposals/V20260802094500__backtest_run_input_pins.sql.fixture`
+- **Current provider-owned target fixture**: `db/migration-contributions/fixtures/pending-root/V20260805130000__backtest_run_input_pins.sql.fixture`
 - **Schema touched**: `backtest` only (owner `backtest`, per `DatabaseAccessPolicy.SCHEMA_OWNERS`)
 - **Date**: 2026-08-02
 
