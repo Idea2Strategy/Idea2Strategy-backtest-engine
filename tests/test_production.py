@@ -15,11 +15,11 @@ from backtest_engine.api import RESULT_INGEST_SCOPE
 from backtest_engine.backtest_request_intake import RequestLane
 from backtest_engine.production import (
     ConfigurationError,
+    JwtAuthenticator,
     PostgresCompiledPlanSource,
     PostgresFeatureMaterializationSource,
     PostgresOwnerDirectory,
     PostgresQueuedRunSource,
-    PostgresSessionAuthenticator,
     S3ParquetMarketDataReader,
     S3VersionedFeatureObjectReader,
     SqsExecutionJobQueue,
@@ -194,16 +194,15 @@ def test_feature_materialization_projection_executes_against_postgresql_16(
     assert resolved["objects"] == ()
 
 
-def test_session_authenticator_accepts_valid_customer_and_separate_worker_token() -> None:
+def test_jwt_authenticator_accepts_valid_customer_and_separate_worker_token() -> None:
     key = b"k" * 32
-    raw = "opaque-session"
-    digest = base64.urlsafe_b64encode(hmac.new(key, raw.encode(), hashlib.sha256).digest()).rstrip(b"=").decode()
-    row = {"account_id": ACCOUNT_ID, "token_digest": digest}
-    authenticator = PostgresSessionAuthenticator(
-        _Engine(row),  # type: ignore[arg-type]
+    raw = _customer_access_jwt(key, ACCOUNT_ID)
+    authenticator = JwtAuthenticator(
         hmac_key=key,
         result_token="worker-only",
         result_principal_id=UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+        issuer="https://ideatostrategy.com",
+        audience="idea2strategy-api",
     )
 
     customer = authenticator.authenticate(raw)
@@ -213,6 +212,23 @@ def test_session_authenticator_accepts_valid_customer_and_separate_worker_token(
     assert customer.scopes == frozenset()
     assert worker is not None and worker.has(RESULT_INGEST_SCOPE)
     assert authenticator.authenticate("wrong") is None
+
+
+def _customer_access_jwt(key: bytes, account_id: UUID) -> str:
+    encode = lambda value: base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")  # noqa: E731
+    header = encode(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    now = int(datetime.now(UTC).timestamp())
+    payload = encode(json.dumps({
+        "iss": "https://ideatostrategy.com",
+        "aud": "idea2strategy-api",
+        "sub": str(account_id),
+        "sid": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        "typ": "access",
+        "iat": now,
+        "exp": now + 300,
+    }, separators=(",", ":")).encode())
+    signature = encode(hmac.new(key, f"{header}.{payload}".encode("ascii"), hashlib.sha256).digest())
+    return f"{header}.{payload}.{signature}"
 
 
 def test_policy_catalog_is_loaded_from_a_versioned_json_document(tmp_path: Path) -> None:

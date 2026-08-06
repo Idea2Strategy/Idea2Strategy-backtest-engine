@@ -464,25 +464,27 @@ class SqsExecutionJobQueue:
         )
 
 
-class PostgresSessionAuthenticator:
-    """Validate backend opaque sessions and a distinct worker-only token."""
+class JwtAuthenticator:
+    """Validate customer access JWTs locally and a distinct worker-only token."""
 
     def __init__(
         self,
-        engine: Engine,
         *,
         hmac_key: bytes,
         result_token: str,
         result_principal_id: uuid.UUID,
+        issuer: str,
+        audience: str,
     ) -> None:
         if len(hmac_key) < 32:
             raise ConfigurationError("BACKTEST_SESSION_HMAC_KEY must contain at least 32 bytes")
         if not result_token:
             raise ConfigurationError("BACKTEST_RESULT_INGEST_TOKEN must not be empty")
-        self._engine = engine
         self._hmac_key = hmac_key
         self._result_token = result_token
         self._result_principal_id = result_principal_id
+        self._issuer = issuer
+        self._audience = audience
 
     def authenticate(self, token: str) -> Principal | None:
         if hmac.compare_digest(token, self._result_token):
@@ -490,42 +492,52 @@ class PostgresSessionAuthenticator:
                 account_id=self._result_principal_id,
                 scopes=frozenset({RESULT_INGEST_SCOPE}),
             )
-        digest = (
-            base64.urlsafe_b64encode(hmac.new(self._hmac_key, token.encode("utf-8"), hashlib.sha256).digest())
-            .rstrip(b"=")
-            .decode("ascii")
-        )
-        statement = text(
-            """
-            SELECT s.account_id, s.token_digest
-              FROM identity.sessions s
-              JOIN identity.accounts a ON a.id = s.account_id
-              JOIN identity.login_identities li
-                ON li.id = s.authenticated_by_login_identity_id
-              JOIN identity.account_security_states sec ON sec.account_id = s.account_id
-              LEFT JOIN identity.password_credentials pc
-                ON pc.login_identity_id = li.id
-             WHERE s.token_digest = :token_digest
-               AND s.revoked_at IS NULL
-               AND s.expires_at > CURRENT_TIMESTAMP
-               AND a.lifecycle_status = 'ACTIVE'
-               AND li.status = 'ACTIVE'
-               AND s.auth_epoch_at_issue = sec.auth_epoch
-               AND s.credential_version_at_issue IS NOT DISTINCT FROM pc.credential_version
-               AND NOT EXISTS (
-                   SELECT 1 FROM identity.account_sanctions sanction
-                    WHERE sanction.account_id = s.account_id
-                      AND sanction.status = 'ACTIVE'
-                      AND sanction.effective_at <= CURRENT_TIMESTAMP
-                      AND (sanction.expires_at IS NULL OR sanction.expires_at > CURRENT_TIMESTAMP)
-               )
-            """
-        )
-        with self._engine.connect() as connection:
-            row = connection.execute(statement, {"token_digest": digest}).mappings().first()
-        if row is None or not hmac.compare_digest(str(row["token_digest"]), digest):
+        principal_id = self._verify_customer_access(token)
+        if principal_id is None:
             return None
-        return Principal(account_id=uuid.UUID(str(row["account_id"])))
+        return Principal(account_id=principal_id)
+
+    def _verify_customer_access(self, token: str) -> uuid.UUID | None:
+        try:
+            parts = token.split(".")
+            if len(parts) != 3 or any(not part for part in parts):
+                return None
+            header = json.loads(_decode_jwt_part(parts[0]))
+            claims = json.loads(_decode_jwt_part(parts[1]))
+            if not isinstance(header, dict) or not isinstance(claims, dict):
+                return None
+            if header != {"alg": "HS256", "typ": "JWT"}:
+                return None
+            expected = hmac.new(
+                self._hmac_key,
+                f"{parts[0]}.{parts[1]}".encode("ascii"),
+                hashlib.sha256,
+            ).digest()
+            if not hmac.compare_digest(expected, _decode_jwt_part(parts[2])):
+                return None
+            issued_at = claims.get("iat")
+            expires_at = claims.get("exp")
+            now = int(datetime.now(UTC).timestamp())
+            if (
+                claims.get("iss") != self._issuer
+                or claims.get("aud") != self._audience
+                or claims.get("typ") != "access"
+                or not isinstance(issued_at, int)
+                or isinstance(issued_at, bool)
+                or not isinstance(expires_at, int)
+                or isinstance(expires_at, bool)
+                or issued_at > now + 30
+                or expires_at <= now
+            ):
+                return None
+            uuid.UUID(str(claims["sid"]))
+            return uuid.UUID(str(claims["sub"]))
+        except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+            return None
+
+
+def _decode_jwt_part(value: str) -> bytes:
+    return base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True)
 
 
 class SqsDeadLetterSink:
@@ -737,17 +749,18 @@ def load_runtime_policy(path: Path) -> RuntimePolicy:
     return RuntimePolicy(attempt_policy, microstructure, fractional_policy, risk_limits)
 
 
-def api_authenticator(environ: Mapping[str, str] = os.environ) -> PostgresSessionAuthenticator:
+def api_authenticator(environ: Mapping[str, str] = os.environ) -> JwtAuthenticator:
     encoded = _required(environ, "BACKTEST_SESSION_HMAC_KEY_BASE64")
     try:
         hmac_key = base64.b64decode(encoded, validate=True)
     except ValueError as exc:
         raise ConfigurationError("BACKTEST_SESSION_HMAC_KEY_BASE64 is not valid base64") from exc
-    return PostgresSessionAuthenticator(
-        _engine(environ),
+    return JwtAuthenticator(
         hmac_key=hmac_key,
         result_token=_required(environ, "BACKTEST_RESULT_INGEST_TOKEN"),
         result_principal_id=uuid.UUID(_required(environ, "BACKTEST_RESULT_PRINCIPAL_ID")),
+        issuer=environ.get("CUSTOMER_JWT_ISSUER", "https://ideatostrategy.com"),
+        audience=environ.get("CUSTOMER_JWT_ACCESS_AUDIENCE", "idea2strategy-api"),
     )
 
 
