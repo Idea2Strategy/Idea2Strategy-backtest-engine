@@ -256,6 +256,18 @@ class PostgresFeatureMaterializationSource:
                    fd.feature_code, fd.calculator_version, fd.resolution,
                    fd.definition_hash, f.instrument_id, f.input_dataset_set_hash,
                    f.period_start, f.period_end, f.output_dataset_manifest_id,
+                   d.feed_id AS output_dataset_feed_id,
+                   output_feed.code AS output_feed_code,
+                   output_feed.data_kind AS output_feed_data_kind,
+                   output_feed.resolution AS output_feed_resolution,
+                   output_feed.timezone_name AS output_feed_timezone,
+                   output_feed.feed_version AS output_feed_version,
+                   output_feed.retired_at AS output_feed_retired_at,
+                   output_provider.id AS output_provider_id,
+                   output_provider.code AS output_provider_code,
+                   output_provider.display_name AS output_provider_display_name,
+                   output_provider.rights_version AS output_provider_rights_version,
+                   output_provider.status AS output_provider_status,
                    d.status::text AS output_dataset_status,
                    d.data_layer AS output_dataset_layer,
                    d.instrument_id AS output_dataset_instrument_id,
@@ -284,12 +296,16 @@ class PostgresFeatureMaterializationSource:
                 ON fd.id = f.feature_definition_id
               LEFT JOIN market_data.dataset_manifests d
                 ON d.id = f.output_dataset_manifest_id
+              LEFT JOIN market_data.feeds output_feed
+                ON output_feed.id = d.feed_id
+              LEFT JOIN market_data.providers output_provider
+                ON output_provider.id = output_feed.provider_id
               LEFT JOIN market_data.dataset_objects rel
                 ON rel.dataset_manifest_id = d.id
               LEFT JOIN storage.objects obj
                 ON obj.id = rel.object_id
              WHERE f.id = :materialization_id
-             GROUP BY f.id, fd.id, d.id
+              GROUP BY f.id, fd.id, d.id, output_feed.id, output_provider.id
             """
         )
         with self._engine.connect() as connection:

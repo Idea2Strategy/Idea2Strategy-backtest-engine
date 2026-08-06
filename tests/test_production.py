@@ -175,6 +175,22 @@ def test_feature_materialization_projection_executes_against_postgresql_16(
         "00000000-0000-4000-8000-000000000095"
     )
     assert resolved["output_dataset_status"] == "AVAILABLE"
+    assert resolved["output_dataset_feed_id"] == UUID(
+        "00000000-0000-4000-8000-000000000092"
+    )
+    assert resolved["output_feed_code"] == "FIXTURE_BARS"
+    assert resolved["output_feed_data_kind"] == "BAR"
+    assert resolved["output_feed_resolution"] == "PT1M"
+    assert resolved["output_feed_timezone"] == "America/New_York"
+    assert resolved["output_feed_version"] == "1.0.0"
+    assert resolved["output_feed_retired_at"] is None
+    assert resolved["output_provider_id"] == UUID(
+        "00000000-0000-4000-8000-000000000091"
+    )
+    assert resolved["output_provider_code"] == "FIXTURE"
+    assert resolved["output_provider_display_name"] == "Fixture Provider"
+    assert resolved["output_provider_rights_version"] == "1.0.0"
+    assert resolved["output_provider_status"] == "ACTIVE"
     assert resolved["objects"] == ()
 
 

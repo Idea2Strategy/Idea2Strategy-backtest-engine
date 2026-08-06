@@ -56,8 +56,9 @@ from d_reproducibility_testkit import (
 
 
 OFFICIAL_RSI_ID = "0f1b0000-0000-4000-8000-000000000001"
+PROJECT_UUID_NAMESPACE = uuid.UUID("05a27d5a-75d8-4d57-bc9a-31cedf90d791")
 MATERIALIZATION_ID = uuid.UUID("10000000-0000-4000-8000-000000000001")
-DEFINITION_HASH = "1" * 64
+DEFINITION_HASH = "sha256:1a7c3e5b9d2f4068a1c3e5b7d9f20416283a5c7e9b1d3f50627496a8c0e2b4d6"
 INPUT_HASH = "2" * 64
 BUCKET = "feature-data"
 KEY = "features/rsi.parquet"
@@ -72,9 +73,11 @@ def _utc_text(value: datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
-def _canonical_hash(rows: list[dict[str, str]]) -> str:
+def _canonical_hash(
+    rows: list[dict[str, str]], *, definition_hash: str = DEFINITION_HASH
+) -> str:
     payload = {
-        "definition_hash": DEFINITION_HASH,
+        "definition_hash": definition_hash.removeprefix("sha256:"),
         "input_dataset_set_hash": INPUT_HASH,
         "instrument_id": INSTRUMENT_ID,
         "period_end": _utc_text(PERIOD_END),
@@ -90,6 +93,23 @@ def _canonical_hash(rows: list[dict[str, str]]) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _feature_feed_id(
+    definition_hash: str = DEFINITION_HASH,
+    calculator_version: str = "rsi:1.0.0",
+    resolution: str = "1m",
+) -> uuid.UUID:
+    identity = "|".join(
+        (
+            "feature-output-feed",
+            definition_hash,
+            calculator_version,
+            resolution,
+            "feature-series.parquet.v1",
+        )
+    )
+    return uuid.uuid5(PROJECT_UUID_NAMESPACE, identity)
 
 
 def _rows() -> list[dict[str, str]]:
@@ -155,7 +175,7 @@ def _record(body: bytes | None = None, **changes: Any) -> dict[str, Any]:
         "result_hash": result_hash,
         "feature_definition_id": uuid.UUID(OFFICIAL_RSI_ID),
         "feature_code": "RSI_14",
-        "calculator_version": "1.0.0",
+        "calculator_version": "rsi:1.0.0",
         "resolution": "1m",
         "definition_hash": DEFINITION_HASH,
         "instrument_id": uuid.UUID(INSTRUMENT_ID),
@@ -163,6 +183,18 @@ def _record(body: bytes | None = None, **changes: Any) -> dict[str, Any]:
         "period_start": PERIOD_START,
         "period_end": PERIOD_END,
         "output_dataset_manifest_id": uuid.UUID("30000000-0000-4000-8000-000000000001"),
+        "output_dataset_feed_id": _feature_feed_id(),
+        "output_feed_code": "FEATURE_RSI_14_1M_RSI_1_0_0",
+        "output_feed_data_kind": "FEATURE_SERIES",
+        "output_feed_resolution": "1m",
+        "output_feed_timezone": "UTC",
+        "output_feed_version": "rsi-1.0.0+feature-series.parquet.v1",
+        "output_feed_retired_at": None,
+        "output_provider_id": uuid.UUID("b9146ed9-dbb0-5323-93e3-8518f3851236"),
+        "output_provider_code": "IDEA2STRATEGY_INTERNAL",
+        "output_provider_display_name": "Idea2Strategy Derived Data",
+        "output_provider_rights_version": "internal-derived-v1",
+        "output_provider_status": "ACTIVE",
         "output_dataset_status": "AVAILABLE",
         "output_dataset_layer": "DERIVED",
         "output_dataset_instrument_id": uuid.UUID(INSTRUMENT_ID),
@@ -244,13 +276,107 @@ def test_official_rsi_catalog_id_loads_as_the_production_feature() -> None:
     assert plan.required_features[0].definition_version == "rsi:1.0.0"
 
 
-def test_provider_calculator_semantic_version_matches_compiled_feature_version() -> None:
+def test_unprefixed_provider_calculator_alias_does_not_match_the_official_adapter() -> None:
     body = _parquet()
-    record = _record(body, calculator_version="1.0.0")
+    record = _record(
+        body,
+        calculator_version="1.0.0",
+        output_dataset_feed_id=_feature_feed_id(calculator_version="1.0.0"),
+    )
+
+    with pytest.raises(FeatureOutputBindingError, match="semantic version"):
+        _resolve(records={MATERIALIZATION_ID: record}, body=body)
+
+
+def test_seeded_runtime_definition_version_matches_the_same_compiled_feature() -> None:
+    body = _parquet()
+    record = _record(
+        body,
+        calculator_version="rsi:1.0.0",
+        output_dataset_feed_id=_feature_feed_id(
+            calculator_version="rsi:1.0.0"
+        ),
+    )
 
     resolved, _reader = _resolve(records={MATERIALIZATION_ID: record}, body=body)
 
     assert resolved[0].feature_id == "RSI_14"
+
+
+def test_proposed_rsi_seed_reproduces_the_exact_deterministic_feed_identity() -> None:
+    body = _parquet()
+    definition_hash = (
+        "sha256:1a7c3e5b9d2f4068a1c3e5b7d9f20416283a5c7e9b1d3f50627496a8c0e2b4d6"
+    )
+    record = _record(
+        body,
+        definition_hash=definition_hash,
+        calculator_version="rsi:1.0.0",
+        result_hash=_canonical_hash(_rows(), definition_hash=definition_hash),
+        output_dataset_feed_id=uuid.UUID(
+            "063f8f27-5c6a-5348-b2bb-abc3c634149c"
+        ),
+    )
+
+    resolved, _reader = _resolve(records={MATERIALIZATION_ID: record}, body=body)
+
+    assert resolved[0].feature_id == "RSI_14"
+
+
+def test_definition_hash_requires_the_canonical_prefixed_representation() -> None:
+    body = _parquet()
+    bare_hash = DEFINITION_HASH.removeprefix("sha256:")
+    record = _record(
+        body,
+        definition_hash=bare_hash,
+        result_hash=_canonical_hash(_rows(), definition_hash=bare_hash),
+        output_dataset_feed_id=_feature_feed_id(definition_hash=bare_hash),
+    )
+
+    with pytest.raises(FeatureOutputBindingError, match="sha256: prefix"):
+        _resolve(records={MATERIALIZATION_ID: record}, body=body)
+
+
+def test_prefixed_definition_hash_must_match_the_official_rsi_adapter() -> None:
+    body = _parquet()
+    changed_hash = "sha256:" + "f" * 64
+    record = _record(
+        body,
+        definition_hash=changed_hash,
+        result_hash=_canonical_hash(_rows(), definition_hash=changed_hash),
+        output_dataset_feed_id=_feature_feed_id(definition_hash=changed_hash),
+    )
+
+    with pytest.raises(FeatureOutputBindingError, match="official RSI adapter"):
+        _resolve(records={MATERIALIZATION_ID: record}, body=body)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("output_feed_code", "FEATURE_OTHER", "feed code"),
+        ("output_feed_data_kind", "BARS", "FEATURE_SERIES"),
+        ("output_feed_resolution", "15m", "feed resolution"),
+        ("output_feed_timezone", "America/New_York", "feed timezone"),
+        ("output_feed_version", "rsi-legacy", "feed version"),
+        ("output_feed_retired_at", PERIOD_END, "retired"),
+        ("output_provider_id", uuid.uuid4(), "provider identity"),
+        ("output_provider_code", "ALPACA", "provider code"),
+        ("output_provider_display_name", "Drifted", "provider display name"),
+        ("output_provider_rights_version", "unknown", "provider rights"),
+        ("output_provider_status", "INACTIVE", "provider.*ACTIVE"),
+    ],
+)
+def test_feature_output_feed_and_provider_provenance_must_be_exact(
+    field: str,
+    value: Any,
+    message: str,
+) -> None:
+    body = _parquet()
+    record = _record(body, **{field: value})
+
+    with pytest.raises(FeatureOutputBindingError, match=message):
+        _resolve(records={MATERIALIZATION_ID: record}, body=body)
 
 
 def test_exact_pin_is_read_from_the_named_object_version_and_decoded() -> None:
@@ -276,6 +402,7 @@ def test_exact_pin_is_read_from_the_named_object_version_and_decoded() -> None:
         (lambda record: record.update(period_end=PERIOD_END - BAR), "evaluation window"),
         (lambda record: record.update(output_dataset_status="BUILDING"), "AVAILABLE"),
         (lambda record: record.update(output_dataset_layer="RAW"), "DERIVED"),
+        (lambda record: record.update(output_dataset_feed_id=uuid.uuid4()), "feed identity"),
         (
             lambda record: record.update(output_dataset_instrument_id=uuid.uuid4()),
             "dataset instrument",

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from itertools import pairwise
@@ -34,6 +35,15 @@ __all__ = [
 
 
 FEATURE_SERIES_SCHEMA_VERSION = "feature-series.parquet.v1"
+PROJECT_UUID_NAMESPACE = uuid.UUID("05a27d5a-75d8-4d57-bc9a-31cedf90d791")
+INTERNAL_PROVIDER_ID = "b9146ed9-dbb0-5323-93e3-8518f3851236"
+INTERNAL_PROVIDER_CODE = "IDEA2STRATEGY_INTERNAL"
+INTERNAL_PROVIDER_DISPLAY_NAME = "Idea2Strategy Derived Data"
+INTERNAL_PROVIDER_RIGHTS_VERSION = "internal-derived-v1"
+OFFICIAL_RSI_DEFINITION_HASH = "sha256:1a7c3e5b9d2f4068a1c3e5b7d9f20416283a5c7e9b1d3f50627496a8c0e2b4d6"
+OFFICIAL_RSI_FEED_ID = "063f8f27-5c6a-5348-b2bb-abc3c634149c"
+OFFICIAL_RSI_FEED_CODE = "FEATURE_RSI_14_1M_RSI_1_0_0"
+OFFICIAL_RSI_FEED_VERSION = "rsi-1.0.0+feature-series.parquet.v1"
 FEATURE_SERIES_SCHEMA = pa.schema(
     [
         pa.field("bar_start_at", pa.timestamp("us", tz="UTC"), nullable=False),
@@ -80,11 +90,62 @@ def _hash(value: Any, label: str) -> str:
 
 def _uuid_text(value: Any, label: str) -> str:
     try:
-        import uuid
-
         return str(uuid.UUID(str(value)))
     except (TypeError, ValueError) as exc:
         raise FeatureOutputBindingError(f"{label} must be a UUID") from exc
+
+
+def _expected_feature_feed_id(record: Mapping[str, Any]) -> str:
+    definition_hash = str(record.get("definition_hash") or "")
+    digest = _hash(definition_hash, "definition hash")
+    if definition_hash != f"sha256:{digest}":
+        raise FeatureOutputBindingError("definition hash must use the canonical sha256: prefix")
+    if definition_hash != OFFICIAL_RSI_DEFINITION_HASH:
+        raise FeatureOutputBindingError("feature definition hash does not match the official RSI adapter")
+    calculator_version = str(record.get("calculator_version") or "")
+    resolution = str(record.get("resolution") or "")
+    if not calculator_version or not resolution:
+        raise FeatureOutputBindingError(
+            "feature feed identity requires calculator version and resolution"
+        )
+    identity = "|".join(
+        (
+            "feature-output-feed",
+            definition_hash,
+            calculator_version,
+            resolution,
+            FEATURE_SERIES_SCHEMA_VERSION,
+        )
+    )
+    expected = str(uuid.uuid5(PROJECT_UUID_NAMESPACE, identity))
+    if expected != OFFICIAL_RSI_FEED_ID:
+        raise FeatureOutputBindingError("feature feed identity inputs do not match the official RSI adapter")
+    return OFFICIAL_RSI_FEED_ID
+
+
+def _require_output_provenance(record: Mapping[str, Any], requirement: RequiredFeature) -> None:
+    if _uuid_text(record.get("output_provider_id"), "output provider id") != INTERNAL_PROVIDER_ID:
+        raise FeatureOutputBindingError("feature output provider identity does not match the internal provider")
+    if str(record.get("output_provider_code")) != INTERNAL_PROVIDER_CODE:
+        raise FeatureOutputBindingError("feature output provider code does not match")
+    if str(record.get("output_provider_display_name")) != INTERNAL_PROVIDER_DISPLAY_NAME:
+        raise FeatureOutputBindingError("feature output provider display name does not match")
+    if str(record.get("output_provider_rights_version")) != INTERNAL_PROVIDER_RIGHTS_VERSION:
+        raise FeatureOutputBindingError("feature output provider rights version does not match")
+    if str(record.get("output_provider_status")) != "ACTIVE":
+        raise FeatureOutputBindingError("feature output provider must be ACTIVE")
+    if str(record.get("output_feed_code")) != OFFICIAL_RSI_FEED_CODE:
+        raise FeatureOutputBindingError("feature output feed code does not match the official RSI adapter")
+    if str(record.get("output_feed_data_kind")) != "FEATURE_SERIES":
+        raise FeatureOutputBindingError("feature output feed must use FEATURE_SERIES data kind")
+    if str(record.get("output_feed_resolution")) != requirement.bar_resolution:
+        raise FeatureOutputBindingError("feature output feed resolution does not match the plan")
+    if str(record.get("output_feed_timezone")) != "UTC":
+        raise FeatureOutputBindingError("feature output feed timezone must be UTC")
+    if str(record.get("output_feed_version")) != OFFICIAL_RSI_FEED_VERSION:
+        raise FeatureOutputBindingError("feature output feed version does not match the official RSI adapter")
+    if record.get("output_feed_retired_at") is not None:
+        raise FeatureOutputBindingError("feature output feed is retired")
 
 
 def _canonical_result_hash(record: Mapping[str, Any], values: Sequence[PinnedFeatureValue]) -> str:
@@ -131,7 +192,8 @@ def _require_metadata(
         raise FeatureOutputBindingError("feature definition does not match the compiled plan")
     if str(record.get("feature_code")) != requirement.feature_key:
         raise FeatureOutputBindingError("feature code does not match the compiled plan")
-    if str(record.get("calculator_version")) != requirement.feature_version:
+    calculator_version = str(record.get("calculator_version"))
+    if calculator_version != requirement.definition_version:
         raise FeatureOutputBindingError("feature semantic version does not match the compiled plan")
     if str(record.get("resolution")) != requirement.bar_resolution:
         raise FeatureOutputBindingError("feature resolution does not match the compiled plan")
@@ -147,6 +209,13 @@ def _require_metadata(
 
     if record.get("output_dataset_manifest_id") is None:
         raise FeatureOutputBindingError("feature output dataset manifest is missing")
+    if _uuid_text(record.get("output_dataset_feed_id"), "output dataset feed id") != (
+        _expected_feature_feed_id(record)
+    ):
+        raise FeatureOutputBindingError(
+            "feature output dataset feed identity does not match the definition"
+        )
+    _require_output_provenance(record, requirement)
     if _uuid_text(
         record.get("output_dataset_instrument_id"), "output dataset instrument id"
     ) != instrument_id:
