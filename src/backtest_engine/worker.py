@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import logging
 import os
 import signal
 import threading
@@ -68,6 +69,8 @@ _KEY_PREFIX = "BACKTEST_RUN:"
 #: SQS caps a single long poll at 20 seconds and a batch at 10 messages.
 _MAX_WAIT = timedelta(seconds=20)
 _MAX_BATCH = 10
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class WorkerConfigurationError(ValueError):
@@ -619,6 +622,9 @@ class BacktestLaneScheduler:
         lane_limits: Mapping[BacktestLane, int] | None = None,
         global_limit: int = 4,
         idle_wait_seconds: float = 5.0,
+        receive_backoff_seconds: float = 0.25,
+        max_receive_backoff_seconds: float = 5.0,
+        monotonic: Callable[[], float] | None = None,
     ) -> None:
         limits = dict(lane_limits or self.DEFAULT_LIMITS)
         if not workers:
@@ -627,6 +633,12 @@ class BacktestLaneScheduler:
             raise WorkerConfigurationError("global_limit must be at least 1")
         if idle_wait_seconds <= 0:
             raise WorkerConfigurationError("idle_wait_seconds must be positive")
+        if receive_backoff_seconds <= 0:
+            raise WorkerConfigurationError("receive_backoff_seconds must be positive")
+        if max_receive_backoff_seconds < receive_backoff_seconds:
+            raise WorkerConfigurationError(
+                "max_receive_backoff_seconds must be at least receive_backoff_seconds"
+            )
         if set(workers) != set(limits):
             raise WorkerConfigurationError("lane workers and lane limits must name the same lanes")
         if any(limit < 1 for limit in limits.values()):
@@ -638,6 +650,9 @@ class BacktestLaneScheduler:
         self._limits = limits
         self._global_limit = global_limit
         self._idle_wait_seconds = idle_wait_seconds
+        self._receive_backoff_seconds = receive_backoff_seconds
+        self._max_receive_backoff_seconds = max_receive_backoff_seconds
+        self._monotonic = monotonic or time.monotonic
         self._lanes = tuple(workers)
         self._cursor = 0
         self._active_by_lane = dict.fromkeys(self._lanes, 0)
@@ -645,6 +660,8 @@ class BacktestLaneScheduler:
         self._executor = ThreadPoolExecutor(max_workers=global_limit, thread_name_prefix="backtest-lane")
         self._stop = threading.Event()
         self._receive_order: list[BacktestLane] = []
+        self._failure_count = dict.fromkeys(self._lanes, 0)
+        self._retry_at = dict.fromkeys(self._lanes, 0.0)
 
     @property
     def active_count(self) -> int:
@@ -668,7 +685,13 @@ class BacktestLaneScheduler:
             lane = self._next_eligible_lane(empty_lanes)
             if lane is None:
                 break
-            message = self._workers[lane].receive_one()
+            try:
+                message = self._workers[lane].receive_one()
+            except Exception:
+                self._record_lane_failure(lane, "receive")
+                empty_lanes.add(lane)
+                continue
+            self._clear_lane_failure(lane)
             if message is None:
                 empty_lanes.add(lane)
                 continue
@@ -697,7 +720,7 @@ class BacktestLaneScheduler:
                 before = len(self._futures)
                 completed = self.poll_once()
                 if not completed and len(self._futures) == before:
-                    wait_seconds = 0.05 if self._futures else self._idle_wait_seconds
+                    wait_seconds = 0.05 if self._futures else self._next_wait_seconds()
                     self._stop.wait(wait_seconds)
         finally:
             self.wait_for_idle()
@@ -708,6 +731,8 @@ class BacktestLaneScheduler:
             index = (self._cursor + offset) % len(self._lanes)
             lane = self._lanes[index]
             if lane in empty_lanes:
+                continue
+            if self._retry_at[lane] > self._monotonic():
                 continue
             if self._active_by_lane[lane] >= self._limits[lane]:
                 continue
@@ -722,8 +747,40 @@ class BacktestLaneScheduler:
                 continue
             del self._futures[future]
             self._active_by_lane[lane] -= 1
-            completed.append(future.result())
+            try:
+                completed.append(future.result())
+            except Exception:
+                # The message was received with a visibility timeout but was not
+                # acknowledged.  Isolate the failed lane and let SQS redeliver it
+                # after visibility expiry instead of terminating all three lanes.
+                self._record_lane_failure(lane, "handle")
         return tuple(completed)
+
+    def _record_lane_failure(self, lane: BacktestLane, operation: str) -> None:
+        failures = self._failure_count[lane] + 1
+        self._failure_count[lane] = failures
+        delay = min(
+            self._max_receive_backoff_seconds,
+            self._receive_backoff_seconds * (2 ** min(failures - 1, 30)),
+        )
+        self._retry_at[lane] = self._monotonic() + delay
+        _LOGGER.exception(
+            "backtest %s lane %s failed; retrying lane after %.3f seconds",
+            lane.value,
+            operation,
+            delay,
+        )
+
+    def _clear_lane_failure(self, lane: BacktestLane) -> None:
+        self._failure_count[lane] = 0
+        self._retry_at[lane] = 0.0
+
+    def _next_wait_seconds(self) -> float:
+        now = self._monotonic()
+        retry_delays = [retry_at - now for retry_at in self._retry_at.values() if retry_at > now]
+        if not retry_delays:
+            return self._idle_wait_seconds
+        return max(0.001, min(self._idle_wait_seconds, min(retry_delays)))
 
 
 # ==========================================================================
