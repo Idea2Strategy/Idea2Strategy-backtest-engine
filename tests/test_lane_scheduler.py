@@ -72,6 +72,26 @@ class BlockingLaneWorker:
         )
 
 
+class FailFirstReceiveLaneWorker(BlockingLaneWorker):
+    def __init__(
+        self,
+        lane: BacktestLane,
+        count: int,
+        release: threading.Event,
+        *,
+        failures: int = 1,
+    ) -> None:
+        super().__init__(lane, count, release)
+        self.receive_attempts = 0
+        self.failures = failures
+
+    def receive_one(self) -> Mapping[str, Any] | None:
+        self.receive_attempts += 1
+        if self.receive_attempts <= self.failures:
+            raise OSError("simulated transient SQS receive failure")
+        return super().receive_one()
+
+
 def _wait_until(predicate: Any, timeout: float = 2.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -198,6 +218,74 @@ def test_lane_scheduler_round_robins_nonempty_lanes_without_starvation() -> None
     scheduler.wait_for_idle(timeout=2)
 
 
+def test_lane_scheduler_isolates_receive_failure_and_retries_after_capped_backoff() -> None:
+    release = threading.Event()
+    now = [100.0]
+    basic = FailFirstReceiveLaneWorker(BacktestLane.BASIC, 1, release)
+    custom = BlockingLaneWorker(BacktestLane.CUSTOM, 1, release)
+    scheduler = BacktestLaneScheduler(
+        workers={BacktestLane.BASIC: basic, BacktestLane.CUSTOM: custom},
+        lane_limits={BacktestLane.BASIC: 1, BacktestLane.CUSTOM: 1},
+        global_limit=2,
+        receive_backoff_seconds=1.0,
+        max_receive_backoff_seconds=2.0,
+        monotonic=lambda: now[0],
+    )
+
+    scheduler.poll_once()
+    _wait_until(lambda: custom.started == ["custom-0"])
+    assert basic.receive_attempts == 1
+
+    scheduler.poll_once()
+    assert basic.receive_attempts == 1
+
+    release.set()
+    scheduler.wait_for_idle(timeout=2)
+    now[0] += 1.0
+    scheduler.poll_once()
+    scheduler.wait_for_idle(timeout=2)
+
+    assert basic.receive_attempts == 2
+    assert basic.started == ["basic-0"]
+
+
+def test_lane_scheduler_exponential_receive_backoff_stops_at_the_configured_cap() -> None:
+    release = threading.Event()
+    now = [100.0]
+    worker = FailFirstReceiveLaneWorker(
+        BacktestLane.BASIC,
+        0,
+        release,
+        failures=4,
+    )
+    scheduler = BacktestLaneScheduler(
+        workers={BacktestLane.BASIC: worker},
+        lane_limits={BacktestLane.BASIC: 1},
+        global_limit=1,
+        receive_backoff_seconds=1.0,
+        max_receive_backoff_seconds=2.0,
+        monotonic=lambda: now[0],
+    )
+
+    scheduler.poll_once()
+    now[0] += 0.999
+    scheduler.poll_once()
+    assert worker.receive_attempts == 1
+
+    now[0] += 0.001
+    scheduler.poll_once()
+    now[0] += 1.999
+    scheduler.poll_once()
+    assert worker.receive_attempts == 2
+
+    now[0] += 0.001
+    scheduler.poll_once()
+    now[0] += 2.0
+    scheduler.poll_once()
+
+    assert worker.receive_attempts == 4
+
+
 class BlockingFinishStore(InMemoryExecutionKeyStore):
     def __init__(self) -> None:
         super().__init__()
@@ -238,6 +326,62 @@ class OneMessageSqs:
 
     def send_message(self, **kwargs: Any) -> None:
         return None
+
+
+class FailingExecutionStore(InMemoryExecutionKeyStore):
+    def __init__(self, stage: str) -> None:
+        super().__init__()
+        self.stage = stage
+
+    def claim(self, *args: Any, **kwargs: Any):
+        if self.stage == "claim":
+            raise OSError("simulated transient claim failure")
+        return super().claim(*args, **kwargs)
+
+    def finish(self, *args: Any, **kwargs: Any) -> None:
+        if self.stage == "finish":
+            raise OSError("simulated transient finish failure")
+        return super().finish(*args, **kwargs)
+
+
+@pytest.mark.parametrize("stage", ["claim", "finish"])
+def test_scheduler_isolates_completed_future_infrastructure_failure_and_leaves_message_unacked(
+    stage: str,
+) -> None:
+    failed_message = _message(BacktestLane.BASIC, 11)
+    failed_client = OneMessageSqs(failed_message)
+    failed_worker = BacktestWorker(
+        client=failed_client,
+        config=WorkerConfig(
+            queue_url="https://sqs.local/basic",
+            dead_letter_queue_url="https://sqs.local/basic-dlq",
+            worker_id="lane-worker",
+            max_receive_count=3,
+            visibility_timeout=timedelta(seconds=30),
+            wait_time=timedelta(0),
+            max_messages=1,
+            heartbeat_interval=timedelta(seconds=10),
+        ),
+        handler=lambda job, context: JobOutcome(JobResult.SUCCEEDED),
+        store=FailingExecutionStore(stage),
+        clock=lambda: T0,
+    )
+    release = threading.Event()
+    healthy_worker = BlockingLaneWorker(BacktestLane.CUSTOM, 1, release)
+    scheduler = BacktestLaneScheduler(
+        workers={BacktestLane.BASIC: failed_worker, BacktestLane.CUSTOM: healthy_worker},
+        lane_limits={BacktestLane.BASIC: 1, BacktestLane.CUSTOM: 1},
+        global_limit=2,
+    )
+
+    scheduler.poll_once()
+    _wait_until(lambda: healthy_worker.started == ["custom-0"])
+    release.set()
+    completed = scheduler.wait_for_idle(timeout=2)
+
+    assert [item.message_id for item in completed] == ["custom-0"]
+    assert failed_client.deleted == []
+    assert failed_client.visibility_changes == []
 
 
 def test_scheduler_acknowledges_only_after_durable_finish() -> None:
