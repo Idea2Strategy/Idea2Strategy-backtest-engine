@@ -26,7 +26,7 @@ The API additionally requires:
 | `BACKTEST_RESULTS_BUCKET` | Immutable result object bucket. |
 | `BACKTEST_RESULTS_PREFIX` | Optional result key prefix; default `backtest-results`. |
 | `BACKTEST_API_DLQ_URL` | SQS queue for permanently rejected API intake. |
-| `BACKTEST_SESSION_HMAC_KEY_BASE64` | The same 32-byte-or-longer HMAC key used by backend opaque sessions, base64 encoded. Inject from a secret, never from source control. |
+| `CUSTOMER_JWT_SIGNING_KEY_BASE64` | The same 32-byte-or-longer HMAC key the backend uses to sign customer access JWTs, base64 encoded. Inject from a secret, never from source control. |
 | `BACKTEST_RESULT_INGEST_TOKEN` | Dedicated worker-to-API bearer token. Inject from a secret and do not reuse a customer session. |
 | `BACKTEST_RESULT_PRINCIPAL_ID` | Stable UUID identifying the internal result publisher in API evidence. |
 | `BACKTEST_EXECUTION_POLICY_FILE` | Read-only JSON file containing `schemaVersion: 1` and at least one immutable policy. |
