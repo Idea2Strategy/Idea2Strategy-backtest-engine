@@ -188,6 +188,9 @@ def _run_payload(run: BacktestRun) -> dict[str, Any]:
         "completedAt": _iso(row.completed_at),
         "failureCode": row.failure_code,
         "resultHash": row.result_hash,
+        "cancellationRequestedAt": _iso(row.cancellation_requested_at),
+        "cancellationReasonCode": row.cancellation_reason_code,
+        "cancelledAt": _iso(row.cancelled_at),
         "attemptCount": len(run.attempts),
     }
 
@@ -497,6 +500,37 @@ def create_app(
         run = _owned(lifecycle, run_id, principal)
         response.headers["ETag"] = run.etag
         return _run_payload(run)
+
+    @app.post(
+        f"{API_PREFIX}/backtests/{{run_id}}/cancellation",
+        status_code=status.HTTP_202_ACCEPTED,
+        tags=["backtests"],
+    )
+    def cancel_backtest(
+        run_id: UUID,
+        body: dict[str, Any] | None = None,
+        principal: Principal = Auth,
+    ) -> dict[str, Any]:
+        """Owner cancellation: queued is immediate, running stops at the next heartbeat."""
+        reason = str((body or {}).get("reasonCode", "USER_CANCELLED")).strip()
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", reason):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="reasonCode must be an uppercase token of at most 80 characters",
+            )
+        try:
+            run = lifecycle.request_cancellation(
+                run_id,
+                owner_account_id=principal.account_id,
+                reason_code=reason,
+            )
+        except BacktestRunNotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except NotRunOwner as exc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+        except InvalidStatusTransition as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        return {"run": _run_payload(run), "cancellationRequested": True}
 
     @app.get(f"{API_PREFIX}/backtests/{{run_id}}/attempts", tags=["backtests"])
     def get_attempts(run_id: UUID, principal: Principal = Auth) -> dict[str, Any]:

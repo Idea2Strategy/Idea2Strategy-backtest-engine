@@ -64,6 +64,7 @@ from d_reproducibility_testkit import ACCOUNT_ID, policy_with
 from test_d91_release_intake import (
     B_BOT_ID,
     B_DATASET_MANIFEST_ID,
+    B_EXECUTION_POLICY_VERSION,
     B_IDEMPOTENCY_KEY,
     B_RELEASE_QUARTER,
     B_RUN_ID,
@@ -82,7 +83,7 @@ pytestmark = pytest.mark.docker
 VISIBILITY = timedelta(seconds=2)
 
 B_RELEASE_POLICY = policy_with(
-    version="official-backtest-policy-2026q3",
+    version=B_EXECUTION_POLICY_VERSION,
     release_quarter=B_RELEASE_QUARTER,
     period_start=et_quarter_start(2026, 3),
     period_end=et_quarter_start(2026, 4),
@@ -255,7 +256,9 @@ def test_the_slippage_comes_from_the_policy_not_from_the_backends_literal_5(
         ]
     )
 
-    harness.publish(b_request())
+    request = b_request()
+    request["executionPolicyVersion"] = "official-backtest-policy-2026q3-slip17"
+    harness.publish(request)
     harness.drain(expected=1)
 
     assert _runs(admin_engine)[0]["slippage_rate_bps"] == 17

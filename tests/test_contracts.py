@@ -747,7 +747,8 @@ def test_the_supported_operation_set_matches_the_schemas_enum() -> None:
         SUPPORTED_PLAN_OPERATIONS
     )
     assert SUPPORTED_PLAN_OPERATIONS == {
-        "LOAD_FEATURE",
-        "COMPARE",
-        "EMIT_ORDER_CANDIDATE",
+        "LOAD_FEATURE", "COMPARE", "PRICE_COMPARE", "PRICE_CHANGE_PERCENT",
+        "VOLUME_COMPARE", "STREAK", "SMA_CROSS", "RSI_CROSS", "MACD_CROSS",
+        "BOLLINGER_REVERSAL", "POSITION_RETURN", "HOLDING_PERIOD", "PEAK_RETURN",
+        "DRAWDOWN_FROM_PEAK", "SCHEDULE", "EMIT_ORDER_CANDIDATE",
     }

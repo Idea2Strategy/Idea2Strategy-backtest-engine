@@ -55,8 +55,10 @@ materialization 결과 해시입니다. 같은 입력은 같은 이벤트 순서
 | `4h` | `PT4H` | 4시간 봉. 정규장 종료를 넘는 마지막 봉은 장 마감에서 잘립니다 |
 | `1d` | `PT24H` | 거래일 정규장 1개를 한 봉으로 취급합니다 |
 
-기존 `1m`, `5m`, `15m`도 호환성을 위해 유지합니다. 모든 주기는 UTC timestamp를 쓰되,
-거래 가능 여부와 거래일은 XNYS 정규장(ET) 기준입니다. 공급자가 일봉 시작을 자정으로
+새로 발행되는 전략은 위 네 주기 중 하나만 사용할 수 있습니다. `1m`, `5m`, `15m`는 활성
+카탈로그에서 제거되었으며, 이미 릴리스된 bot을 동일하게 재현할 때만 구 catalog reader가
+해석합니다. 모든 주기는 UTC timestamp를 쓰되, 거래 가능 여부와 거래일은 XNYS 정규장(ET)
+기준입니다. 공급자가 일봉 시작을 자정으로
 표시해도 `session_date_et`의 정규장 시가/종가로 정규화합니다.
 
 4시간 봉처럼 세션 끝에서 짧아진 봉은 `session_truncated=true`인 경우에만 허용합니다.
@@ -69,11 +71,13 @@ materialization 결과 해시입니다. 같은 입력은 같은 이벤트 순서
   제공하고 인증 및 소유자 범위를 적용합니다.
 - worker는 SQS long poll, visibility heartbeat, 재전달, DLQ, 중복 실행 방지를 구현합니다.
   취소는 실패가 아니므로 DLQ로 보내지 않고 `CANCELLED`로 저장한 뒤 메시지를 삭제합니다.
+- 소유자는 `POST /api/v1/backtests/{runId}/cancellation`으로 취소를 요청합니다. `QUEUED`는
+  즉시 취소되고 `RUNNING`은 worker 안전 지점에서 협력 취소되며 요청·완료 시각이 보존됩니다.
 - 운영 어댑터는 PostgreSQL, S3 versioned object, 결과 수신 HTTP를 연결합니다.
 - 런타임은 long-only 주문 모델입니다. 공매도와 정규장 외 체결은 지원하지 않습니다.
-- Backtest가 지원하는 주기와 live trading runtime의 지원 주기는 별도 배포 단위입니다.
-  동일 전략을 실거래로 전환하려면 trading-engine의 `30m`, `4h`, `1d` 지원 여부를 별도로
-  확인해야 합니다.
+- `basic-elements:2026-08-08`의 전체 14개 블록과 주문 비율·최대 실행·재진입 대기 의미는
+  live virtual trading runtime과 동일하게 구현됩니다. 두 서비스는 별도 배포 단위이므로
+  정확히 호환되는 root submodule pointer를 하나의 release candidate로 검증해야 합니다.
 
 ## 실행
 

@@ -131,7 +131,12 @@ OFFICIAL_BACKTEST_MESSAGE_TYPE = "OFFICIAL_BACKTEST_REQUESTED"
 #: in `strategy-bot/v1/basic-compiled-plan.schema.json`; `test_contracts.py` asserts
 #: the two agree, so widening one without the other is a test failure.
 SUPPORTED_PLAN_OPERATIONS: frozenset[str] = frozenset(
-    {"LOAD_FEATURE", "COMPARE", "EMIT_ORDER_CANDIDATE"}
+    {
+        "LOAD_FEATURE", "COMPARE", "PRICE_COMPARE", "PRICE_CHANGE_PERCENT",
+        "VOLUME_COMPARE", "STREAK", "SMA_CROSS", "RSI_CROSS", "MACD_CROSS",
+        "BOLLINGER_REVERSAL", "POSITION_RETURN", "HOLDING_PERIOD", "PEAK_RETURN",
+        "DRAWDOWN_FROM_PEAK", "SCHEDULE", "EMIT_ORDER_CANDIDATE",
+    }
 )
 
 #: Card D93. Every ``backtest.v1`` result event states its own origin, as a

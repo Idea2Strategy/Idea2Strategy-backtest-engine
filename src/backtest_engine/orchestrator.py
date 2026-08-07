@@ -231,6 +231,13 @@ class PlanReplay(Protocol):
 
     def run(self) -> Sequence[Any]: ...
 
+    def evaluate_at(
+        self,
+        instant: datetime,
+        visible_events: tuple[MarketDataEvent, ...],
+        runtime_values: Mapping[str, Mapping[str, str]] | None = None,
+    ) -> Any: ...
+
 
 class PlanReplayFactory(Protocol):
     """Binds a loaded plan to the clock and assessment the orchestrator built.
@@ -265,6 +272,10 @@ class ExecutionEngine(Protocol):
     def place(self, candidate: Any) -> str | None: ...
 
     def settle(self, event: MarketDataEvent) -> int: ...
+
+    def runtime_values(
+        self, instant: datetime, events: tuple[MarketDataEvent, ...]
+    ) -> Mapping[str, Mapping[str, str]]: ...
 
     def summary(self) -> ExecutionSummary: ...
 
@@ -703,17 +714,8 @@ class BacktestOrchestrator:
             return _from_attempt_failure(job, assessment, (), failure, coordinator)
 
         replay = self._replay_factory(clock=clock, assessment=assessment)
-        try:
-            evaluations = tuple(replay.run())
-        except Exception:
-            return self._abort(
-                job, coordinator, lease, "PLAN_REPLAY_FAILED",
-                retryable=False, status=ReplayStatus.FAILED,
-                availability=assessment.status,
-            )
-
         return self._execute(
-            job, events, evaluations, replay.gate, assessment, coordinator, lease, monitor
+            job, events, replay, replay.gate, assessment, coordinator, lease, monitor
         )
 
     # -- execution pass ---------------------------------------------------
@@ -722,7 +724,7 @@ class BacktestOrchestrator:
         self,
         job: BacktestJob,
         events: tuple[MarketDataEvent, ...],
-        evaluations: tuple[Any, ...],
+        replay: PlanReplay,
         gate: ExecutionGate,
         assessment: AvailabilityAssessment,
         coordinator: AttemptCoordinator,
@@ -738,11 +740,8 @@ class BacktestOrchestrator:
         events_at: dict[datetime, list[MarketDataEvent]] = {}
         for event in events:
             events_at.setdefault(event.occurred_at, []).append(event)
-        evaluation_at = {
-            evaluation.occurred_at: evaluation for evaluation in evaluations
-        }
-
         steps: list[ReplayStep] = []
+        evaluations: list[Any] = []
         for sequence, instant in enumerate(sorted(events_at), start=1):
             try:
                 lease = coordinator.heartbeat(
@@ -753,7 +752,6 @@ class BacktestOrchestrator:
                     job, assessment, tuple(steps), failure, coordinator
                 )
 
-            evaluation = evaluation_at.get(instant)
             if gate.is_fill_allowed(instant):
                 fillable_events = tuple(events_at[instant])
             elif gate.session_status_at(instant) is MarketSessionStatus.REGULAR_OPEN:
@@ -777,6 +775,27 @@ class BacktestOrchestrator:
             if fill_allowed:
                 for event in fillable_events:
                     fill_count += self._engine.settle(event)
+
+            visible_events = tuple(
+                event
+                for event in events
+                if event.available_at <= instant and event.occurred_at <= instant
+            )
+            runtime_values_provider = getattr(self._engine, "runtime_values", None)
+            runtime_values = (
+                runtime_values_provider(instant, tuple(events_at[instant]))
+                if runtime_values_provider is not None
+                else {}
+            )
+            try:
+                evaluation = replay.evaluate_at(instant, visible_events, runtime_values)
+            except Exception:
+                return self._abort(
+                    job, coordinator, lease, "PLAN_REPLAY_FAILED",
+                    retryable=False, status=ReplayStatus.FAILED,
+                    availability=assessment.status, steps=tuple(steps),
+                )
+            evaluations.append(evaluation)
 
             candidates = tuple(evaluation.candidates) if evaluation else ()
             placed: tuple[str, ...] = ()
@@ -812,7 +831,7 @@ class BacktestOrchestrator:
             )
 
         return self._publish(
-            job, assessment, evaluations, tuple(steps), coordinator, lease
+            job, assessment, tuple(evaluations), tuple(steps), coordinator, lease
         )
 
     def _publish(

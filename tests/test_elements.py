@@ -108,8 +108,21 @@ def test_rsi_14_definition_is_pinned_and_declared() -> None:
         # RSI = 100 - 100/3 = 66.666... -> 66.66666667 at 8dp HALF_EVEN.
         (
             [
-                "100", "102", "101", "103", "102", "104", "103", "105",
-                "104", "106", "105", "107", "106", "108", "107",
+                "100",
+                "102",
+                "101",
+                "103",
+                "102",
+                "104",
+                "103",
+                "105",
+                "104",
+                "106",
+                "105",
+                "107",
+                "106",
+                "108",
+                "107",
             ],
             "66.66666667",
         ),
@@ -131,13 +144,24 @@ def test_rsi_14_matches_the_pinned_formula(closes: list[str], expected: str) -> 
 def test_rsi_uses_only_bars_completed_at_or_before_the_evaluation_instant() -> None:
     # A 16th bar that closes after `as_of` must not shift the answer.
     closes = [
-        "100", "102", "101", "103", "102", "104", "103", "105",
-        "104", "106", "105", "107", "106", "108", "107",
+        "100",
+        "102",
+        "101",
+        "103",
+        "102",
+        "104",
+        "103",
+        "105",
+        "104",
+        "106",
+        "105",
+        "107",
+        "106",
+        "108",
+        "107",
     ]
     bounded = _evaluation(closes)
-    with_future_bar = _evaluation(
-        [*closes, "999"], as_of=bounded.as_of
-    )
+    with_future_bar = _evaluation([*closes, "999"], as_of=bounded.as_of)
     catalog = element_catalog(CATALOG_VERSION)
 
     assert catalog.evaluate(LOAD_RSI, bounded).evidence["value"] == "66.66666667"
@@ -148,8 +172,21 @@ def test_rsi_window_is_bounded_so_older_history_cannot_change_the_value() -> Non
     # A bounded window is what lets C's realtime runtime agree with a replay
     # that started at a different instant: only the last 15 bars matter.
     closes = [
-        "100", "102", "101", "103", "102", "104", "103", "105",
-        "104", "106", "105", "107", "106", "108", "107",
+        "100",
+        "102",
+        "101",
+        "103",
+        "102",
+        "104",
+        "103",
+        "105",
+        "104",
+        "106",
+        "105",
+        "107",
+        "106",
+        "108",
+        "107",
     ]
     catalog = element_catalog(CATALOG_VERSION)
     long_history = _evaluation(["7", "913", "41", "268", *closes])
@@ -236,9 +273,7 @@ def test_compare_uses_the_value_loaded_by_the_preceding_step(
     evaluation = _evaluation(["100"] * 15)
     evaluation.record("RSI_14", Decimal("20.00000000"))
 
-    outcome = catalog.evaluate(
-        _step(2, "COMPARE", operator=operator, threshold=threshold), evaluation
-    )
+    outcome = catalog.evaluate(_step(2, "COMPARE", operator=operator, threshold=threshold), evaluation)
 
     assert outcome.is_passed is expected_pass
     assert outcome.reason_code == expected_reason
@@ -273,9 +308,7 @@ def test_compare_without_a_loaded_operand_is_an_evaluation_error() -> None:
     evaluation = _evaluation(["100"] * 15)
 
     with pytest.raises(ElementEvaluationError) as failure:
-        element_catalog(CATALOG_VERSION).evaluate(
-            _step(2, "COMPARE", operator="LT", threshold="30"), evaluation
-        )
+        element_catalog(CATALOG_VERSION).evaluate(_step(2, "COMPARE", operator="LT", threshold="30"), evaluation)
 
     assert failure.value.reason_code == "CONDITION_EVALUATION_ERROR"
     assert "operand" in str(failure.value)
@@ -287,7 +320,11 @@ def test_compare_without_a_loaded_operand_is_an_evaluation_error() -> None:
 
 
 def test_the_published_catalog_version_is_the_one_b_emits() -> None:
-    assert ELEMENT_CATALOG_VERSIONS == ("basic-elements:2026-07-31",)
+    assert ELEMENT_CATALOG_VERSIONS == (
+        "basic-elements:2026-07-31",
+        "basic-elements:2026-08-07",
+        "basic-elements:2026-08-08",
+    )
     catalog = element_catalog(CATALOG_VERSION)
     assert catalog.version == CATALOG_VERSION
     assert sorted(catalog.operations) == [
@@ -297,6 +334,88 @@ def test_the_published_catalog_version_is_the_one_b_emits() -> None:
     ]
     assert catalog.feature_versions == {"RSI_14": "rsi:1.0.0"}
     assert supported_feature_versions() == {"RSI_14": "rsi:1.0.0"}
+
+
+def test_production_catalog_exposes_every_ui_operation_and_only_new_resolutions() -> None:
+    catalog = element_catalog("basic-elements:2026-08-08")
+    assert set(catalog.operations) == {
+        "PRICE_COMPARE",
+        "PRICE_CHANGE_PERCENT",
+        "VOLUME_COMPARE",
+        "STREAK",
+        "SMA_CROSS",
+        "RSI_CROSS",
+        "MACD_CROSS",
+        "BOLLINGER_REVERSAL",
+        "POSITION_RETURN",
+        "HOLDING_PERIOD",
+        "PEAK_RETURN",
+        "DRAWDOWN_FROM_PEAK",
+        "SCHEDULE",
+        "EMIT_ORDER_CANDIDATE",
+    }
+    for _operation, spec in catalog.specs.items():
+        if "resolution" in spec.enumerations:
+            assert spec.enumerations["resolution"] == ("30m", "1h", "4h", "1d")
+
+
+@pytest.mark.parametrize(
+    ("operation", "arguments"),
+    [
+        ("PRICE_COMPARE", {"resolution": "30m", "operator": "GT", "reference": "PREVIOUS_CLOSE"}),
+        (
+            "PRICE_CHANGE_PERCENT",
+            {"resolution": "30m", "base": "PREVIOUS_CLOSE", "direction": "UP", "thresholdPercent": "1"},
+        ),
+        (
+            "VOLUME_COMPARE",
+            {"resolution": "30m", "operator": "GT", "reference": "PREVIOUS_VOLUME", "period": "1", "multiplier": "1"},
+        ),
+        ("STREAK", {"resolution": "30m", "direction": "UP", "bars": "2"}),
+        ("SMA_CROSS", {"resolution": "30m", "direction": "UP", "shortPeriod": "5", "longPeriod": "20"}),
+        ("RSI_CROSS", {"resolution": "30m", "direction": "UP", "period": "14", "threshold": "50"}),
+        (
+            "MACD_CROSS",
+            {"resolution": "30m", "direction": "UP", "fastPeriod": "12", "slowPeriod": "26", "signalPeriod": "9"},
+        ),
+        ("BOLLINGER_REVERSAL", {"resolution": "30m", "direction": "UP", "period": "20", "deviations": "2"}),
+        ("POSITION_RETURN", {"direction": "PROFIT", "thresholdPercent": "1"}),
+        ("HOLDING_PERIOD", {"unit": "BAR", "amount": "1", "resolution": "30m"}),
+        ("PEAK_RETURN", {"operator": "GTE", "thresholdPercent": "1"}),
+        ("DRAWDOWN_FROM_PEAK", {"operator": "LTE", "thresholdPercent": "2"}),
+        ("SCHEDULE", {"cycle": "EVERY_TRADING_DAY", "interval": "1", "resolution": "30m"}),
+    ],
+)
+def test_every_production_condition_has_an_executable_evaluator(operation: str, arguments: dict[str, str]) -> None:
+    closes = ",".join(str(value) for value in range(1, 160))
+    volumes = ",".join(str(value) for value in range(100, 259))
+    values = {
+        "bar.closed.30m": "true",
+        "closes.30m": closes,
+        "volumes.30m": volumes,
+        "session.open": "1",
+        "session.close": "true",
+        "position.averageEntryPrice": "100",
+        "position.returnPercent": "5",
+        "position.peakReturnPercent": "8",
+        "position.drawdownPercent": "1",
+        "position.holdingBars.30m": "3",
+        "position.holdingTradingDays": "2",
+        "schedule.newTradingDay": "true",
+        "schedule.tradingDayIndex": "1",
+        "schedule.weekFirstTradingDay": "true",
+        "schedule.monthFirstTradingDay": "true",
+        "schedule.monthLastTradingDay": "false",
+    }
+    evaluation = ElementEvaluation(
+        instrument_id=INSTRUMENT,
+        as_of=ORIGIN,
+        inputs=InstrumentInput(instrument_id=INSTRUMENT, series=(), values=values),
+    )
+    step = PlanStep(sequence=1, operation=operation, arguments=arguments)
+    catalog = element_catalog("basic-elements:2026-08-08")
+    catalog.validate_step(step)
+    assert catalog.evaluate(step, evaluation).reason_code
 
 
 def test_unknown_catalog_version_fails_loudly_instead_of_defaulting() -> None:
@@ -405,9 +524,7 @@ def test_the_fixture_steps_validate_unchanged() -> None:
 
 def test_evaluating_the_terminal_order_element_is_a_programming_error() -> None:
     catalog = element_catalog(CATALOG_VERSION)
-    step = _step(
-        3, "EMIT_ORDER_CANDIDATE", allocation="EQUAL", orderType="MARKET", side="BUY"
-    )
+    step = _step(3, "EMIT_ORDER_CANDIDATE", allocation="EQUAL", orderType="MARKET", side="BUY")
 
     with pytest.raises(ElementEvaluationError, match="terminal"):
         catalog.evaluate(step, _evaluation(["100"] * 15))

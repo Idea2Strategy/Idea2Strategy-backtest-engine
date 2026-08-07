@@ -467,6 +467,7 @@ class InstrumentInput:
     series: tuple[InstrumentSeries, ...]
     feature_series: tuple[PinnedFeatureSeries, ...] = ()
     require_pinned_features: bool = False
+    values: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "instrument_id", _uuid(self.instrument_id, "instrument_id"))
@@ -492,6 +493,10 @@ class InstrumentInput:
                 "every feature series must belong to the input instrument"
             )
         object.__setattr__(self, "feature_series", feature_series)
+        values = dict(self.values)
+        if any(not isinstance(key, str) or not isinstance(value, str) for key, value in values.items()):
+            raise ElementEvaluationError("instrument input values must map strings to strings")
+        object.__setattr__(self, "values", MappingProxyType(values))
 
     def series_for(self, data_kind: str, resolution: str) -> InstrumentSeries | None:
         for item in self.series:

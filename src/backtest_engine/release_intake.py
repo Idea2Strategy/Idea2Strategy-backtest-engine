@@ -83,6 +83,7 @@ travelling as a message attribute so the queue is triageable.
 from __future__ import annotations
 
 import json
+import logging
 import signal
 import threading
 import uuid
@@ -118,6 +119,7 @@ __all__ = [
 
 
 INTAKE_VERSION = "backtest-release-intake:1.0.0"
+_LOGGER = logging.getLogger(__name__)
 
 #: SQS caps a single long poll at 20 seconds and a batch at 10 messages.
 _MAX_WAIT = timedelta(seconds=20)
@@ -273,7 +275,10 @@ class OfficialBacktestIntake:
             return self._dead_letter(
                 body, receipt, "UNSUPPORTED_CONTRACT_VERSION", message_id
             )
-        except ContractValidationError:
+        except ContractValidationError as exc:
+            _LOGGER.warning(
+                "official backtest release %s violated its contract: %s", message_id, exc
+            )
             return self._dead_letter(body, receipt, "CONTRACT_VIOLATION", message_id)
         except IdempotencyConflict:
             # B reused an idempotency key for materially different content. A

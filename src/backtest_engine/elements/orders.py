@@ -109,6 +109,11 @@ class OrderCandidate:
     session_date_et: date
     session_closes_at: datetime
     budget_cap_bps: int
+    order_percent: Decimal = Decimal("100")
+    execution_mode: str = "1회만"
+    wait_mode: str = "조건 재충족"
+    wait_interval: int = 1
+    max_executions: int = 1
 
     def __post_init__(self) -> None:
         _text(self.evaluation_id, "evaluation_id")
@@ -183,6 +188,30 @@ class OrderCandidate:
                 f"[{BUDGET_CAP_BPS_MIN}, {BUDGET_CAP_BPS_MAX}], "
                 f"got {self.budget_cap_bps!r}"
             )
+        if not Decimal(0) < self.order_percent <= Decimal(100):
+            raise ElementEvaluationError("order_percent must lie in (0, 100]")
+        if self.execution_mode not in {
+            "1회만",
+            "주기마다",
+            "대기 후 재진입",
+            "대기 후 재실행",
+        }:
+            raise ElementEvaluationError("execution_mode is not supported")
+        if self.wait_mode not in {"조건 재충족", "N봉 이후", "N거래일 이후"}:
+            raise ElementEvaluationError("wait_mode is not supported")
+        allowed_modes = (
+            {"1회만", "주기마다", "대기 후 재진입"}
+            if self.side == "BUY"
+            else {"1회만", "대기 후 재실행"}
+        )
+        if self.execution_mode not in allowed_modes:
+            raise ElementEvaluationError(
+                f"execution_mode {self.execution_mode!r} is not valid for {self.side}"
+            )
+        if self.wait_interval < 1 or self.max_executions < 1:
+            raise ElementEvaluationError(
+                "wait_interval and max_executions must be positive"
+            )
 
 
 def emit_order_candidate(
@@ -214,6 +243,11 @@ def emit_order_candidate(
     allocation_mode = step.argument("allocation")
     order_type = step.argument("orderType")
     side = step.argument("side")
+    order_percent = Decimal(step.arguments.get("orderPercent", "100"))
+    execution_mode = step.arguments.get("executionMode", "1회만")
+    wait_mode = step.arguments.get("waitMode", "조건 재충족")
+    wait_interval = int(step.arguments.get("waitInterval", "1"))
+    max_executions = int(step.arguments.get("maxExecutions", "1"))
 
     if allocation_mode not in SUPPORTED_ALLOCATION_MODES:
         raise _reject_argument(
@@ -256,4 +290,9 @@ def emit_order_candidate(
         session_date_et=session_date_et,
         session_closes_at=session_closes_at,
         budget_cap_bps=budget_cap_bps,
+        order_percent=order_percent,
+        execution_mode=execution_mode,
+        wait_mode=wait_mode,
+        wait_interval=wait_interval,
+        max_executions=max_executions,
     )

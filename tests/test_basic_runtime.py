@@ -14,6 +14,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -31,6 +32,7 @@ from backtest_engine.basic_runtime import (
     PlanLoadFailure,
     ReplaySkipReason,
     ReplayUnavailableError,
+    _ReplayExecutionState,
     bar_closed_event,
     derive_data_requirements,
 )
@@ -68,6 +70,26 @@ OVERSOLD_CLOSES = [
     "100", "101", "100", "99", "98", "97", "96", "95", "94",
     "94", "94", "94", "94", "94", "94", "94", "94", "94", "94", "94",
 ]
+
+
+def test_production_execution_gate_enforces_rearm_wait_and_maximum() -> None:
+    state = _ReplayExecutionState()
+
+    def candidate(session: date = SESSION_DATE) -> Any:
+        return SimpleNamespace(
+            execution_mode="대기 후 재진입",
+            max_executions=2,
+            wait_mode="조건 재충족",
+            wait_interval=1,
+            session_date_et=session,
+        )
+
+    assert state.accepts(candidate()) is True
+    assert state.accepts(candidate()) is False
+    state.observe_non_candidate(BasicDecisionStatus.CONDITION_NOT_MET)
+    assert state.accepts(candidate()) is True
+    state.observe_non_candidate(BasicDecisionStatus.CONDITION_NOT_MET)
+    assert state.accepts(candidate()) is False
 
 
 def _document(path: Path = VALID_PLAN) -> dict[str, Any]:
@@ -165,6 +187,60 @@ def test_loads_bs_published_plan_unmodified() -> None:
     assert (feature.required_observations, feature.definition_bars) == (14, 15)
     assert feature.warmup_bars == 15
     assert plan.reference_series == ("ADJUSTED_BAR", "1m")
+
+
+@pytest.mark.parametrize(
+    ("resolution", "period"),
+    [
+        ("30m", timedelta(minutes=30)),
+        ("1h", timedelta(hours=1)),
+        ("4h", timedelta(hours=4)),
+        ("1d", timedelta(days=1)),
+    ],
+)
+def test_loads_and_executes_the_full_catalog_without_synthetic_features(
+    resolution: str, period: timedelta
+) -> None:
+    def full_catalog(document: dict[str, Any]) -> None:
+        document["elementCatalogVersion"] = "basic-elements:2026-08-08"
+        document["requiredFeatures"] = []
+        document["steps"] = [
+            {"sequence": 1, "operation": "PRICE_COMPARE", "arguments": {
+                "resolution": resolution, "operator": "GT", "reference": "PREVIOUS_CLOSE",
+            }},
+            {"sequence": 2, "operation": "EMIT_ORDER_CANDIDATE", "arguments": {
+                "allocation": "EQUAL", "orderType": "MARKET", "timeInForce": "DAY",
+                "side": "BUY", "orderPercent": "50", "executionMode": "1회만",
+                "waitMode": "조건 재충족", "waitInterval": "1", "maxExecutions": "1",
+            }},
+        ]
+
+    plan = _runtime().load(_resealed(full_catalog))
+    bars = tuple(
+        SeriesBar(
+            instrument_id=FIRST, resolution=resolution,
+            starts_at=OPEN + period * index, ends_at=OPEN + period * (index + 1),
+            close=Decimal(value), volume=Decimal("1000"),
+        )
+        for index, value in enumerate(("100", "101"))
+    )
+    instrument_input = InstrumentInput(
+        instrument_id=FIRST,
+        series=(InstrumentSeries(
+            instrument_id=FIRST, data_kind="ADJUSTED_BAR", resolution=resolution, bars=bars
+        ),),
+        values={
+            f"bar.closed.{resolution}": "true",
+            f"closes.{resolution}": "100,101",
+            f"volumes.{resolution}": "1000,1000",
+        },
+    )
+    result = _runtime().execute(plan, {FIRST: instrument_input}, as_of=bars[-1].ends_at)
+
+    assert plan.reference_series == ("ADJUSTED_BAR", resolution)
+    assert plan.required_features == ()
+    assert result.decisions[0].status is BasicDecisionStatus.CANDIDATE
+    assert result.decisions[0].reference_price == Decimal("101.00000000")
 
 
 def test_the_vendored_fixture_is_byte_identical_to_bs_authoritative_copy() -> None:
@@ -566,7 +642,7 @@ def test_a_plan_without_a_usable_required_features_block_is_refused(
         _runtime().load(document)
 
     assert failure.value.failure is PlanLoadFailure.PLAN_CONTRACT_INVALID
-    assert "requiredFeatures" in str(failure.value)
+    assert ("planChecksum" if value == [] else "requiredFeatures") in str(failure.value)
 
 
 def test_a_declared_floor_above_the_definition_window_widens_the_warm_up() -> None:
