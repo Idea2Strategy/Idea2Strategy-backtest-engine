@@ -88,12 +88,15 @@ Competition jobs preserve `evaluationPeriodId`, `inputSetHash`, all dataset pins
 and all feature materialization pins. The worker re-resolves every dataset and
 hash-checks it before execution, and publication persists the complete pin set.
 
-Locked feature output consumption remains deliberately fail-closed. The current
-canonical/code sources do not define how an output dataset is bound to a
-compiled-plan `LOAD_FEATURE` input. The runtime verifies materialization status,
-result hash, output manifest presence, output availability and output hash, then
-returns `FEATURE_OUTPUT_CONSUMPTION_UNSUPPORTED` rather than silently ignoring
-the locked features.
+Locked feature output consumption is fail-closed and identity-bound. For the active
+Basic catalog, an RSI condition at `30m`, `1h`, `4h`, or `1d` requires the distinct
+`RSI_14` definition and deterministic feature-output feed at that same resolution.
+The runtime verifies the compiled feature UUID/resolution pair, materialization status,
+result hash, output manifest and feed identity, object version, content hash, schema,
+and exact prior/current bar positions before evaluation. Missing, stale, cross-resolution,
+or gapped output is unavailable; RSI is never recomputed from closes in the backtest
+worker. The legacy `RSI_14@1m` identity remains readable only for immutable historical
+plans that already pin the legacy catalog.
 
 `BacktestRequestIntake` and `PostgresRequestReceiptStore` are safe wire-boundary
 components, not a substitute for the missing domain handler. The internal lane

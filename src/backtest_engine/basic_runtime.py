@@ -742,6 +742,13 @@ class BasicPlanRuntime:
                 token = bar_resolution(entry["resolution"])
             except ElementCompatibilityError as failure:
                 raise _reject(failure.failure, failure.detail) from failure
+            pinned_resolution = catalog.require_canonical_feature_resolution(entry["featureId"])
+            if pinned_resolution is not None and token != pinned_resolution:
+                raise _reject(
+                    PlanLoadFailure.FEATURE_VERSION_MISMATCH,
+                    f"requiredFeature {entry['requirementId']!r} uses {token}, but featureId "
+                    f"{entry['featureId']} pins {pinned_resolution}",
+                )
 
             features.append(
                 RequiredFeature(
@@ -792,6 +799,17 @@ class BasicPlanRuntime:
                     )
                 if reference is None:
                     reference = match.series_key
+            if step.operation == "RSI_CROSS":
+                token = step.argument("resolution")
+                match = next(
+                    (item for item in features if item.feature_key == "RSI_14" and item.bar_resolution == token),
+                    None,
+                )
+                if match is None:
+                    raise _structure(
+                        f"RSI_CROSS at sequence {step.sequence} reads RSI_14 at {token}, "
+                        "which plan.requiredFeatures does not declare"
+                    )
         if reference is None:
             resolutions = {step.arguments["resolution"] for step in condition_steps if "resolution" in step.arguments}
             if len(resolutions) > 1:
@@ -1206,7 +1224,9 @@ def _raw_operation_lookback(step: PlanStep) -> int:
     if operation == "SMA_CROSS":
         return int(step.argument("longPeriod")) + 1
     if operation == "RSI_CROSS":
-        return int(step.argument("period")) + 2
+        # RSI history is supplied by the exact pinned feature materialization. One raw bar
+        # remains necessary for the selected-resolution evaluation and pricing clock.
+        return 1
     if operation == "MACD_CROSS":
         return int(step.argument("slowPeriod")) + int(step.argument("signalPeriod")) + 2
     if operation == "BOLLINGER_REVERSAL":

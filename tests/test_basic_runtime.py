@@ -50,6 +50,7 @@ from backtest_engine.elements import (
     InstrumentInput,
     InstrumentSeries,
     SeriesBar,
+    element_catalog,
 )
 from backtest_engine.event_clock import MarketEventClock, MarketSessionStatus
 
@@ -241,6 +242,88 @@ def test_loads_and_executes_the_full_catalog_without_synthetic_features(
     assert plan.required_features == ()
     assert result.decisions[0].status is BasicDecisionStatus.CANDIDATE
     assert result.decisions[0].reference_price == Decimal("101.00000000")
+
+
+@pytest.mark.parametrize(
+    ("resolution", "wire_resolution", "feature_id"),
+    [
+        ("30m", "PT30M", "4b1c6801-0259-5176-a857-0e5ea923d898"),
+        ("1h", "PT1H", "2e18c093-5d4e-5d9a-bd22-b7e5679f1a3e"),
+        ("4h", "PT4H", "1b2785bd-20f0-50a2-ae96-6a1f7bad74b9"),
+        ("1d", "PT24H", "eddfb2d4-8586-5260-8fc9-9c8125990270"),
+    ],
+)
+def test_rsi_cross_requires_the_exact_selected_resolution_feature_definition(
+    resolution: str, wire_resolution: str, feature_id: str
+) -> None:
+    def rsi_cross(document: dict[str, Any]) -> None:
+        catalog = element_catalog("basic-elements:2026-08-08")
+        terminal = catalog.spec("EMIT_ORDER_CANDIDATE")
+        terminal_arguments = {
+            name: values[0] for name, values in terminal.enumerations.items()
+        }
+        terminal_arguments.update(
+            {"orderPercent": "50", "waitInterval": "1", "maxExecutions": "1"}
+        )
+        document["elementCatalogVersion"] = catalog.version
+        document["requiredFeatures"] = [
+            {
+                "requirementId": f"rsi-14-{resolution}",
+                "featureId": feature_id,
+                "featureVersion": "1.0.0",
+                "instruments": [FIRST],
+                "resolution": wire_resolution,
+                "requiredObservations": 14,
+            }
+        ]
+        document["steps"] = [
+            {
+                "sequence": 1,
+                "operation": "RSI_CROSS",
+                "arguments": {
+                    "resolution": resolution,
+                    "direction": "UP",
+                    "period": "14",
+                    "threshold": "50",
+                },
+            },
+            {"sequence": 2, "operation": "EMIT_ORDER_CANDIDATE", "arguments": terminal_arguments},
+        ]
+
+    plan = _runtime().load(_resealed(rsi_cross))
+
+    assert plan.required_features[0].feature_id == feature_id
+    assert plan.required_features[0].bar_resolution == resolution
+    assert plan.reference_series == ("ADJUSTED_BAR", resolution)
+
+
+def test_rsi_cross_rejects_a_feature_uuid_from_another_resolution() -> None:
+    def mismatched(document: dict[str, Any]) -> None:
+        catalog = element_catalog("basic-elements:2026-08-08")
+        terminal = catalog.spec("EMIT_ORDER_CANDIDATE")
+        terminal_arguments = {
+            name: values[0] for name, values in terminal.enumerations.items()
+        }
+        terminal_arguments.update(
+            {"orderPercent": "50", "waitInterval": "1", "maxExecutions": "1"}
+        )
+        document["elementCatalogVersion"] = catalog.version
+        document["requiredFeatures"] = [{
+            "requirementId": "rsi-14-30m",
+            "featureId": "2e18c093-5d4e-5d9a-bd22-b7e5679f1a3e",
+            "featureVersion": "1.0.0",
+            "instruments": [FIRST],
+            "resolution": "PT30M",
+            "requiredObservations": 14,
+        }]
+        document["steps"] = [{
+            "sequence": 1,
+            "operation": "RSI_CROSS",
+            "arguments": {"resolution": "30m", "direction": "UP", "period": "14", "threshold": "50"},
+        }, {"sequence": 2, "operation": "EMIT_ORDER_CANDIDATE", "arguments": terminal_arguments}]
+
+    with pytest.raises(BasicPlanCompatibilityError, match="pins 1h"):
+        _runtime().load(_resealed(mismatched))
 
 
 def test_the_vendored_fixture_is_byte_identical_to_bs_authoritative_copy() -> None:
@@ -603,13 +686,13 @@ def _set_feature(**changes: Any) -> Any:
             PlanLoadFailure.PLAN_CONTRACT_INVALID,
             "duplicates an earlier required feature",
         ),
-        (
-            # The step still reads RSI_14 at 1m, but the plan now declares the
-            # history for 5m. The step's series was never requested.
-            _set_feature(resolution="PT5M"),
-            PlanLoadFailure.PLAN_STRUCTURE_INVALID,
-            "does not declare",
-        ),
+            (
+                # The step still reads RSI_14 at 1m, but the plan now declares the
+                # history for 5m. The canonical feature UUID itself pins 1m.
+                _set_feature(resolution="PT5M"),
+                PlanLoadFailure.FEATURE_VERSION_MISMATCH,
+                "pins 1m",
+            ),
     ],
 )
 def test_rejects_a_required_features_block_it_cannot_honour(

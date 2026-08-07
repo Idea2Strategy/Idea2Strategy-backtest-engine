@@ -44,6 +44,40 @@ OFFICIAL_RSI_DEFINITION_HASH = "sha256:1a7c3e5b9d2f4068a1c3e5b7d9f20416283a5c7e9
 OFFICIAL_RSI_FEED_ID = "063f8f27-5c6a-5348-b2bb-abc3c634149c"
 OFFICIAL_RSI_FEED_CODE = "FEATURE_RSI_14_1M_RSI_1_0_0"
 OFFICIAL_RSI_FEED_VERSION = "rsi-1.0.0+feature-series.parquet.v1"
+RSI_FEED_IDENTITIES: Mapping[str, tuple[str, str, str, str]] = {
+    # Immutable legacy identity retained for replay of already-published plans.
+    "0f1b0000-0000-4000-8000-000000000001": (
+        OFFICIAL_RSI_DEFINITION_HASH,
+        "1m",
+        OFFICIAL_RSI_FEED_ID,
+        OFFICIAL_RSI_FEED_CODE,
+    ),
+    # Active-catalog proposal: each definition and feed is bound to one execution resolution.
+    "4b1c6801-0259-5176-a857-0e5ea923d898": (
+        "363f534dc77c6af0ebfe58f35be4fd2aa208906b1eaa36b550b17e9acb8692e4",
+        "30m",
+        "57794d8c-2254-53e4-966e-44f97edd9e6a",
+        "FEATURE_RSI_14_30M_RSI_1_0_0",
+    ),
+    "2e18c093-5d4e-5d9a-bd22-b7e5679f1a3e": (
+        "9b8512c0502ca80e1804711ac624eb4a3b4e294a875dac2364e3510e284cc8b9",
+        "1h",
+        "28012549-4f45-56d3-8bb6-329e4c7a9d77",
+        "FEATURE_RSI_14_1H_RSI_1_0_0",
+    ),
+    "1b2785bd-20f0-50a2-ae96-6a1f7bad74b9": (
+        "da3aff028a1fdef861abb1d68852e2ba3a91ed3917f7c7196e2d43ef48176b2c",
+        "4h",
+        "e1d7d508-aaf1-5ae9-8098-c4af870f6fa4",
+        "FEATURE_RSI_14_4H_RSI_1_0_0",
+    ),
+    "eddfb2d4-8586-5260-8fc9-9c8125990270": (
+        "0cf646eb9cacf5826d26f7dcb982bf7cec9213cc438b99716ac47883aa04ba04",
+        "1d",
+        "6d2647f8-5caf-55ee-8821-869dc693f68a",
+        "FEATURE_RSI_14_1D_RSI_1_0_0",
+    ),
+}
 FEATURE_SERIES_SCHEMA = pa.schema(
     [
         pa.field("bar_start_at", pa.timestamp("us", tz="UTC"), nullable=False),
@@ -96,11 +130,16 @@ def _uuid_text(value: Any, label: str) -> str:
 
 
 def _expected_feature_feed_id(record: Mapping[str, Any]) -> str:
+    definition_id = _uuid_text(record.get("feature_definition_id"), "feature definition id")
+    identity = RSI_FEED_IDENTITIES.get(definition_id)
+    if identity is None:
+        raise FeatureOutputBindingError("feature definition id does not match a pinned RSI adapter")
+    expected_hash, expected_resolution, expected_feed_id, _expected_feed_code = identity
     definition_hash = str(record.get("definition_hash") or "")
     digest = _hash(definition_hash, "definition hash")
-    if definition_hash != f"sha256:{digest}":
+    if expected_hash.startswith("sha256:") and definition_hash != f"sha256:{digest}":
         raise FeatureOutputBindingError("definition hash must use the canonical sha256: prefix")
-    if definition_hash != OFFICIAL_RSI_DEFINITION_HASH:
+    if definition_hash != expected_hash:
         raise FeatureOutputBindingError("feature definition hash does not match the official RSI adapter")
     calculator_version = str(record.get("calculator_version") or "")
     resolution = str(record.get("resolution") or "")
@@ -108,7 +147,9 @@ def _expected_feature_feed_id(record: Mapping[str, Any]) -> str:
         raise FeatureOutputBindingError(
             "feature feed identity requires calculator version and resolution"
         )
-    identity = "|".join(
+    if resolution != expected_resolution:
+        raise FeatureOutputBindingError("feature definition resolution does not match its pinned RSI identity")
+    feed_identity = "|".join(
         (
             "feature-output-feed",
             definition_hash,
@@ -117,10 +158,10 @@ def _expected_feature_feed_id(record: Mapping[str, Any]) -> str:
             FEATURE_SERIES_SCHEMA_VERSION,
         )
     )
-    expected = str(uuid.uuid5(PROJECT_UUID_NAMESPACE, identity))
-    if expected != OFFICIAL_RSI_FEED_ID:
+    expected = str(uuid.uuid5(PROJECT_UUID_NAMESPACE, feed_identity))
+    if expected != expected_feed_id:
         raise FeatureOutputBindingError("feature feed identity inputs do not match the official RSI adapter")
-    return OFFICIAL_RSI_FEED_ID
+    return expected_feed_id
 
 
 def _require_output_provenance(record: Mapping[str, Any], requirement: RequiredFeature) -> None:
@@ -134,7 +175,14 @@ def _require_output_provenance(record: Mapping[str, Any], requirement: RequiredF
         raise FeatureOutputBindingError("feature output provider rights version does not match")
     if str(record.get("output_provider_status")) != "ACTIVE":
         raise FeatureOutputBindingError("feature output provider must be ACTIVE")
-    if str(record.get("output_feed_code")) != OFFICIAL_RSI_FEED_CODE:
+    definition_id = _uuid_text(record.get("feature_definition_id"), "feature definition id")
+    identity = RSI_FEED_IDENTITIES.get(definition_id)
+    if identity is None:
+        raise FeatureOutputBindingError("feature definition id does not match a pinned RSI adapter")
+    _expected_hash, expected_resolution, _expected_feed_id, expected_feed_code = identity
+    if requirement.feature_id != definition_id or requirement.bar_resolution != expected_resolution:
+        raise FeatureOutputBindingError("feature output identity does not match the compiled plan")
+    if str(record.get("output_feed_code")) != expected_feed_code:
         raise FeatureOutputBindingError("feature output feed code does not match the official RSI adapter")
     if str(record.get("output_feed_data_kind")) != "FEATURE_SERIES":
         raise FeatureOutputBindingError("feature output feed must use FEATURE_SERIES data kind")

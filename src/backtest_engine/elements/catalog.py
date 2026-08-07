@@ -57,6 +57,7 @@ from backtest_engine.elements.core import (
     PlanStep,
     StepEvaluator,
     StepOutcome,
+    resolution_period,
 )
 from backtest_engine.elements.features import FEATURE_REGISTRY, feature_definition
 
@@ -430,9 +431,20 @@ def _evaluate_catalog_operation(step: PlanStep, evaluation: ElementEvaluation) -
         passed = ps <= pl and cs > cl if direction == "UP" else ps >= pl and cs < cl
         return _outcome(operation, passed, {"direction": direction, "short": _plain(cs), "long": _plain(cl)})
     if operation == "RSI_CROSS":
-        period = int(step.argument("period"))
-        closes = _series_values(evaluation, f"closes.{resolution}", period + 2, operation)
-        current, previous = _rsi(closes, period, 0), _rsi(closes, period, 1)
+        rsi_resolution = step.argument("resolution")
+        pinned = evaluation.inputs.feature_series_for("RSI_14", rsi_resolution)
+        if pinned is None:
+            raise ElementInputMissing(
+                f"instrument {evaluation.instrument_id} has no pinned RSI_14/{rsi_resolution} feature series",
+                input_reason="FEATURE_SERIES_MISSING",
+                evidence={
+                    "feature": "RSI_14",
+                    "resolution": rsi_resolution,
+                    "asOf": evaluation.as_of.isoformat(),
+                },
+            )
+        current = pinned.value_at(evaluation.as_of)
+        previous = pinned.value_at(evaluation.as_of - resolution_period(rsi_resolution))
         threshold = _parse_decimal(step, "threshold")
         direction = step.argument("direction")
         passed = previous <= threshold < current if direction == "UP" else previous >= threshold > current
@@ -444,6 +456,7 @@ def _evaluate_catalog_operation(step: PlanStep, evaluation: ElementEvaluation) -
                 "previous": _plain(previous),
                 "current": _plain(current),
                 "threshold": _plain(threshold),
+                "source": "PINNED_FEATURE_OUTPUT",
             },
         )
     if operation == "MACD_CROSS":
@@ -575,6 +588,8 @@ class ElementCatalog:
     ``elementCatalogVersion`` can re-point a UUID without silently changing the
     meaning of plans already compiled against the old one.
     """
+    canonical_feature_resolutions: Mapping[str, str]
+    """Canonical feature UUID -> exact bar resolution pinned by that definition."""
 
     @property
     def operations(self) -> tuple[str, ...]:
@@ -645,6 +660,10 @@ class ElementCatalog:
                 f"requiredFeature.featureId {canonical_feature_id!r} is not in element catalog {self.version}",
             ) from exc
 
+    def require_canonical_feature_resolution(self, canonical_feature_id: str) -> str | None:
+        """Return the exact resolution pinned by a canonical feature UUID, when constrained."""
+        return self.canonical_feature_resolutions.get(canonical_feature_id)
+
     def evaluate(self, step: PlanStep, evaluation: ElementEvaluation) -> StepOutcome:
         return self.spec(step.operation).evaluator(step, evaluation)
 
@@ -705,6 +724,12 @@ _BASIC_ELEMENTS_2026_07_31 = ElementCatalog(
             "0f1b0000-0000-4000-8000-000000000001": "RSI_14",
             # Published cross-runtime conformance fixture.
             "00000000-0000-4000-8000-000000000401": "RSI_14",
+        }
+    ),
+    canonical_feature_resolutions=MappingProxyType(
+        {
+            "0f1b0000-0000-4000-8000-000000000001": "1m",
+            "00000000-0000-4000-8000-000000000401": "1m",
         }
     ),
 )
@@ -901,16 +926,32 @@ _BASIC_ELEMENTS_2026_08_07 = ElementCatalog(
     ),
     feature_versions=MappingProxyType({}),
     canonical_feature_ids=MappingProxyType({}),
+    canonical_feature_resolutions=MappingProxyType({}),
 )
 
-# The backend publishes a new immutable catalog version when it replaces the accidentally
-# hard-coded 1m feed declaration. Runtime operations are unchanged; only the catalog's parameter
-# and backtest-feed metadata changes, so both released versions deliberately share evaluators.
+# The active production catalog aligns the raw bar, RSI materialization, pinned feature input,
+# and evaluation clock to the selected 30m/1h/4h/1d resolution. The legacy catalog remains
+# immutable for historical replay only.
 _BASIC_ELEMENTS_2026_08_08 = ElementCatalog(
     version="basic-elements:2026-08-08",
     specs=_BASIC_ELEMENTS_2026_08_07.specs,
-    feature_versions=_BASIC_ELEMENTS_2026_08_07.feature_versions,
-    canonical_feature_ids=_BASIC_ELEMENTS_2026_08_07.canonical_feature_ids,
+    feature_versions=MappingProxyType({"RSI_14": FEATURE_REGISTRY["RSI_14"].definition_version}),
+    canonical_feature_ids=MappingProxyType(
+        {
+            "4b1c6801-0259-5176-a857-0e5ea923d898": "RSI_14",
+            "2e18c093-5d4e-5d9a-bd22-b7e5679f1a3e": "RSI_14",
+            "1b2785bd-20f0-50a2-ae96-6a1f7bad74b9": "RSI_14",
+            "eddfb2d4-8586-5260-8fc9-9c8125990270": "RSI_14",
+        }
+    ),
+    canonical_feature_resolutions=MappingProxyType(
+        {
+            "4b1c6801-0259-5176-a857-0e5ea923d898": "30m",
+            "2e18c093-5d4e-5d9a-bd22-b7e5679f1a3e": "1h",
+            "1b2785bd-20f0-50a2-ae96-6a1f7bad74b9": "4h",
+            "eddfb2d4-8586-5260-8fc9-9c8125990270": "1d",
+        }
+    ),
 )
 
 

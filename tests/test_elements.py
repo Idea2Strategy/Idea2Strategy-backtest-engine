@@ -22,6 +22,8 @@ from backtest_engine.elements import (
     ElementInputMissing,
     InstrumentInput,
     InstrumentSeries,
+    PinnedFeatureSeries,
+    PinnedFeatureValue,
     PlanLoadFailure,
     PlanStep,
     SeriesBar,
@@ -359,6 +361,70 @@ def test_production_catalog_exposes_every_ui_operation_and_only_new_resolutions(
             assert spec.enumerations["resolution"] == ("30m", "1h", "4h", "1d")
 
 
+def _pinned_rsi_series(
+    *, resolution: str = "30m", previous: str = "49.00000000", current: str = "51.00000000",
+) -> PinnedFeatureSeries:
+    period = resolution_period(resolution)
+    return PinnedFeatureSeries(
+        feature_id="RSI_14",
+        instrument_id=INSTRUMENT,
+        resolution=resolution,
+        values=(
+            PinnedFeatureValue(bar_start_at=ORIGIN - period * 2, value=Decimal(previous)),
+            PinnedFeatureValue(bar_start_at=ORIGIN - period, value=Decimal(current)),
+        ),
+    )
+
+
+def test_rsi_cross_consumes_the_official_pinned_series_instead_of_recomputing_closes() -> None:
+    inputs = InstrumentInput(
+        instrument_id=INSTRUMENT,
+        series=(),
+        feature_series=(_pinned_rsi_series(),),
+        require_pinned_features=True,
+        values={"bar.closed.30m": "true"},
+    )
+    evaluation = ElementEvaluation(instrument_id=INSTRUMENT, as_of=ORIGIN, inputs=inputs)
+    step = _step(
+        1, "RSI_CROSS", resolution="30m", direction="UP", period="14", threshold="50",
+    )
+
+    outcome = element_catalog("basic-elements:2026-08-08").evaluate(step, evaluation)
+
+    assert outcome.is_passed is True
+    assert outcome.evidence["previous"] == "49"
+    assert outcome.evidence["current"] == "51"
+    assert outcome.evidence["source"] == "PINNED_FEATURE_OUTPUT"
+
+
+def test_rsi_cross_fails_closed_when_the_pinned_series_has_a_gap() -> None:
+    period = resolution_period("30m")
+    inputs = InstrumentInput(
+        instrument_id=INSTRUMENT,
+        series=(),
+        feature_series=(PinnedFeatureSeries(
+            feature_id="RSI_14",
+            instrument_id=INSTRUMENT,
+            resolution="30m",
+            values=(PinnedFeatureValue(
+                bar_start_at=ORIGIN - period,
+                value=Decimal("51.00000000"),
+            ),),
+        ),),
+        require_pinned_features=True,
+        values={"bar.closed.30m": "true"},
+    )
+    evaluation = ElementEvaluation(instrument_id=INSTRUMENT, as_of=ORIGIN, inputs=inputs)
+
+    with pytest.raises(ElementInputMissing) as failure:
+        element_catalog("basic-elements:2026-08-08").evaluate(
+            _step(1, "RSI_CROSS", resolution="30m", direction="UP", period="14", threshold="50"),
+            evaluation,
+        )
+
+    assert failure.value.input_reason == "FEATURE_SERIES_DATA_GAP"
+
+
 @pytest.mark.parametrize(
     ("operation", "arguments"),
     [
@@ -407,10 +473,17 @@ def test_every_production_condition_has_an_executable_evaluator(operation: str, 
         "schedule.monthFirstTradingDay": "true",
         "schedule.monthLastTradingDay": "false",
     }
+    pinned_features = (_pinned_rsi_series(),) if operation == "RSI_CROSS" else ()
     evaluation = ElementEvaluation(
         instrument_id=INSTRUMENT,
         as_of=ORIGIN,
-        inputs=InstrumentInput(instrument_id=INSTRUMENT, series=(), values=values),
+        inputs=InstrumentInput(
+            instrument_id=INSTRUMENT,
+            series=(),
+            feature_series=pinned_features,
+            require_pinned_features=bool(pinned_features),
+            values=values,
+        ),
     )
     step = PlanStep(sequence=1, operation=operation, arguments=arguments)
     catalog = element_catalog("basic-elements:2026-08-08")
