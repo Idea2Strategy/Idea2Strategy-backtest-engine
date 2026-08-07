@@ -40,11 +40,12 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_FLOOR, Decimal, localcontext
 from enum import Enum
 
+from backtest_engine.elements.core import resolution_period
 from backtest_engine.execution_policy import ExecutionPolicy
 from backtest_engine.money import (
     PRECISION_RULES_VERSION,
@@ -493,7 +494,9 @@ class OrderRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class MinuteBar:
+class ExecutionBar:
+    """A completed bar used for deterministic fills at any supported resolution."""
+
     instrument_id: str
     starts_at: datetime
     ends_at: datetime
@@ -503,6 +506,8 @@ class MinuteBar:
     close: Decimal
     volume: Decimal
     complete: bool = True
+    resolution: str = field(default="1m", kw_only=True)
+    session_truncated: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -510,8 +515,16 @@ class MinuteBar:
         )
         starts_at = _utc(self.starts_at, "starts_at")
         ends_at = _utc(self.ends_at, "ends_at")
-        if ends_at - starts_at != timedelta(minutes=1):
-            raise ExecutionModelValidationError("bar must cover exactly one minute")
+        period = resolution_period(self.resolution)
+        actual_period = ends_at - starts_at
+        if actual_period <= timedelta(0) or (
+            actual_period != period
+            and (not self.session_truncated or actual_period > period)
+        ):
+            raise ExecutionModelValidationError(
+                "bar must cover its declared resolution or be a shorter "
+                "session-truncated bar"
+            )
         object.__setattr__(self, "starts_at", starts_at)
         object.__setattr__(self, "ends_at", ends_at)
         for label in ("open", "high", "low", "close"):
@@ -525,6 +538,15 @@ class MinuteBar:
             raise ExecutionModelValidationError("OHLC values are inconsistent")
         if not isinstance(self.complete, bool):
             raise ExecutionModelValidationError("complete must be boolean")
+        if not isinstance(self.session_truncated, bool):
+            raise ExecutionModelValidationError("session_truncated must be boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class MinuteBar(ExecutionBar):
+    """Backward-compatible exact one-minute execution bar."""
+
+    resolution: str = field(default="1m", init=False, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -858,18 +880,18 @@ class BacktestExecutionModel:
                 expired.append(self._snapshot(state))
         return tuple(expired)
 
-    def process_bars(self, bars: Iterable[MinuteBar]) -> tuple[Fill, ...]:
+    def process_bars(self, bars: Iterable[ExecutionBar]) -> tuple[Fill, ...]:
         ordered = list(bars)
-        if any(not isinstance(bar, MinuteBar) for bar in ordered):
-            raise ExecutionModelValidationError("bars must contain MinuteBar values")
+        if any(not isinstance(bar, ExecutionBar) for bar in ordered):
+            raise ExecutionModelValidationError("bars must contain ExecutionBar values")
         fills: list[Fill] = []
         for bar in sorted(ordered, key=lambda item: (item.starts_at, item.instrument_id)):
             fills.extend(self.process_bar(bar))
         return tuple(fills)
 
-    def process_bar(self, bar: MinuteBar) -> tuple[Fill, ...]:
-        if not isinstance(bar, MinuteBar):
-            raise ExecutionModelValidationError("bar must be a MinuteBar")
+    def process_bar(self, bar: ExecutionBar) -> tuple[Fill, ...]:
+        if not isinstance(bar, ExecutionBar):
+            raise ExecutionModelValidationError("bar must be an ExecutionBar")
         self.advance_time(bar.starts_at)
         if not bar.complete:
             return ()
@@ -1033,7 +1055,7 @@ class BacktestExecutionModel:
 
     # -- prices -------------------------------------------------------------
 
-    def _base_price(self, state: _OrderState, bar: MinuteBar) -> Decimal | None:
+    def _base_price(self, state: _OrderState, bar: ExecutionBar) -> Decimal | None:
         request = state.request
         if request.order_type is OrderType.MARKET:
             return bar.open
@@ -1079,7 +1101,7 @@ class BacktestExecutionModel:
 
     @staticmethod
     def _limit_base(
-        side: OrderSide, limit_price: Decimal, bar: MinuteBar
+        side: OrderSide, limit_price: Decimal, bar: ExecutionBar
     ) -> Decimal | None:
         if side is OrderSide.BUY:
             return min(bar.open, limit_price) if bar.low <= limit_price else None
@@ -1087,7 +1109,7 @@ class BacktestExecutionModel:
 
     @staticmethod
     def _stop_base(
-        side: OrderSide, stop_price: Decimal, bar: MinuteBar
+        side: OrderSide, stop_price: Decimal, bar: ExecutionBar
     ) -> Decimal | None:
         if side is OrderSide.BUY:
             if bar.open >= stop_price:

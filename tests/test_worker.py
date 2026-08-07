@@ -448,6 +448,28 @@ def test_permanent_job_failure_is_dead_lettered_and_recorded(
 
 
 @pytest.mark.docker
+def test_cancelled_job_is_acknowledged_without_dead_lettering(
+    sqs: Any, queues: tuple[str, str]
+) -> None:
+    main, dlq = queues
+    sqs.send_message(QueueUrl=main, MessageBody=_body())
+    handler = RecordingHandler(
+        JobOutcome(JobResult.CANCELLED, reason_code="USER_CANCELLED")
+    )
+    store = InMemoryExecutionKeyStore()
+    worker = _worker(sqs, queues, handler, store)
+
+    handled = worker.poll_once()
+
+    assert [item.disposition for item in handled] == [MessageDisposition.DELETED]
+    assert [item.reason_code for item in handled] == ["USER_CANCELLED"]
+    key = worker_execution_key_for(RUN_ID, "OFFICIAL_BACKTEST:bt4")
+    assert store.status(key) is ExecutionRecordStatus.CANCELLED
+    assert _visible(sqs, main) == 0
+    assert _visible(sqs, dlq) == 0
+
+
+@pytest.mark.docker
 def test_graceful_shutdown_finishes_the_in_flight_message_then_returns(
     sqs: Any, queues: tuple[str, str]
 ) -> None:

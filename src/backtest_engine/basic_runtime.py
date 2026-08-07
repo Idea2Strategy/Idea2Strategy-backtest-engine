@@ -1443,13 +1443,25 @@ class BasicPlanReplay:
             as_of=instant,
         )
         candidates: tuple[OrderCandidate, ...] = ()
-        if session is not None:
+        candidate_session = session
+        eligible_at: datetime | None = None
+        if session is not None and instant >= session.closes_at:
+            # A signal from a bar that closes with the regular session cannot
+            # create a same-session DAY order. Carry it to the next official
+            # session so the next completed bar may fill it at that session's
+            # open without using the signal bar's own prices.
+            candidate_session = self.clock.schedule.next_session_after(instant)
+            eligible_at = (
+                None if candidate_session is None else candidate_session.opens_at
+            )
+        if candidate_session is not None:
             candidates = self.runtime.order_candidates(
                 self.plan,
                 result,
                 evaluation_id=evaluation_id,
-                session_date_et=session.trading_date_et,
-                session_closes_at=session.closes_at,
+                session_date_et=candidate_session.trading_date_et,
+                session_closes_at=candidate_session.closes_at,
+                eligible_at=eligible_at,
             )
         return PlanEvaluation(
             evaluation_id=evaluation_id,

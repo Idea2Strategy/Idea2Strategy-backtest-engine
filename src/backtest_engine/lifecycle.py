@@ -496,6 +496,12 @@ class PersistenceRunGateway:
                         values["failure_code"],
                         retryable=values.get("retryable"),
                     )
+                if target is RunStatus.CANCELLED:
+                    return uow.runs.mark_cancelled(
+                        run_id,
+                        values["cancelled_at"],
+                        values["cancellation_reason_code"],
+                    )
                 if target is RunStatus.UNAVAILABLE:
                     return uow.runs.mark_unavailable(
                         run_id,
@@ -943,6 +949,16 @@ class BacktestLifecycleService:
                 completed_at=_parse_timestamp(event["failedAt"]),
                 failure_code=event["failureCode"],
                 retryable=bool(event["retryable"]),
+            )
+        if status is RunStatus.CANCELLED:
+            cancelled_at = _parse_timestamp(event["cancelledAt"])
+            return self.gateway.transition(
+                run_id,
+                RunStatus.CANCELLED,
+                completed_at=cancelled_at,
+                cancelled_at=cancelled_at,
+                cancellation_requested_at=cancelled_at,
+                cancellation_reason_code=event["reasonCode"],
             )
         return self.gateway.transition(
             run_id,

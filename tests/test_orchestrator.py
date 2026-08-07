@@ -42,10 +42,14 @@ from backtest_engine.basic_runtime import (
 from backtest_engine.basic_runtime import BasicPlanReplay, ExecutionGate
 from backtest_engine.calendar import XNYS_CALENDAR
 from backtest_engine.contracts import canonical_dataset_hash
-from backtest_engine.data_availability import AvailabilityStatus, DataRequirement
+from backtest_engine.data_availability import (
+    AvailabilityAssessment,
+    AvailabilityStatus,
+    DataRequirement,
+)
 from backtest_engine.elements import InstrumentInput
 from backtest_engine.elements.orders import OrderCandidate
-from backtest_engine.event_clock import MarketDataEvent, MarketSessionStatus
+from backtest_engine.event_clock import MarketDataEvent, MarketEventClock, MarketSessionStatus
 from backtest_engine.execution_policy import D17_EXECUTION_POLICY_FIXTURE
 from backtest_engine.market_data import ParquetMarketDataReader
 from backtest_engine.orchestrator import (
@@ -60,6 +64,7 @@ from backtest_engine.orchestrator import (
     ReplayOutcome,
     ReplayStatus,
     ResultPublicationError,
+    bar_events_from_table,
 )
 
 
@@ -137,6 +142,77 @@ def write_bars(path: Path) -> None:
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.Table.from_pylist(rows, schema=_SCHEMA), path, version="2.6")
+
+
+def _bar_row(starts_at: datetime, session_date: date) -> dict[str, Any]:
+    return {
+        "instrument_id": AAPL,
+        "provider_symbol": "AAPL",
+        "bar_start_at": starts_at,
+        "session_date_et": session_date,
+        "open": 100.0,
+        "high": 102.0,
+        "low": 99.0,
+        "close": 101.0,
+        "volume": 1000,
+    }
+
+
+def test_daily_bars_close_on_the_official_session_and_signal_the_next_session() -> None:
+    schedule = XNYS_CALENDAR.session_schedule(date(2024, 1, 2), date(2024, 1, 3))
+    table = pa.Table.from_pylist(
+        [
+            _bar_row(_utc(5, 0), date(2024, 1, 2)),
+            _bar_row(datetime(2024, 1, 3, 5, 0, tzinfo=timezone.utc), date(2024, 1, 3)),
+        ],
+        schema=_SCHEMA,
+    )
+    events = bar_events_from_table(
+        table,
+        data_kind=DATA_KIND,
+        resolution="1d",
+        schedule=schedule,
+    )
+
+    first_session, second_session = schedule.sessions
+    first_bar = events[0].payload["bar"]
+    assert first_bar.starts_at == first_session.opens_at
+    assert first_bar.ends_at == first_session.closes_at
+    assert first_bar.session_truncated is True
+
+    runtime = StubRuntime(buy_at=first_session.closes_at)
+    replay = BasicPlanReplay(
+        runtime=runtime,
+        plan=StubPlan(),
+        clock=MarketEventClock(schedule, events),
+        assessment=AvailabilityAssessment(AvailabilityStatus.AVAILABLE, (), ()),
+    )
+
+    candidate = replay.run()[0].candidates[0]
+    assert candidate.decided_at == first_session.closes_at
+    assert candidate.eligible_at == second_session.opens_at
+    assert candidate.session_date_et == second_session.trading_date_et
+    assert candidate.session_closes_at == second_session.closes_at
+
+
+def test_a_session_ending_four_hour_bar_is_explicitly_truncated() -> None:
+    schedule = XNYS_CALENDAR.session_schedule(date(2024, 1, 2), date(2024, 1, 2))
+    table = pa.Table.from_pylist(
+        [_bar_row(_utc(18, 30), date(2024, 1, 2))],
+        schema=_SCHEMA,
+    )
+
+    event = bar_events_from_table(
+        table,
+        data_kind=DATA_KIND,
+        resolution="4h",
+        schedule=schedule,
+    )[0]
+
+    bar = event.payload["bar"]
+    assert bar.starts_at == _utc(18, 30)
+    assert bar.ends_at == schedule.sessions[0].closes_at == _utc(21, 0)
+    assert bar.session_truncated is True
 
 
 def manifest_for(path: Path) -> dict[str, Any]:

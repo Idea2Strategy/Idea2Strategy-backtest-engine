@@ -79,6 +79,7 @@ class WorkerConfigurationError(ValueError):
 
 class JobResult(StrEnum):
     SUCCEEDED = "SUCCEEDED"
+    CANCELLED = "CANCELLED"
     RETRY = "RETRY"
     PERMANENT_FAILURE = "PERMANENT_FAILURE"
 
@@ -86,6 +87,7 @@ class JobResult(StrEnum):
 class ExecutionRecordStatus(StrEnum):
     IN_PROGRESS = "IN_PROGRESS"
     SUCCEEDED = "SUCCEEDED"
+    CANCELLED = "CANCELLED"
     FAILED = "FAILED"
 
 
@@ -477,6 +479,11 @@ class BacktestWorker:
             self._delete(receipt)
             return HandledMessage(message_id, MessageDisposition.DELETED, None, key)
 
+        if outcome.result is JobResult.CANCELLED:
+            self._store.finish(key, ExecutionRecordStatus.CANCELLED, now=self._clock(), claim=claim)
+            self._delete(receipt)
+            return HandledMessage(message_id, MessageDisposition.DELETED, outcome.reason_code, key)
+
         if outcome.result is JobResult.RETRY:
             # Release the CAS record so the redelivery is a *new* attempt, then
             # make the message immediately visible again.
@@ -540,6 +547,14 @@ class BacktestWorker:
                 message_id,
                 MessageDisposition.DELETED,
                 "DUPLICATE_ALREADY_SUCCEEDED",
+                key,
+            )
+        if claim.existing_status is ExecutionRecordStatus.CANCELLED:
+            self._delete(receipt)
+            return HandledMessage(
+                message_id,
+                MessageDisposition.DELETED,
+                "DUPLICATE_ALREADY_CANCELLED",
                 key,
             )
         if claim.existing_status is ExecutionRecordStatus.FAILED:

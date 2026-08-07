@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://contracts.idea2strategy.io/backtest/v1/backtest-result.schema.json",
   "title": "backtest.v1 result event",
-  "description": "Published by D (backtest-engine) for every backtest.run_status value in db/schema.dbml: QUEUED, RUNNING, COMPLETED, FAILED, UNAVAILABLE. Card D93: source/eventType/livePerformanceEligible are constants that mark the event as a backtest result, matching exactly the input E's room-performance/v1 live-performance-input.backtest-rejected.json declares it refuses.",
+  "description": "Published by D (backtest-engine) for every backtest.run_status value in db/schema.dbml: QUEUED, RUNNING, COMPLETED, FAILED, CANCELLED, UNAVAILABLE. Card D93: source/eventType/livePerformanceEligible are constants that mark the event as a backtest result, matching exactly the input E's room-performance/v1 live-performance-input.backtest-rejected.json declares it refuses.",
   "type": "object",
   "required": [
     "metadata",
@@ -40,12 +40,13 @@
     "executionPolicyVersion": {"$ref": "#/$defs/text"},
     "precisionRulesVersion": {"$ref": "#/$defs/text"},
     "status": {
-      "enum": ["QUEUED", "RUNNING", "COMPLETED", "FAILED", "UNAVAILABLE"]
+      "enum": ["QUEUED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED", "UNAVAILABLE"]
     },
     "queuedAt": {"$ref": "#/$defs/timestamp"},
     "startedAt": {"$ref": "#/$defs/timestamp"},
     "completedAt": {"$ref": "#/$defs/timestamp"},
     "failedAt": {"$ref": "#/$defs/timestamp"},
+    "cancelledAt": {"$ref": "#/$defs/timestamp"},
     "decidedAt": {"$ref": "#/$defs/timestamp"},
     "attempt": {"type": "integer", "minimum": 1},
     "resultManifestId": {"$ref": "#/$defs/uuid"},
@@ -102,6 +103,15 @@
         "required": ["decidedAt", "reasonCode", "missingRequirements"],
         "properties": {
           "metadata": {"properties": {"messageType": {"const": "BACKTEST_UNAVAILABLE"}}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "CANCELLED"}}, "required": ["status"]},
+      "then": {
+        "required": ["cancelledAt", "attempt", "reasonCode"],
+        "properties": {
+          "metadata": {"properties": {"messageType": {"const": "BACKTEST_CANCELLED"}}}
         }
       }
     }

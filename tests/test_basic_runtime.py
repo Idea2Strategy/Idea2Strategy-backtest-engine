@@ -485,9 +485,9 @@ def _set_feature(**changes: Any) -> Any:
         ),
         (
             # A resolution this build does not implement at all.
-            _set_feature(resolution="PT30M"),
+            _set_feature(resolution="PT2H"),
             PlanLoadFailure.UNSUPPORTED_ELEMENT_ARGUMENT,
-            "PT30M",
+            "PT2H",
         ),
         (
             # PT60M and PT1H are the same duration, but only PT1H is normalized.

@@ -167,6 +167,7 @@ BACKTEST_RESULT_MESSAGE_TYPES = {
     "RUNNING": "BACKTEST_RUNNING",
     "COMPLETED": "BACKTEST_COMPLETED",
     "FAILED": "BACKTEST_FAILED",
+    "CANCELLED": "BACKTEST_CANCELLED",
     "UNAVAILABLE": "BACKTEST_UNAVAILABLE",
 }
 
@@ -672,6 +673,11 @@ def backtest_result_operation_key(status: str, detail: Mapping[str, Any]) -> str
         return (
             f"BACKTEST_RESULT|FAILED|attempt={field('attempt')}"
             f"|failureCode={field('failureCode')}"
+        )
+    if status == "CANCELLED":
+        return (
+            f"BACKTEST_RESULT|CANCELLED|attempt={field('attempt')}"
+            f"|reasonCode={field('reasonCode')}"
         )
     if status == "UNAVAILABLE":
         requirements = ",".join(sorted(field("missingRequirements")))

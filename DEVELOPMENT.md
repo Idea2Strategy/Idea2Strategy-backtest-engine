@@ -8,14 +8,56 @@
 | 스키마 | 이 저장소의 권한 | 현재 코드 상태 |
 |---|---|---|
 | `backtest` | write | 9개 테이블 전부 `src/backtest_engine/persistence` 에서 read/write |
-| `storage` | read only | `StorageObjectReader` 만 존재. write 메서드 없음 |
-| `market_data`, `strategy` | read only | **아직 읽는 코드가 없습니다.** 입력 잠금은 `backtest.input_*` 에 해시만 고정합니다 |
+| `storage` | read only | 시장 데이터·feature 오브젝트 메타데이터를 읽습니다. write는 거부합니다 |
+| `market_data`, `strategy` | read only | 고정된 dataset, feature materialization, compiled plan을 운영 어댑터가 읽습니다 |
 | 그 외 (`identity`, `bot`, `competition`, `performance`, `trading`, `operations`) | 접근 없음 | 런타임 가드가 write를 거부합니다 |
 
 `storage` 소유권은 **미해결 모순**입니다. 체크리스트는 D 소유라고 하고
 `DatabaseAccessPolicy.java:36` 은 `SHARED` 로 등록합니다. 그래서 이 저장소는 `storage`
 스키마를 기여 루트에서 주장하지 않고, `storage` DDL을 작성하지 않으며, 오브젝트 행도
 만들지 않습니다. 자세한 내용은 `db/migration-contributions/README.md` 를 보십시오.
+
+## 재생·체결 불변식
+
+오케스트레이터는 입력을 임의의 현재 상태로 다시 조회하지 않습니다. 요청에 고정된 봇
+스냅샷, compiled plan, dataset hash, feature result hash, 실행 정책 버전을 검증한 후에만
+재생합니다. 고정 증거가 없거나 바뀌면 fail-closed로 `UNAVAILABLE` 또는 실패 처리합니다.
+
+지원 주기는 `30m`, `1h`, `4h`, `1d`이며 기존 `1m`, `5m`, `15m`도 호환성을 위해
+유지합니다. shorthand와 계약 값의 대응은 다음과 같습니다.
+
+| shorthand | 계약 값 | 고정 기간 |
+|---|---|---|
+| `30m` | `PT30M` | 30분 |
+| `1h` | `PT1H` | 1시간 |
+| `4h` | `PT4H` | 4시간 |
+| `1d` | `PT24H` | 24시간(계약/워밍업 계산용) |
+
+`1d`의 실제 시장 이벤트는 24시간 봉이 아니라 `session_date_et`에 해당하는 XNYS 정규장
+시가부터 종가까지입니다. 4시간 봉의 마지막 구간도 세션 종가에서 끝날 수 있습니다. 이처럼
+명목 기간보다 짧은 봉은 데이터 오류와 구분하기 위해 반드시 `session_truncated=true`여야
+합니다.
+
+평가는 `BAR_CLOSED`에서 수행하지만 같은 봉에 주문을 소급 체결하지 않습니다. 장중 봉에서
+생긴 주문은 다음 체결 가능 이벤트부터, 세션 종가에 생긴 주문은 다음 정규장 시가부터
+유효합니다. 데이터 누락 구간은 주문 체결 가능 시점으로 간주하지 않습니다. 이 규칙은
+look-ahead bias를 막는 재현성 계약의 일부입니다.
+
+## 실행과 취소 흐름
+
+worker는 SQS 메시지마다 안정적인 `worker_execution_key`를 만들고 DB CAS로 시도를
+획득합니다. 실행 중에는 visibility timeout을 연장하며 결과에 따라 다음과 같이 처리합니다.
+
+| 결과 | 실행 상태 | 큐 처리 |
+|---|---|---|
+| 성공 | `COMPLETED` | ack/delete |
+| 일시 오류 | 재시도 가능 상태 | visibility 반환, 한도 초과 시 DLQ |
+| 영구 오류 | `FAILED` 또는 `UNAVAILABLE` | DLQ |
+| 사용자/조정자 취소 | `CANCELLED` | ack/delete, DLQ 금지 |
+
+취소 결과 이벤트는 `BACKTEST_CANCELLED`, `cancelledAt`, `attempt`, `reasonCode`를 포함합니다.
+lifecycle과 영속성 계층은 기존 취소 요청 시각·사유가 있으면 이를 보존하고, 없을 때만 결과
+이벤트 값으로 채웁니다. 이미 취소된 실행의 재전달은 중복 종단 상태로 ack합니다.
 
 ## DB 접근 규칙
 
@@ -74,8 +116,8 @@ with persistence.unit_of_work() as uow:
   `schemas=backtest` 입니다.
 - 파일명은 `V<YYYYMMDDHHMMSS>__backtest_<slug>.sql` 이어야 합니다. `V001__` 같은 legacy
   번호는 중앙에서 거부됩니다.
-- 지금 `migrations/` 는 비어 있습니다. 9개 테이블이 이미 적용된 baseline
-  `V1__initial_schema.sql` 에 있고, 적용된 마이그레이션은 수정하지 않습니다.
+- 9개 테이블의 baseline은 중앙 `V1__initial_schema.sql` 에 있습니다. 이 저장소의
+  `migrations/`에는 이후 승인된 backtest 전용 변경만 있으며 적용된 파일은 수정하지 않습니다.
 - 적용된 정본 번들의 바이트 단위 사본이
   `db/migration-contributions/fixtures/central-migration/` 에 있고, 통합 테스트가 이것을
   적용합니다. 사본이 손대졌거나 중앙 번들이 바뀌면
@@ -103,8 +145,9 @@ python -m mypy
 - 슬리피지 0.05%, 수수료 0.2%. `backtest.runs` 는 `fee_policy_id`,
   `buying_power_buffer_policy_id`, `slippage_rate_bps`, 그리고 세 개의 rules version을
   실행마다 고정합니다.
-- 실행 상태는 정본 `backtest.run_status` = `QUEUED|RUNNING|COMPLETED|FAILED|UNAVAILABLE`
-  입니다. `COMPLETE` 는 정본 라벨이 아닙니다.
+- 실행 상태는 정본 `backtest.run_status` =
+  `QUEUED|RUNNING|COMPLETED|FAILED|CANCELLED|UNAVAILABLE` 입니다. `COMPLETE` 는 정본
+  라벨이 아닙니다.
 - 상세 Parquet 파티션은 **ET 월요일 주 경계 + `part_number`**, 압축은 명시적
   `UNCOMPRESSED` 입니다.
 

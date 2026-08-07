@@ -93,9 +93,9 @@ from .elements import PinnedFeatureSeries
 from .event_clock import MarketDataEvent, MarketEventClock
 from .execution_model import (
     BacktestExecutionModel,
+    ExecutionBar,
     ExecutionMicrostructurePolicy,
     InstrumentFractionalPolicy,
-    MinuteBar,
     OrderRequest,
     OrderSide,
     OrderStatus,
@@ -339,13 +339,13 @@ class ExecutionModelEngine:
     * **sizing** -- turn an unsized ``OrderCandidate`` into an ``OrderRequest``
       under :data:`SIZING_RULES_VERSION`;
     * **bar translation** -- turn the orchestrator's ``MarketDataEvent`` into
-      the ``MinuteBar`` the matching engine consumes;
+      the resolution-aware ``ExecutionBar`` the matching engine consumes;
     * **evidence** -- accumulate the ``ResultRecord`` stream the result snapshot
       is built from, so a rejected or expired order is still visible.
 
-    Only 1-minute bars are supported, because ``MinuteBar`` is defined as
-    exactly one minute. A coarser resolution is refused rather than silently
-    re-labelled.
+    The adapter preserves the plan-pinned resolution. Session-ending partial
+    bars remain explicitly marked instead of being relabelled as a shorter
+    resolution.
     """
 
     def __init__(
@@ -491,15 +491,15 @@ class ExecutionModelEngine:
             label="order quantity",
         )
 
-    def _bar_of(self, event: MarketDataEvent) -> MinuteBar:
+    def _bar_of(self, event: MarketDataEvent) -> ExecutionBar:
         payload = event.payload
         series_bar = payload["bar"]
-        if series_bar.ends_at - series_bar.starts_at != timedelta(minutes=1):
+        if series_bar.resolution != payload["resolution"]:
             raise WiringError(
-                "the execution model consumes one-minute bars only; this run pinned "
-                f"resolution {payload['resolution']!r}"
+                "the bar resolution does not match the event's pinned resolution: "
+                f"{series_bar.resolution!r} != {payload['resolution']!r}"
             )
-        return MinuteBar(
+        return ExecutionBar(
             instrument_id=event.instrument_id,
             starts_at=series_bar.starts_at,
             ends_at=series_bar.ends_at,
@@ -508,6 +508,8 @@ class ExecutionModelEngine:
             low=payload["low"],
             close=series_bar.close,
             volume=series_bar.volume,
+            resolution=series_bar.resolution,
+            session_truncated=series_bar.session_truncated,
         )
 
     def _positions(self) -> tuple[PositionAfter, ...]:
@@ -689,14 +691,24 @@ class PersistenceExecutionKeyStore:
         if status is ExecutionRecordStatus.IN_PROGRESS:
             raise ValueError("finish requires a terminal status")
         attempt_id, claim_token = self._claim_ids(claim)
-        work_status = WorkStatus.SUCCEEDED if status is ExecutionRecordStatus.SUCCEEDED else WorkStatus.FAILED
+        work_status = {
+            ExecutionRecordStatus.SUCCEEDED: WorkStatus.SUCCEEDED,
+            ExecutionRecordStatus.CANCELLED: WorkStatus.CANCELLED,
+            ExecutionRecordStatus.FAILED: WorkStatus.FAILED,
+        }[status]
         with self._persistence.unit_of_work() as uow:
             uow.attempts.close_fenced(
                 attempt_id,
                 claim_token,
                 status=work_status,
                 terminal_reason_code=status.value,
-                failure_code=None if work_status is WorkStatus.SUCCEEDED else "EXECUTION_FAILED",
+                failure_code=(
+                    None
+                    if work_status is WorkStatus.SUCCEEDED
+                    else "EXECUTION_CANCELLED"
+                    if work_status is WorkStatus.CANCELLED
+                    else "EXECUTION_FAILED"
+                ),
             )
 
     def status(self, key: str) -> ExecutionRecordStatus | None:
@@ -717,6 +729,8 @@ class PersistenceExecutionKeyStore:
 def _execution_status(status: WorkStatus) -> ExecutionRecordStatus:
     if status is WorkStatus.SUCCEEDED:
         return ExecutionRecordStatus.SUCCEEDED
+    if status is WorkStatus.CANCELLED:
+        return ExecutionRecordStatus.CANCELLED
     if status in (WorkStatus.PENDING, WorkStatus.RUNNING):
         return ExecutionRecordStatus.IN_PROGRESS
     return ExecutionRecordStatus.FAILED
@@ -1564,6 +1578,18 @@ class OrchestratorJobHandler:
                 missingRequirements=list(outcome.missing_requirements) or [reason_code],
             )
             return JobOutcome(JobResult.PERMANENT_FAILURE, reason_code=reason_code)
+
+        if outcome.status is ReplayStatus.CANCELLED:
+            self._publish(
+                envelope,
+                binding.correlation_id,
+                status="CANCELLED",
+                delivery_attempt=context.receive_count,
+                cancelledAt=_utc_text(now),
+                attempt=context.attempt_number,
+                reasonCode=reason_code,
+            )
+            return JobOutcome(JobResult.CANCELLED, reason_code=reason_code)
 
         if coordinator.state is RunState.WAITING:
             # Retryable. `FAILED` is terminal in `backtest.run_status`, so

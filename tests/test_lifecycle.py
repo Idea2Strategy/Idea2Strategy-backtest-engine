@@ -394,6 +394,26 @@ def test_unavailable_records_the_reason_code(
     assert outcome.run.run.failure_code == "REQUIRED_DATA_MISSING"
 
 
+def test_cancelled_result_records_the_cancellation_instead_of_a_failure(
+    service: BacktestLifecycleService, official_request: dict[str, Any]
+) -> None:
+    service.accept(official_request)
+
+    outcome = service.ingest_result(
+        _event(
+            service,
+            "CANCELLED",
+            cancelledAt="2026-07-31T12:06:00Z",
+            attempt=1,
+            reasonCode="USER_CANCELLED",
+        )
+    )
+
+    assert outcome.run.status is RunStatus.CANCELLED
+    assert outcome.run.run.cancelled_at == datetime(2026, 7, 31, 12, 6, tzinfo=timezone.utc)
+    assert outcome.run.run.cancellation_reason_code == "USER_CANCELLED"
+
+
 # ===========================================================================
 # Dead-letter policy
 # ===========================================================================

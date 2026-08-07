@@ -422,9 +422,12 @@ def test_resolution_periods_are_pinned() -> None:
     assert resolution_period("1m") == timedelta(minutes=1)
     assert resolution_period("5m") == timedelta(minutes=5)
     assert resolution_period("15m") == timedelta(minutes=15)
+    assert resolution_period("30m") == timedelta(minutes=30)
     assert resolution_period("1h") == timedelta(hours=1)
-    with pytest.raises(ElementCompatibilityError, match="1d"):
-        resolution_period("1d")
+    assert resolution_period("4h") == timedelta(hours=4)
+    assert resolution_period("1d") == timedelta(days=1)
+    with pytest.raises(ElementCompatibilityError, match="2h"):
+        resolution_period("2h")
 
 
 def test_series_rejects_out_of_order_and_mismatched_bars() -> None:
