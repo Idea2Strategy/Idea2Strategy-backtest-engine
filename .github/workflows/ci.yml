@@ -26,7 +26,7 @@ on:
   pull_request:
     branches: [develop]
   push:
-    branches: [develop]
+    branches: [develop, main]
 
 permissions:
   contents: read
@@ -288,6 +288,7 @@ jobs:
   # ---------------------------------------------------------------- gate 8
   gate8-db-integration:
     name: gate8-db-integration (PostgreSQL 16 + LocalStack)
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # LocalStack as well as PostgreSQL, because `-m docker` is a single set that
@@ -383,6 +384,7 @@ jobs:
   # ---------------------------------------------------------------- gate 9
   gate9-localstack-storage:
     name: gate9-localstack-storage (S3 object store)
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
