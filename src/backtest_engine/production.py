@@ -477,7 +477,7 @@ class JwtAuthenticator:
         audience: str,
     ) -> None:
         if len(hmac_key) < 32:
-            raise ConfigurationError("BACKTEST_SESSION_HMAC_KEY must contain at least 32 bytes")
+            raise ConfigurationError("CUSTOMER_JWT_SIGNING_KEY_BASE64 must contain at least 32 bytes")
         if not result_token:
             raise ConfigurationError("BACKTEST_RESULT_INGEST_TOKEN must not be empty")
         self._hmac_key = hmac_key
@@ -766,11 +766,11 @@ def load_runtime_policy(path: Path) -> RuntimePolicy:
 
 
 def api_authenticator(environ: Mapping[str, str] = os.environ) -> JwtAuthenticator:
-    encoded = _required(environ, "BACKTEST_SESSION_HMAC_KEY_BASE64")
+    encoded = _required(environ, "CUSTOMER_JWT_SIGNING_KEY_BASE64")
     try:
         hmac_key = base64.b64decode(encoded, validate=True)
     except ValueError as exc:
-        raise ConfigurationError("BACKTEST_SESSION_HMAC_KEY_BASE64 is not valid base64") from exc
+        raise ConfigurationError("CUSTOMER_JWT_SIGNING_KEY_BASE64 is not valid base64") from exc
     return JwtAuthenticator(
         hmac_key=hmac_key,
         result_token=_required(environ, "BACKTEST_RESULT_INGEST_TOKEN"),

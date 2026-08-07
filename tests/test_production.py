@@ -23,6 +23,7 @@ from backtest_engine.production import (
     S3ParquetMarketDataReader,
     S3VersionedFeatureObjectReader,
     SqsExecutionJobQueue,
+    api_authenticator,
     load_execution_policy_catalog,
     service_endpoint,
 )
@@ -42,6 +43,22 @@ def test_service_specific_aws_endpoint_overrides_the_legacy_shared_endpoint() ->
     assert service_endpoint(environment, "S3") == "http://minio:9000"
     assert service_endpoint(environment, "SQS") == "http://localstack:4566"
     assert service_endpoint({"AWS_ENDPOINT_URL": "http://legacy:4566"}, "S3") == "http://legacy:4566"
+
+
+def test_api_authenticator_requires_the_customer_jwt_signing_key() -> None:
+    environment = {
+        "CUSTOMER_JWT_SIGNING_KEY_BASE64": base64.b64encode(b"j" * 32).decode(),
+        "BACKTEST_RESULT_INGEST_TOKEN": "worker-only",
+        "BACKTEST_RESULT_PRINCIPAL_ID": str(ACCOUNT_ID),
+    }
+
+    assert isinstance(api_authenticator(environment), JwtAuthenticator)
+    with pytest.raises(ConfigurationError, match="CUSTOMER_JWT_SIGNING_KEY_BASE64"):
+        api_authenticator({
+            "BACKTEST_SESSION_HMAC_KEY_BASE64": environment["CUSTOMER_JWT_SIGNING_KEY_BASE64"],
+            "BACKTEST_RESULT_INGEST_TOKEN": "worker-only",
+            "BACKTEST_RESULT_PRINCIPAL_ID": str(ACCOUNT_ID),
+        })
 
 
 class _Rows:
