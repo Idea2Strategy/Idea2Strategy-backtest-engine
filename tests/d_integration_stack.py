@@ -216,7 +216,14 @@ def build_stack(
     main, dead = queues
     market_data = write_market_data(root, closes)
     plan = compiled_plan()
-    accepted_request = dict(request) if request is not None else official_backtest_request(plan=plan)
+    accepted_request = (
+        dict(request)
+        if request is not None
+        else official_backtest_request(
+            plan=plan,
+            expected_dataset_hash=f"sha256:{market_data.manifest['dataset_hash']}",
+        )
+    )
 
     plan_source = StaticCompiledPlanSource(
         dict(plans) if plans is not None else {plan["planChecksum"]: plan}

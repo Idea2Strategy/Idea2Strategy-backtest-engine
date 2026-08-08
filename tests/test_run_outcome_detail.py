@@ -60,7 +60,7 @@ from test_lifecycle import (
 
 POLICY_2026Q3 = replace(
     D17_EXECUTION_POLICY_FIXTURE,
-    version="official-backtest-policy-v2",
+    version="backtest-policy:1.0.0",
     release_quarter="2026-Q3",
     period_start=et_quarter_start(2026, 3),
     period_end=et_quarter_start(2026, 4),
@@ -99,7 +99,7 @@ def _event(service: BacktestLifecycleService, status: str, **detail: Any) -> dic
         correlation_id="00000000-0000-4000-8000-000000000202",
         message_id=str(uuid4()),
         expected_snapshot_hash=SNAPSHOT_HASH,
-        execution_policy_version="official-backtest-policy-v2",
+        execution_policy_version=POLICY_2026Q3.version,
         **detail,
     )
 

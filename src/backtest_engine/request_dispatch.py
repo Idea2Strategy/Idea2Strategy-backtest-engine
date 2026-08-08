@@ -82,7 +82,26 @@ def _request_period(
 ) -> tuple[date, date, tuple[PinnedDataset, ...], tuple[PinnedFeatureMaterialization, ...]]:
     try:
         if lane is RequestLane.BASIC:
-            raise RequestProcessingError("BASIC_PERIOD_COMES_FROM_RUN", retryable=False)
+            return (
+                date.fromisoformat(str(request["periodStart"])),
+                date.fromisoformat(str(request["periodEnd"])),
+                (
+                    PinnedDataset(
+                        uuid.UUID(str(request["datasetManifestId"])),
+                        "MARKET_BARS",
+                        str(request["expectedDatasetHash"]),
+                    ),
+                ),
+                tuple(
+                    sorted(
+                        PinnedFeatureMaterialization(
+                            uuid.UUID(str(item["featureMaterializationId"])),
+                            str(item["lockedResultHash"]),
+                        )
+                        for item in request["featureMaterializations"]
+                    )
+                ),
+            )
         if lane is RequestLane.CUSTOM:
             return (
                 date.fromisoformat(str(request["periodStart"])),
@@ -167,15 +186,9 @@ class BacktestRequestJobPublisher:
             raise RequestProcessingError("MARKET_BARS_DATASET_INVALID", retryable=False)
         primary = market_bars[0]
         if lane is RequestLane.BASIC:
-            start, end = run.evaluation_start, run.evaluation_end
-            requested_datasets: tuple[PinnedDataset, ...] = (
-                PinnedDataset(
-                    uuid.UUID(str(request["datasetManifestId"])),
-                    "MARKET_BARS",
-                    primary.locked_dataset_hash,
-                ),
+            start, end, requested_datasets, requested_features = _request_period(
+                request, lane
             )
-            requested_features: tuple[PinnedFeatureMaterialization, ...] = stored_features
             period_identity: dict[str, str] = {}
         else:
             start, end, requested_datasets, requested_features = _request_period(request, lane)

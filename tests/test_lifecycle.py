@@ -51,14 +51,15 @@ OTHER_OWNER_ID = UUID("55555555-5555-4555-8555-555555555555")
 MANIFEST_ID = UUID("00000000-0000-4000-8000-000000000203")
 
 B_IDEMPOTENCY_KEY = "sha256:c6dd5229151352a530ff8312f050258107370cf26ea943c68473bf81936f6c1e"
-EXPECTED_RUN_ID = UUID("f876f259-4158-5a9a-8973-db21764024dc")
+EXPECTED_RUN_ID = UUID("00000000-0000-4000-8000-000000000214")
+DERIVED_RUN_ID = UUID("f876f259-4158-5a9a-8973-db21764024dc")
 SNAPSHOT_HASH = "sha256:" + "1" * 64
 RESULT_HASH = "sha256:" + "a" * 64
 DATASET_HASH = "d9f6310297b7eb858570086d7292a709261eecc7bf92fc9a03745c46f514161c"
 
 POLICY_2026Q3 = replace(
     D17_EXECUTION_POLICY_FIXTURE,
-    version="official-backtest-policy-v2",
+    version="backtest-policy:1.0.0",
     release_quarter="2026-Q3",
     period_start=et_quarter_start(2026, 3),
     period_end=et_quarter_start(2026, 4),
@@ -110,7 +111,7 @@ def _event(service: BacktestLifecycleService, status: str, **detail: Any) -> dic
         correlation_id="00000000-0000-4000-8000-000000000202",
         message_id=str(uuid4()),
         expected_snapshot_hash=SNAPSHOT_HASH,
-        execution_policy_version="official-backtest-policy-v2",
+        execution_policy_version=POLICY_2026Q3.version,
         **detail,
     )
 
@@ -126,7 +127,7 @@ def test_run_id_namespace_is_pinned() -> None:
 
 
 def test_run_id_is_a_pinned_function_of_bs_idempotency_key() -> None:
-    assert run_id_for(B_IDEMPOTENCY_KEY) == EXPECTED_RUN_ID
+    assert run_id_for(B_IDEMPOTENCY_KEY) == DERIVED_RUN_ID
     # A second pinned literal: a constant-returning implementation fails here.
     assert str(run_id_for("sha256:" + "0" * 64)) == "2b97cf3a-1700-5b1a-bbab-5e02f181c281"
 
