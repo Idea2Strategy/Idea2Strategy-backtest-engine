@@ -12,14 +12,20 @@ fixed session length passes on 2025-12-01 and fails here.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from fractions import Fraction
 from types import SimpleNamespace
 
 import pytest
 
-from backtest_engine.basic_runtime import BasicPlanReplay, _ReplayExecutionState
+from backtest_engine.basic_runtime import (
+    LIVE_SERIES_BARS,
+    BasicPlanReplay,
+    _published_values,
+    _ReplayExecutionState,
+    bar_closed_event,
+)
 from backtest_engine.calendar import XNYS_CALENDAR
 from backtest_engine.elements.core import (
     ElementInputMissing,
@@ -357,3 +363,53 @@ class TestExecutionGateIsScopedToOnePositionCycle:
         replay._retire_closed_position_gates({other: {"position.averageEntryPrice": "200"}})
 
         assert replay._execution_states == {("flow-1", other): kept}
+
+
+class TestTheVisibleWindowMatchesLive:
+    """A strategy sees a bounded rolling window, because the live runtime only has one.
+
+    ``MACD_CROSS`` reads an EMA, an unbounded recursion whose value depends on every earlier
+    bar. An uncapped replay and a live runtime holding 180 bars therefore compute different
+    histograms for the same instant and never converge -- and the histogram is compared against
+    zero, so near a crossing the difference decides the trade.
+    """
+
+    @staticmethod
+    def _closes(count: int) -> str:
+        events = tuple(
+            bar_closed_event(
+                event_id=f"bar-{index:04d}",
+                instrument_id=INSTRUMENT,
+                data_kind="ADJUSTED_BAR",
+                resolution="30m",
+                starts_at=_utc("2025-12-01T14:30:00+00:00") + timedelta(minutes=30 * index),
+                close=Decimal(100 + index),
+                volume=Decimal(1000),
+                source_sequence=index + 1,
+            )
+            for index in range(count)
+        )
+        published = _published_values(
+            INSTRUMENT,
+            {(INSTRUMENT, "30m"): list(events)},
+            events[-1].occurred_at,
+            runtime_values={},
+            shared_values={},
+        )
+        return published["closes.30m"]
+
+    def test_a_short_history_is_shown_whole(self) -> None:
+        assert len(self._closes(40).split(",")) == 40
+
+    def test_a_history_at_the_bound_is_shown_whole(self) -> None:
+        assert len(self._closes(LIVE_SERIES_BARS).split(",")) == LIVE_SERIES_BARS
+
+    def test_a_longer_history_is_truncated_to_the_bound(self) -> None:
+        assert len(self._closes(LIVE_SERIES_BARS + 50).split(",")) == LIVE_SERIES_BARS
+
+    def test_the_newest_bars_are_the_ones_kept(self) -> None:
+        """Truncation drops the oldest bars; the newest close must still be last."""
+        closes = self._closes(LIVE_SERIES_BARS + 50).split(",")
+
+        assert Decimal(closes[-1]) == Decimal(100 + LIVE_SERIES_BARS + 49)
+        assert Decimal(closes[0]) == Decimal(100 + 50)
