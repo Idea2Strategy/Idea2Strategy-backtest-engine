@@ -368,11 +368,7 @@ class BasicCompiledPlan:
         """Every official instrument the plan touches, in UUID order."""
         return tuple(
             sorted(
-                {
-                    instrument_id
-                    for flow in self.flows
-                    for instrument_id in flow.instrument_ids
-                },
+                {instrument_id for flow in self.flows for instrument_id in flow.instrument_ids},
                 key=uuid.UUID,
             )
         )
@@ -386,9 +382,7 @@ class BasicCompiledPlan:
     def evaluation_id(self, occurred_at: datetime) -> str:
         """Deterministic id for this plan's evaluation at ``occurred_at``."""
         instant = occurred_at.astimezone(timezone.utc).isoformat()
-        return str(
-            uuid.uuid5(_EVALUATION_ID_NAMESPACE, f"{self.plan_checksum}|{instant}")
-        )
+        return str(uuid.uuid5(_EVALUATION_ID_NAMESPACE, f"{self.plan_checksum}|{instant}"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -473,9 +467,7 @@ class BasicExecutionResult:
     evaluations: Mapping[str, ElementEvaluation] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self, "evaluations", MappingProxyType(dict(self.evaluations))
-        )
+        object.__setattr__(self, "evaluations", MappingProxyType(dict(self.evaluations)))
 
 
 # ---------------------------------------------------------------------------
@@ -499,9 +491,7 @@ def _require_unique_required_features(document: Mapping[str, Any]) -> None:
     for index, entry in enumerate(entries):
         requirement_id = entry["requirementId"]
         if requirement_id in requirement_ids:
-            raise _invalid(
-                f"plan.requiredFeatures requirementId {requirement_id!r} is not unique"
-            )
+            raise _invalid(f"plan.requiredFeatures requirementId {requirement_id!r} is not unique")
         requirement_ids.add(requirement_id)
 
         identity = (
@@ -617,9 +607,7 @@ class BasicPlanRuntime:
             semantic_hash=version["semanticHash"],
             mode=snapshot["mode"],
             currency=snapshot["currency"],
-            initial_cash=quantize_money(
-                Decimal(snapshot["initialCashAmount"]), "initialCashAmount"
-            ),
+            initial_cash=quantize_money(Decimal(snapshot["initialCashAmount"]), "initialCashAmount"),
             condition_steps=condition_steps,
             terminal_step=terminal_step,
             side=side,
@@ -650,9 +638,7 @@ class BasicPlanRuntime:
             raise _invalid(str(failure)) from failure
 
     @staticmethod
-    def _verify_request_checksum(
-        document: Mapping[str, Any], compiled_plan_checksum: str | None
-    ) -> None:
+    def _verify_request_checksum(document: Mapping[str, Any], compiled_plan_checksum: str | None) -> None:
         """Cross-check the requester's copy of the checksum against the plan's.
 
         The plan's own ``planChecksum`` was already verified by the contract
@@ -672,8 +658,7 @@ class BasicPlanRuntime:
         if compiler_version != COMPILER_VERSION:
             raise _reject(
                 PlanLoadFailure.COMPILER_VERSION_MISMATCH,
-                f"the plan was compiled by {compiler_version}; this build consumes "
-                f"only {COMPILER_VERSION}",
+                f"the plan was compiled by {compiler_version}; this build consumes only {COMPILER_VERSION}",
             )
         try:
             catalog = element_catalog(document["elementCatalogVersion"])
@@ -685,8 +670,7 @@ class BasicPlanRuntime:
             raise _reject(
                 PlanLoadFailure.INSTRUMENT_CATALOG_VERSION_UNSUPPORTED,
                 f"instrumentCatalogVersion {instrument_catalog_version!r} is not "
-                "implemented by this build; implemented: "
-                + ", ".join(INSTRUMENT_CATALOG_VERSIONS),
+                "implemented by this build; implemented: " + ", ".join(INSTRUMENT_CATALOG_VERSIONS),
             )
         return catalog
 
@@ -705,8 +689,7 @@ class BasicPlanRuntime:
         if len(terminals) != 1 or terminals[0] is not steps[-1]:
             raise _structure(
                 "a compiled plan must end with EMIT_ORDER_CANDIDATE and contain "
-                f"exactly one; got {len(terminals)} in "
-                + " -> ".join(step.operation for step in steps)
+                f"exactly one; got {len(terminals)} in " + " -> ".join(step.operation for step in steps)
             )
 
         condition_steps = steps[:-1]
@@ -722,16 +705,13 @@ class BasicPlanRuntime:
             spec = catalog.spec(step.operation)
             if spec.consumes_value and not produced:
                 raise _structure(
-                    f"{step.operation} at sequence {step.sequence} has no operand: "
-                    "no preceding step produced a value"
+                    f"{step.operation} at sequence {step.sequence} has no operand: no preceding step produced a value"
                 )
             produced = produced or spec.produces_value
         return condition_steps, steps[-1]
 
     @staticmethod
-    def _required_features(
-        document: Mapping[str, Any], catalog: ElementCatalog
-    ) -> tuple[RequiredFeature, ...]:
+    def _required_features(document: Mapping[str, Any], catalog: ElementCatalog) -> tuple[RequiredFeature, ...]:
         """Resolve B's ``requiredFeatures`` block against this build's registry.
 
         B's block is the authority on *what history the plan needs*. It is read
@@ -762,6 +742,13 @@ class BasicPlanRuntime:
                 token = bar_resolution(entry["resolution"])
             except ElementCompatibilityError as failure:
                 raise _reject(failure.failure, failure.detail) from failure
+            pinned_resolution = catalog.require_canonical_feature_resolution(entry["featureId"])
+            if pinned_resolution is not None and token != pinned_resolution:
+                raise _reject(
+                    PlanLoadFailure.FEATURE_VERSION_MISMATCH,
+                    f"requiredFeature {entry['requirementId']!r} uses {token}, but featureId "
+                    f"{entry['featureId']} pins {pinned_resolution}",
+                )
 
             features.append(
                 RequiredFeature(
@@ -801,12 +788,7 @@ class BasicPlanRuntime:
                 feature_key = step.arguments[name]
                 token = step.argument("resolution")
                 match = next(
-                    (
-                        item
-                        for item in features
-                        if item.feature_key == feature_key
-                        and item.bar_resolution == token
-                    ),
+                    (item for item in features if item.feature_key == feature_key and item.bar_resolution == token),
                     None,
                 )
                 if match is None:
@@ -817,11 +799,29 @@ class BasicPlanRuntime:
                     )
                 if reference is None:
                     reference = match.series_key
+            if step.operation == "RSI_CROSS":
+                token = step.argument("resolution")
+                match = next(
+                    (item for item in features if item.feature_key == "RSI_14" and item.bar_resolution == token),
+                    None,
+                )
+                if match is None:
+                    raise _structure(
+                        f"RSI_CROSS at sequence {step.sequence} reads RSI_14 at {token}, "
+                        "which plan.requiredFeatures does not declare"
+                    )
         if reference is None:
-            raise _structure(
-                "a compiled plan must read at least one feature: a plan with no "
-                "LOAD_FEATURE step has no market input to decide on"
-            )
+            resolutions = {step.arguments["resolution"] for step in condition_steps if "resolution" in step.arguments}
+            if len(resolutions) > 1:
+                raise _structure(
+                    "a raw-market Basic container must declare exactly one resolution "
+                    "for deterministic dataset binding; found multiple resolutions: "
+                    f"{sorted(resolutions)}"
+                )
+            # Position-only exits have no editor resolution parameter. Their price clock is the
+            # immutable dataset manifest selected for the run, which the production binder replaces
+            # before deriving requirements. The sentinel is never allowed to reach replay.
+            reference = ("ADJUSTED_BAR", resolutions.pop()) if resolutions else ("ADJUSTED_BAR", "$DATASET")
         return reference
 
     def _require_compatibility(
@@ -843,13 +843,7 @@ class BasicPlanRuntime:
         supported = self.compatibility.supported_feature_versions
         for feature in required_features:
             if supported.get(feature.feature_key) != feature.definition_version:
-                implemented = (
-                    ", ".join(
-                        f"{name}@{version}"
-                        for name, version in sorted(supported.items())
-                    )
-                    or "none"
-                )
+                implemented = ", ".join(f"{name}@{version}" for name, version in sorted(supported.items())) or "none"
                 raise _reject(
                     PlanLoadFailure.FEATURE_VERSION_MISMATCH,
                     f"the plan requires {feature.feature_key}@"
@@ -857,11 +851,7 @@ class BasicPlanRuntime:
                     f"{implemented}",
                 )
 
-        declared_runtime = (
-            RUNTIME_SCHEMA_VERSION
-            if runtime_schema_version is None
-            else runtime_schema_version
-        )
+        declared_runtime = RUNTIME_SCHEMA_VERSION if runtime_schema_version is None else runtime_schema_version
         expected_runtime = self.compatibility.runtime_schema_version
         if declared_runtime != expected_runtime:
             raise _reject(
@@ -895,9 +885,7 @@ class BasicPlanRuntime:
                         "identifies one flow across the whole plan"
                     )
                 seen_flow_ids.add(flow_id)
-                instrument_ids = tuple(
-                    str(uuid.UUID(value)) for value in flow["officialInstrumentIds"]
-                )
+                instrument_ids = tuple(str(uuid.UUID(value)) for value in flow["officialInstrumentIds"])
                 if len(set(instrument_ids)) != len(instrument_ids):
                     raise _structure(
                         f"flow {flow_id!r} officialInstrumentIds must be unique: a "
@@ -933,9 +921,7 @@ class BasicPlanRuntime:
         without reimplementing the loop, and so nothing can be shared between
         two instruments by accident.
         """
-        return ElementEvaluation(
-            instrument_id=instrument_id, as_of=as_of, inputs=instrument_input
-        )
+        return ElementEvaluation(instrument_id=instrument_id, as_of=as_of, inputs=instrument_input)
 
     def execute(
         self,
@@ -963,9 +949,7 @@ class BasicPlanRuntime:
                         f"{supplied.instrument_id}"
                     )
                 flow_decisions.append(
-                    self._evaluate_instrument(
-                        plan, flow, instrument_id, supplied, as_of, evaluations
-                    )
+                    self._evaluate_instrument(plan, flow, instrument_id, supplied, as_of, evaluations)
                 )
             # Each container allocates within its own side: a buy container spreads its
             # budget across the instruments it chose, and a sell container is separate.
@@ -1043,11 +1027,7 @@ class BasicPlanRuntime:
                     CONDITION_ERROR_REASON,
                 )
 
-            trace.append(
-                BasicStepTrace(
-                    step_id, outcome.is_passed, outcome.reason_code, outcome.evidence
-                )
-            )
+            trace.append(BasicStepTrace(step_id, outcome.is_passed, outcome.reason_code, outcome.evidence))
             if not outcome.is_passed:
                 return _failed(
                     flow,
@@ -1091,12 +1071,10 @@ class BasicPlanRuntime:
                 continue
             flow = plan.flow(decision.flow_id)
             if decision.reference_price is None:  # pragma: no cover - invariant
-                raise ElementEvaluationError(
-                    f"candidate {decision.instrument_id} carries no reference price"
-                )
+                raise ElementEvaluationError(f"candidate {decision.instrument_id} carries no reference price")
             candidates.append(
                 emit_order_candidate(
-                    plan.terminal_step,
+                    flow.terminal_step or plan.terminal_step,
                     evaluation_id=evaluation_id,
                     instrument_id=decision.instrument_id,
                     partition_key=flow.partition_key,
@@ -1132,9 +1110,7 @@ def _failed(
     )
 
 
-def _allocate_equally(
-    decisions: list[BasicInstrumentDecision], side: str
-) -> tuple[BasicInstrumentDecision, ...]:
+def _allocate_equally(decisions: list[BasicInstrumentDecision], side: str) -> tuple[BasicInstrumentDecision, ...]:
     """Give every surviving BUY candidate the exact share ``1/n``.
 
     ``Fraction``, not ``Decimal``: 1/3 has no finite decimal form, and three
@@ -1143,16 +1119,12 @@ def _allocate_equally(
     """
     if side != "BUY":
         return tuple(decisions)
-    candidate_count = sum(
-        decision.status is BasicDecisionStatus.CANDIDATE for decision in decisions
-    )
+    candidate_count = sum(decision.status is BasicDecisionStatus.CANDIDATE for decision in decisions)
     if candidate_count == 0:
         return tuple(decisions)
     share = Fraction(1, candidate_count)
     return tuple(
-        replace(decision, buy_allocation=share)
-        if decision.status is BasicDecisionStatus.CANDIDATE
-        else decision
+        replace(decision, buy_allocation=share) if decision.status is BasicDecisionStatus.CANDIDATE else decision
         for decision in decisions
     )
 
@@ -1189,11 +1161,20 @@ def derive_data_requirements(
     same plan always makes the same request of the data layer.
     """
     by_id: dict[str, DataRequirement] = {}
+    raw_lookback: dict[tuple[str, str], int] = {}
+    for flow in plan.flows:
+        for step in flow.condition_steps:
+            resolution = step.arguments.get("resolution")
+            if resolution is None:
+                continue
+            lookback = _raw_operation_lookback(step)
+            key = ("ADJUSTED_BAR", resolution)
+            raw_lookback[key] = max(raw_lookback.get(key, 1), lookback)
+    if not raw_lookback and plan.reference_series[1] != "$DATASET":
+        raw_lookback[plan.reference_series] = 1
     for instrument_id in plan.instrument_ids:
         for feature in plan.required_features:
-            requirement_id = (
-                f"{instrument_id}|{feature.data_kind}|{feature.bar_resolution}"
-            )
+            requirement_id = f"{instrument_id}|{feature.data_kind}|{feature.bar_resolution}"
             warmup_from = evaluation_from - feature.warmup_span
             existing = by_id.get(requirement_id)
             if existing is not None and existing.warmup_from <= warmup_from:
@@ -1208,7 +1189,49 @@ def derive_data_requirements(
                 evaluation_from=evaluation_from,
                 evaluation_through=evaluation_through,
             )
+        for (data_kind, resolution), bars in raw_lookback.items():
+            requirement_id = f"{instrument_id}|{data_kind}|{resolution}"
+            warmup_from = evaluation_from - resolution_period(resolution) * bars
+            existing = by_id.get(requirement_id)
+            if existing is not None and existing.warmup_from <= warmup_from:
+                continue
+            by_id[requirement_id] = DataRequirement(
+                requirement_id=requirement_id,
+                instrument_id=instrument_id,
+                data_kind=data_kind,
+                resolution=resolution,
+                warmup_from=warmup_from,
+                evaluation_from=evaluation_from,
+                evaluation_through=evaluation_through,
+            )
     return tuple(by_id[key] for key in sorted(by_id))
+
+
+def _raw_operation_lookback(step: PlanStep) -> int:
+    """Completed bars needed by one full-catalog operation, including crossing history."""
+    operation = step.operation
+    if operation in {"PRICE_COMPARE", "PRICE_CHANGE_PERCENT"}:
+        reference = step.arguments.get("reference", step.arguments.get("base", ""))
+        if reference == "PREVIOUS_CLOSE":
+            return 2
+        if reference.startswith(("SMA_", "HIGH_", "LOW_")):
+            return int(reference.rsplit("_", 1)[1]) + (1 if reference.startswith(("HIGH_", "LOW_")) else 0)
+        return 1
+    if operation == "VOLUME_COMPARE":
+        return 2 if step.argument("reference") == "PREVIOUS_VOLUME" else int(step.argument("period")) + 1
+    if operation == "STREAK":
+        return int(step.argument("bars")) + 1
+    if operation == "SMA_CROSS":
+        return int(step.argument("longPeriod")) + 1
+    if operation == "RSI_CROSS":
+        # RSI history is supplied by the exact pinned feature materialization. One raw bar
+        # remains necessary for the selected-resolution evaluation and pricing clock.
+        return 1
+    if operation == "MACD_CROSS":
+        return int(step.argument("slowPeriod")) + int(step.argument("signalPeriod")) + 2
+    if operation == "BOLLINGER_REVERSAL":
+        return int(step.argument("period")) + 1
+    return 1
 
 
 # ---------------------------------------------------------------------------
@@ -1268,15 +1291,19 @@ def _instrument_inputs(
     *,
     feature_series: Sequence[PinnedFeatureSeries] = (),
     require_pinned_features: bool = False,
+    runtime_values: Mapping[str, Mapping[str, str]] | None = None,
+    shared_values: Mapping[str, str] | None = None,
 ) -> dict[str, InstrumentInput]:
     """Group the bars available at ``as_of`` into one input per instrument."""
     grouped: dict[tuple[str, str, str], list[SeriesBar]] = {}
+    payloads: dict[tuple[str, str], list[MarketDataEvent]] = {}
     for event in events:
         if event.event_type != BAR_CLOSED_EVENT_TYPE or event.available_at > as_of:
             continue
         payload = event.payload
         key = (event.instrument_id, payload["dataKind"], payload["resolution"])
         grouped.setdefault(key, []).append(payload["bar"])
+        payloads.setdefault((event.instrument_id, payload["resolution"]), []).append(event)
 
     by_instrument: dict[str, list[InstrumentSeries]] = {}
     for (instrument_id, data_kind, resolution), bars in grouped.items():
@@ -1291,16 +1318,56 @@ def _instrument_inputs(
     features_by_instrument: dict[str, list[PinnedFeatureSeries]] = {}
     for feature in feature_series:
         features_by_instrument.setdefault(feature.instrument_id, []).append(feature)
-    instrument_ids = set(by_instrument) | set(features_by_instrument)
+    instrument_ids = set(by_instrument) | set(features_by_instrument) | set(runtime_values or {})
     return {
         instrument_id: InstrumentInput(
             instrument_id=instrument_id,
             series=tuple(by_instrument.get(instrument_id, ())),
             feature_series=tuple(features_by_instrument.get(instrument_id, ())),
             require_pinned_features=require_pinned_features,
+            values=_published_values(
+                instrument_id,
+                payloads,
+                as_of,
+                runtime_values=(runtime_values or {}).get(instrument_id, {}),
+                shared_values=shared_values or {},
+            ),
         )
         for instrument_id in instrument_ids
     }
+
+
+def _published_values(
+    instrument_id: str,
+    payloads: Mapping[tuple[str, str], list[MarketDataEvent]],
+    as_of: datetime,
+    *,
+    runtime_values: Mapping[str, str],
+    shared_values: Mapping[str, str],
+) -> dict[str, str]:
+    values = dict(shared_values)
+    values.update(runtime_values)
+    for (candidate, resolution), events in payloads.items():
+        if candidate != instrument_id:
+            continue
+        ordered = sorted(events, key=lambda item: item.occurred_at)
+        values[f"closes.{resolution}"] = ",".join(str(item.payload["bar"].close) for item in ordered)
+        values[f"volumes.{resolution}"] = ",".join(str(item.payload["bar"].volume) for item in ordered)
+        values[f"opens.{resolution}"] = ",".join(
+            str(item.payload.get("open", item.payload["bar"].close)) for item in ordered
+        )
+        values[f"highs.{resolution}"] = ",".join(
+            str(item.payload.get("high", item.payload["bar"].close)) for item in ordered
+        )
+        values[f"lows.{resolution}"] = ",".join(
+            str(item.payload.get("low", item.payload["bar"].close)) for item in ordered
+        )
+        values[f"bar.closed.{resolution}"] = str(ordered[-1].occurred_at == as_of).lower()
+        current_session = ordered[-1].payload.get("sessionDateEt")
+        session_events = [item for item in ordered if item.payload.get("sessionDateEt") == current_session]
+        if session_events:
+            values["session.open"] = str(session_events[0].payload.get("open", session_events[0].payload["bar"].close))
+    return values
 
 
 # ---------------------------------------------------------------------------
@@ -1342,9 +1409,7 @@ class ExecutionGate:
 
     def is_fill_allowed(self, instant: datetime) -> bool:
         """Both gates must agree: the market is open *and* the data is there."""
-        return self.session_status_at(
-            instant
-        ) is MarketSessionStatus.REGULAR_OPEN and self.is_stage_allowed(
+        return self.session_status_at(instant) is MarketSessionStatus.REGULAR_OPEN and self.is_stage_allowed(
             SkipStage.FILL, instant
         )
 
@@ -1359,6 +1424,58 @@ class PlanEvaluation:
     decisions: tuple[BasicInstrumentDecision, ...]
     candidates: tuple[OrderCandidate, ...]
     skip_reason: ReplaySkipReason | None = None
+
+
+@dataclass(slots=True)
+class _ReplayExecutionState:
+    executions: int = 0
+    bars_since_execution: int = 0
+    last_session_date: date | None = None
+    condition_rearmed: bool = True
+
+    def observe_non_candidate(self, status: BasicDecisionStatus) -> None:
+        if self.executions:
+            self.bars_since_execution += 1
+        if status is BasicDecisionStatus.CONDITION_NOT_MET:
+            self.condition_rearmed = True
+
+    def accepts(self, candidate: OrderCandidate) -> bool:
+        if self.executions:
+            self.bars_since_execution += 1
+        limit = 1 if candidate.execution_mode == "1회만" else candidate.max_executions
+        if self.executions >= limit:
+            return False
+        if self.executions == 0 or candidate.execution_mode == "주기마다":
+            eligible = True
+        elif candidate.wait_mode == "조건 재충족":
+            eligible = self.condition_rearmed
+        elif candidate.wait_mode == "N봉 이후":
+            eligible = self.bars_since_execution >= candidate.wait_interval
+        elif candidate.wait_mode == "N거래일 이후":
+            eligible = (
+                self.last_session_date is not None
+                and _weekdays_between_dates(self.last_session_date, candidate.session_date_et)
+                >= candidate.wait_interval
+            )
+        else:
+            eligible = False
+        if not eligible:
+            return False
+        self.executions += 1
+        self.bars_since_execution = 0
+        self.last_session_date = candidate.session_date_et
+        self.condition_rearmed = False
+        return True
+
+
+def _weekdays_between_dates(start: date, end: date) -> int:
+    count = 0
+    cursor = start
+    while cursor < end:
+        cursor += timedelta(days=1)
+        if cursor.weekday() < 5:
+            count += 1
+    return count
 
 
 class BasicPlanReplay:
@@ -1397,6 +1514,7 @@ class BasicPlanReplay:
         self.require_pinned_features = require_pinned_features
         self.gate = ExecutionGate(clock.schedule, assessment)
         self._evaluations: tuple[PlanEvaluation, ...] | None = None
+        self._execution_states: dict[tuple[str, str], _ReplayExecutionState] = {}
 
     def run(self) -> tuple[PlanEvaluation, ...]:
         """Replay the whole stream. Idempotent: the clock is advanced once."""
@@ -1408,16 +1526,17 @@ class BasicPlanReplay:
         evaluations: list[PlanEvaluation] = []
         evaluated: set[datetime] = set()
         while (snapshot := self.clock.advance_to_next_event()) is not None:
-            instants = sorted(
-                {event.occurred_at for event in snapshot.released_events} - evaluated
-            )
+            instants = sorted({event.occurred_at for event in snapshot.released_events} - evaluated)
             for instant in instants:
                 evaluated.add(instant)
                 evaluations.append(self._evaluate_at(instant, snapshot.visible_events))
         return tuple(sorted(evaluations, key=lambda item: item.occurred_at))
 
     def _evaluate_at(
-        self, instant: datetime, visible_events: tuple[MarketDataEvent, ...]
+        self,
+        instant: datetime,
+        visible_events: tuple[MarketDataEvent, ...],
+        runtime_values: Mapping[str, Mapping[str, str]] | None = None,
     ) -> PlanEvaluation:
         evaluation_id = self.plan.evaluation_id(instant)
         session, status = self.clock.schedule.status_at(instant)
@@ -1439,18 +1558,31 @@ class BasicPlanReplay:
                 instant,
                 feature_series=self.feature_series,
                 require_pinned_features=self.require_pinned_features,
+                runtime_values=runtime_values,
+                shared_values=self._schedule_values(instant, visible_events),
             ),
             as_of=instant,
         )
         candidates: tuple[OrderCandidate, ...] = ()
-        if session is not None:
+        candidate_session = session
+        eligible_at: datetime | None = None
+        if session is not None and instant >= session.closes_at:
+            # A signal from a bar that closes with the regular session cannot
+            # create a same-session DAY order. Carry it to the next official
+            # session so the next completed bar may fill it at that session's
+            # open without using the signal bar's own prices.
+            candidate_session = self.clock.schedule.next_session_after(instant)
+            eligible_at = None if candidate_session is None else candidate_session.opens_at
+        if candidate_session is not None:
             candidates = self.runtime.order_candidates(
                 self.plan,
                 result,
                 evaluation_id=evaluation_id,
-                session_date_et=session.trading_date_et,
-                session_closes_at=session.closes_at,
+                session_date_et=candidate_session.trading_date_et,
+                session_closes_at=candidate_session.closes_at,
+                eligible_at=eligible_at,
             )
+            candidates = self._apply_execution_policy(result.decisions, candidates)
         return PlanEvaluation(
             evaluation_id=evaluation_id,
             occurred_at=instant,
@@ -1458,6 +1590,69 @@ class BasicPlanReplay:
             decisions=result.decisions,
             candidates=candidates,
         )
+
+    def _apply_execution_policy(
+        self,
+        decisions: tuple[BasicInstrumentDecision, ...],
+        candidates: tuple[OrderCandidate, ...],
+    ) -> tuple[OrderCandidate, ...]:
+        if (
+            getattr(self.plan, "element_catalog_version", None)
+            != "basic-elements:2026-08-08"
+        ):
+            return candidates
+        candidate_keys = {(item.flow_id, item.instrument_id) for item in candidates}
+        for decision in decisions:
+            key = (decision.flow_id, decision.instrument_id)
+            if key not in candidate_keys:
+                state = self._execution_states.setdefault(key, _ReplayExecutionState())
+                state.observe_non_candidate(decision.status)
+        return tuple(
+            candidate
+            for candidate in candidates
+            if self._execution_states.setdefault(
+                (candidate.flow_id, candidate.instrument_id), _ReplayExecutionState()
+            ).accepts(candidate)
+        )
+
+    def evaluate_at(
+        self,
+        instant: datetime,
+        visible_events: tuple[MarketDataEvent, ...],
+        runtime_values: Mapping[str, Mapping[str, str]] | None = None,
+    ) -> PlanEvaluation:
+        """Evaluate one instant after the execution model exposed its current positions."""
+        return self._evaluate_at(instant, visible_events, runtime_values)
+
+    def _schedule_values(self, instant: datetime, visible_events: tuple[MarketDataEvent, ...]) -> dict[str, str]:
+        session = self.clock.schedule.session_at(instant)
+        if session is None:
+            return {}
+        sessions = self.clock.schedule.sessions
+        index = sessions.index(session)
+        previous = sessions[index - 1] if index else None
+        following = sessions[index + 1] if index + 1 < len(sessions) else None
+        earlier_today = any(
+            event.occurred_at < instant and event.payload.get("sessionDateEt") == session.trading_date_et
+            for event in visible_events
+        )
+        current = session.trading_date_et
+        return {
+            "session.close": str(instant >= session.closes_at).lower(),
+            "schedule.newTradingDay": str(not earlier_today).lower(),
+            "schedule.tradingDayIndex": str(index + 1),
+            "schedule.weekFirstTradingDay": str(
+                previous is None or previous.trading_date_et.isocalendar()[:2] != current.isocalendar()[:2]
+            ).lower(),
+            "schedule.monthFirstTradingDay": str(
+                previous is None
+                or (previous.trading_date_et.year, previous.trading_date_et.month) != (current.year, current.month)
+            ).lower(),
+            "schedule.monthLastTradingDay": str(
+                following is None
+                or (following.trading_date_et.year, following.trading_date_et.month) != (current.year, current.month)
+            ).lower(),
+        }
 
 
 def _unavailable_fields(assessment: AvailabilityAssessment) -> dict[str, Any]:
@@ -1472,7 +1667,5 @@ def _unavailable_fields(assessment: AvailabilityAssessment) -> dict[str, Any]:
     reason_code = reasons.pop() if len(reasons) == 1 else "REQUIRED_DATA_UNAVAILABLE"
     return {
         "reason_code": reason_code,
-        "missing_requirements": sorted(
-            item.contract_value for item in assessment.missing_requirements
-        ),
+        "missing_requirements": sorted(item.contract_value for item in assessment.missing_requirements),
     }

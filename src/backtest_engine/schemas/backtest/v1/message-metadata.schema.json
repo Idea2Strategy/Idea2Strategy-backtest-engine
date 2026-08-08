@@ -20,6 +20,7 @@
         "BACKTEST_RUNNING",
         "BACKTEST_COMPLETED",
         "BACKTEST_FAILED",
+        "BACKTEST_CANCELLED",
         "BACKTEST_UNAVAILABLE"
       ]
     },

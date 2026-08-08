@@ -14,6 +14,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -31,6 +32,7 @@ from backtest_engine.basic_runtime import (
     PlanLoadFailure,
     ReplaySkipReason,
     ReplayUnavailableError,
+    _ReplayExecutionState,
     bar_closed_event,
     derive_data_requirements,
 )
@@ -48,6 +50,7 @@ from backtest_engine.elements import (
     InstrumentInput,
     InstrumentSeries,
     SeriesBar,
+    element_catalog,
 )
 from backtest_engine.event_clock import MarketEventClock, MarketSessionStatus
 
@@ -68,6 +71,26 @@ OVERSOLD_CLOSES = [
     "100", "101", "100", "99", "98", "97", "96", "95", "94",
     "94", "94", "94", "94", "94", "94", "94", "94", "94", "94", "94",
 ]
+
+
+def test_production_execution_gate_enforces_rearm_wait_and_maximum() -> None:
+    state = _ReplayExecutionState()
+
+    def candidate(session: date = SESSION_DATE) -> Any:
+        return SimpleNamespace(
+            execution_mode="대기 후 재진입",
+            max_executions=2,
+            wait_mode="조건 재충족",
+            wait_interval=1,
+            session_date_et=session,
+        )
+
+    assert state.accepts(candidate()) is True
+    assert state.accepts(candidate()) is False
+    state.observe_non_candidate(BasicDecisionStatus.CONDITION_NOT_MET)
+    assert state.accepts(candidate()) is True
+    state.observe_non_candidate(BasicDecisionStatus.CONDITION_NOT_MET)
+    assert state.accepts(candidate()) is False
 
 
 def _document(path: Path = VALID_PLAN) -> dict[str, Any]:
@@ -165,6 +188,142 @@ def test_loads_bs_published_plan_unmodified() -> None:
     assert (feature.required_observations, feature.definition_bars) == (14, 15)
     assert feature.warmup_bars == 15
     assert plan.reference_series == ("ADJUSTED_BAR", "1m")
+
+
+@pytest.mark.parametrize(
+    ("resolution", "period"),
+    [
+        ("30m", timedelta(minutes=30)),
+        ("1h", timedelta(hours=1)),
+        ("4h", timedelta(hours=4)),
+        ("1d", timedelta(days=1)),
+    ],
+)
+def test_loads_and_executes_the_full_catalog_without_synthetic_features(
+    resolution: str, period: timedelta
+) -> None:
+    def full_catalog(document: dict[str, Any]) -> None:
+        document["elementCatalogVersion"] = "basic-elements:2026-08-08"
+        document["requiredFeatures"] = []
+        document["steps"] = [
+            {"sequence": 1, "operation": "PRICE_COMPARE", "arguments": {
+                "resolution": resolution, "operator": "GT", "reference": "PREVIOUS_CLOSE",
+            }},
+            {"sequence": 2, "operation": "EMIT_ORDER_CANDIDATE", "arguments": {
+                "allocation": "EQUAL", "orderType": "MARKET", "timeInForce": "DAY",
+                "side": "BUY", "orderPercent": "50", "executionMode": "1회만",
+                "waitMode": "조건 재충족", "waitInterval": "1", "maxExecutions": "1",
+            }},
+        ]
+
+    plan = _runtime().load(_resealed(full_catalog))
+    bars = tuple(
+        SeriesBar(
+            instrument_id=FIRST, resolution=resolution,
+            starts_at=OPEN + period * index, ends_at=OPEN + period * (index + 1),
+            close=Decimal(value), volume=Decimal("1000"),
+        )
+        for index, value in enumerate(("100", "101"))
+    )
+    instrument_input = InstrumentInput(
+        instrument_id=FIRST,
+        series=(InstrumentSeries(
+            instrument_id=FIRST, data_kind="ADJUSTED_BAR", resolution=resolution, bars=bars
+        ),),
+        values={
+            f"bar.closed.{resolution}": "true",
+            f"closes.{resolution}": "100,101",
+            f"volumes.{resolution}": "1000,1000",
+        },
+    )
+    result = _runtime().execute(plan, {FIRST: instrument_input}, as_of=bars[-1].ends_at)
+
+    assert plan.reference_series == ("ADJUSTED_BAR", resolution)
+    assert plan.required_features == ()
+    assert result.decisions[0].status is BasicDecisionStatus.CANDIDATE
+    assert result.decisions[0].reference_price == Decimal("101.00000000")
+
+
+@pytest.mark.parametrize(
+    ("resolution", "wire_resolution", "feature_id"),
+    [
+        ("30m", "PT30M", "4b1c6801-0259-5176-a857-0e5ea923d898"),
+        ("1h", "PT1H", "2e18c093-5d4e-5d9a-bd22-b7e5679f1a3e"),
+        ("4h", "PT4H", "1b2785bd-20f0-50a2-ae96-6a1f7bad74b9"),
+        ("1d", "PT24H", "eddfb2d4-8586-5260-8fc9-9c8125990270"),
+    ],
+)
+def test_rsi_cross_requires_the_exact_selected_resolution_feature_definition(
+    resolution: str, wire_resolution: str, feature_id: str
+) -> None:
+    def rsi_cross(document: dict[str, Any]) -> None:
+        catalog = element_catalog("basic-elements:2026-08-08")
+        terminal = catalog.spec("EMIT_ORDER_CANDIDATE")
+        terminal_arguments = {
+            name: values[0] for name, values in terminal.enumerations.items()
+        }
+        terminal_arguments.update(
+            {"orderPercent": "50", "waitInterval": "1", "maxExecutions": "1"}
+        )
+        document["elementCatalogVersion"] = catalog.version
+        document["requiredFeatures"] = [
+            {
+                "requirementId": f"rsi-14-{resolution}",
+                "featureId": feature_id,
+                "featureVersion": "1.0.0",
+                "instruments": [FIRST],
+                "resolution": wire_resolution,
+                "requiredObservations": 14,
+            }
+        ]
+        document["steps"] = [
+            {
+                "sequence": 1,
+                "operation": "RSI_CROSS",
+                "arguments": {
+                    "resolution": resolution,
+                    "direction": "UP",
+                    "period": "14",
+                    "threshold": "50",
+                },
+            },
+            {"sequence": 2, "operation": "EMIT_ORDER_CANDIDATE", "arguments": terminal_arguments},
+        ]
+
+    plan = _runtime().load(_resealed(rsi_cross))
+
+    assert plan.required_features[0].feature_id == feature_id
+    assert plan.required_features[0].bar_resolution == resolution
+    assert plan.reference_series == ("ADJUSTED_BAR", resolution)
+
+
+def test_rsi_cross_rejects_a_feature_uuid_from_another_resolution() -> None:
+    def mismatched(document: dict[str, Any]) -> None:
+        catalog = element_catalog("basic-elements:2026-08-08")
+        terminal = catalog.spec("EMIT_ORDER_CANDIDATE")
+        terminal_arguments = {
+            name: values[0] for name, values in terminal.enumerations.items()
+        }
+        terminal_arguments.update(
+            {"orderPercent": "50", "waitInterval": "1", "maxExecutions": "1"}
+        )
+        document["elementCatalogVersion"] = catalog.version
+        document["requiredFeatures"] = [{
+            "requirementId": "rsi-14-30m",
+            "featureId": "2e18c093-5d4e-5d9a-bd22-b7e5679f1a3e",
+            "featureVersion": "1.0.0",
+            "instruments": [FIRST],
+            "resolution": "PT30M",
+            "requiredObservations": 14,
+        }]
+        document["steps"] = [{
+            "sequence": 1,
+            "operation": "RSI_CROSS",
+            "arguments": {"resolution": "30m", "direction": "UP", "period": "14", "threshold": "50"},
+        }, {"sequence": 2, "operation": "EMIT_ORDER_CANDIDATE", "arguments": terminal_arguments}]
+
+    with pytest.raises(BasicPlanCompatibilityError, match="pins 1h"):
+        _runtime().load(_resealed(mismatched))
 
 
 def test_the_vendored_fixture_is_byte_identical_to_bs_authoritative_copy() -> None:
@@ -485,9 +644,9 @@ def _set_feature(**changes: Any) -> Any:
         ),
         (
             # A resolution this build does not implement at all.
-            _set_feature(resolution="PT30M"),
+            _set_feature(resolution="PT2H"),
             PlanLoadFailure.UNSUPPORTED_ELEMENT_ARGUMENT,
-            "PT30M",
+            "PT2H",
         ),
         (
             # PT60M and PT1H are the same duration, but only PT1H is normalized.
@@ -527,13 +686,13 @@ def _set_feature(**changes: Any) -> Any:
             PlanLoadFailure.PLAN_CONTRACT_INVALID,
             "duplicates an earlier required feature",
         ),
-        (
-            # The step still reads RSI_14 at 1m, but the plan now declares the
-            # history for 5m. The step's series was never requested.
-            _set_feature(resolution="PT5M"),
-            PlanLoadFailure.PLAN_STRUCTURE_INVALID,
-            "does not declare",
-        ),
+            (
+                # The step still reads RSI_14 at 1m, but the plan now declares the
+                # history for 5m. The canonical feature UUID itself pins 1m.
+                _set_feature(resolution="PT5M"),
+                PlanLoadFailure.FEATURE_VERSION_MISMATCH,
+                "pins 1m",
+            ),
     ],
 )
 def test_rejects_a_required_features_block_it_cannot_honour(
@@ -566,7 +725,7 @@ def test_a_plan_without_a_usable_required_features_block_is_refused(
         _runtime().load(document)
 
     assert failure.value.failure is PlanLoadFailure.PLAN_CONTRACT_INVALID
-    assert "requiredFeatures" in str(failure.value)
+    assert ("planChecksum" if value == [] else "requiredFeatures") in str(failure.value)
 
 
 def test_a_declared_floor_above_the_definition_window_widens_the_warm_up() -> None:

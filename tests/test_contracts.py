@@ -333,8 +333,23 @@ def test_published_result_event_covers_exactly_the_canonical_run_status_enum() -
         "RUNNING": "BACKTEST_RUNNING",
         "COMPLETED": "BACKTEST_COMPLETED",
         "FAILED": "BACKTEST_FAILED",
+        "CANCELLED": "BACKTEST_CANCELLED",
         "UNAVAILABLE": "BACKTEST_UNAVAILABLE",
     }
+
+
+def test_cancelled_result_is_a_distinct_terminal_event() -> None:
+    event = _result_event(
+        "CANCELLED",
+        cancelledAt="2024-01-03T01:07:00Z",
+        attempt=2,
+        reasonCode="USER_CANCELLED",
+    )
+
+    assert event["metadata"]["messageType"] == "BACKTEST_CANCELLED"
+    assert event["status"] == "CANCELLED"
+    assert event["reasonCode"] == "USER_CANCELLED"
+    validate_backtest_result_event(event)
 
 
 @pytest.mark.parametrize(
@@ -373,6 +388,16 @@ def test_published_result_event_covers_exactly_the_canonical_run_status_enum() -
             },
             "BACKTEST_FAILED",
             "sha256:ddae478cec5865b979364f69f4140e8725e8ca462c53989be7b12bf4e60563e3",
+        ),
+        (
+            "CANCELLED",
+            {
+                "cancelledAt": "2024-01-03T01:07:00Z",
+                "attempt": 2,
+                "reasonCode": "USER_CANCELLED",
+            },
+            "BACKTEST_CANCELLED",
+            "sha256:acadace5c053c96f500e56c2dd43669bbdd64394f26b75e6d8243fed8ac5c9dc",
         ),
         (
             "UNAVAILABLE",
@@ -722,7 +747,8 @@ def test_the_supported_operation_set_matches_the_schemas_enum() -> None:
         SUPPORTED_PLAN_OPERATIONS
     )
     assert SUPPORTED_PLAN_OPERATIONS == {
-        "LOAD_FEATURE",
-        "COMPARE",
-        "EMIT_ORDER_CANDIDATE",
+        "LOAD_FEATURE", "COMPARE", "PRICE_COMPARE", "PRICE_CHANGE_PERCENT",
+        "VOLUME_COMPARE", "STREAK", "SMA_CROSS", "RSI_CROSS", "MACD_CROSS",
+        "BOLLINGER_REVERSAL", "POSITION_RETURN", "HOLDING_PERIOD", "PEAK_RETURN",
+        "DRAWDOWN_FROM_PEAK", "SCHEDULE", "EMIT_ORDER_CANDIDATE",
     }

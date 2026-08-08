@@ -214,6 +214,8 @@ class PlanEvaluation(Protocol):
 class ExecutionGate(Protocol):
     """Satisfied by ``backtest_engine.basic_runtime.ExecutionGate`` (BT-a)."""
 
+    def session_status_at(self, instant: datetime) -> MarketSessionStatus: ...
+
     def is_evaluation_allowed(self, instant: datetime) -> bool: ...
 
     def is_order_trigger_allowed(self, instant: datetime) -> bool: ...
@@ -228,6 +230,13 @@ class PlanReplay(Protocol):
     gate: ExecutionGate
 
     def run(self) -> Sequence[Any]: ...
+
+    def evaluate_at(
+        self,
+        instant: datetime,
+        visible_events: tuple[MarketDataEvent, ...],
+        runtime_values: Mapping[str, Mapping[str, str]] | None = None,
+    ) -> Any: ...
 
 
 class PlanReplayFactory(Protocol):
@@ -263,6 +272,10 @@ class ExecutionEngine(Protocol):
     def place(self, candidate: Any) -> str | None: ...
 
     def settle(self, event: MarketDataEvent) -> int: ...
+
+    def runtime_values(
+        self, instant: datetime, events: tuple[MarketDataEvent, ...]
+    ) -> Mapping[str, Mapping[str, str]]: ...
 
     def summary(self) -> ExecutionSummary: ...
 
@@ -388,6 +401,7 @@ def bar_events_from_table(
     data_kind: str,
     resolution: str,
     publication_lag: timedelta = timedelta(0),
+    schedule: OfficialSessionSchedule | None = None,
 ) -> tuple[MarketDataEvent, ...]:
     """Compatibility adapter for already-materialized Arrow tables."""
     return bar_events_from_batches(
@@ -395,6 +409,7 @@ def bar_events_from_table(
         data_kind=data_kind,
         resolution=resolution,
         publication_lag=publication_lag,
+        schedule=schedule,
     )
 
 
@@ -404,6 +419,7 @@ def bar_events_from_batches(
     data_kind: str,
     resolution: str,
     publication_lag: timedelta = timedelta(0),
+    schedule: OfficialSessionSchedule | None = None,
 ) -> tuple[MarketDataEvent, ...]:
     """Turn verified Parquet rows into the clock's event stream.
 
@@ -425,12 +441,31 @@ def bar_events_from_batches(
     for batch in batches:
         for row in batch.to_pylist():
             source_sequence += 1
-            starts_at: datetime = row["bar_start_at"]
-            ends_at = starts_at + period
+            source_starts_at: datetime = row["bar_start_at"]
+            starts_at = source_starts_at
+            session_truncated = False
+            if schedule is not None:
+                session = schedule.session_on(row["session_date_et"])
+                if session is None:
+                    raise MarketDataValidationError(
+                        f"no official session exists for {row['session_date_et']}"
+                    )
+                if resolution == "1d":
+                    # Daily providers may label a bar at midnight. Its economic
+                    # interval is the official regular session, not that label.
+                    starts_at = session.opens_at
+                if not session.contains(starts_at):
+                    raise MarketDataValidationError(
+                        "bar_start_at is outside its official regular session"
+                    )
+                ends_at = min(starts_at + period, session.closes_at)
+                session_truncated = ends_at - starts_at < period
+            else:
+                ends_at = starts_at + period
             instrument_id = str(row["instrument_id"])
             events.append(
                 MarketDataEvent(
-                    event_id=f"BAR:{instrument_id}:{starts_at.isoformat()}",
+                    event_id=f"BAR:{instrument_id}:{source_starts_at.isoformat()}",
                     instrument_id=instrument_id,
                     occurred_at=ends_at,
                     available_at=ends_at + publication_lag,
@@ -446,7 +481,10 @@ def bar_events_from_batches(
                             ends_at=ends_at,
                             close=Decimal(str(row["close"])),
                             volume=Decimal(str(row["volume"])),
+                            session_truncated=session_truncated,
                         ),
+                        "sessionDateEt": row["session_date_et"],
+                        "sourceBarStartAt": source_starts_at,
                         "providerSymbol": row["provider_symbol"],
                         "open": Decimal(str(row["open"])),
                         "high": Decimal(str(row["high"])),
@@ -463,6 +501,7 @@ def observations_from_events(
     requirements: Sequence[DataRequirement],
     events: Sequence[MarketDataEvent],
     bar_interval: timedelta,
+    schedule: OfficialSessionSchedule | None = None,
 ) -> tuple[DataObservation, ...]:
     """Coverage as actually delivered, derived from the verified bars.
 
@@ -474,10 +513,14 @@ def observations_from_events(
     """
     by_instrument: dict[str, list[TimeInterval]] = {}
     for event in events:
-        # The event's instant is the bar's close; the coverage it evidences is
-        # the bar's period.
+        bar = event.payload.get("bar")
+        interval = (
+            TimeInterval(bar.starts_at, bar.ends_at)
+            if isinstance(bar, SeriesBar)
+            else TimeInterval(event.occurred_at - bar_interval, event.occurred_at)
+        )
         by_instrument.setdefault(event.instrument_id, []).append(
-            TimeInterval(event.occurred_at - bar_interval, event.occurred_at)
+            interval
         )
     return tuple(
         DataObservation(
@@ -485,11 +528,41 @@ def observations_from_events(
             instrument_id=requirement.instrument_id,
             data_kind=requirement.data_kind,
             resolution=requirement.resolution,
-            available_intervals=tuple(by_instrument.get(requirement.instrument_id, ())),
+            available_intervals=(
+                tuple(by_instrument.get(requirement.instrument_id, ()))
+                + (
+                    _closed_market_intervals(schedule, requirement.required_interval)
+                    if schedule is not None
+                    else ()
+                )
+            ),
             verified=True,
         )
         for requirement in requirements
     )
+
+
+def _closed_market_intervals(
+    schedule: OfficialSessionSchedule,
+    target: TimeInterval,
+) -> tuple[TimeInterval, ...]:
+    """Intervals where no regular-session bar is expected within ``target``."""
+
+    closed: list[TimeInterval] = []
+    cursor = target.starts_at
+    for session in schedule.sessions:
+        if session.closes_at <= target.starts_at:
+            continue
+        if session.opens_at >= target.ends_at:
+            break
+        opens_at = max(session.opens_at, target.starts_at)
+        closes_at = min(session.closes_at, target.ends_at)
+        if cursor < opens_at:
+            closed.append(TimeInterval(cursor, opens_at))
+        cursor = max(cursor, closes_at)
+    if cursor < target.ends_at:
+        closed.append(TimeInterval(cursor, target.ends_at))
+    return tuple(closed)
 
 
 def _canonical_json(value: object) -> bytes:
@@ -594,12 +667,14 @@ class BacktestOrchestrator:
         lease: AttemptLease,
         monitor: ResourceMonitor,
     ) -> ReplayOutcome:
+        schedule = self._schedule(job.execution_policy)
         try:
             events = bar_events_from_batches(
                 self._reader.iter_batches(job.manifest, job.execution_policy),
                 data_kind=job.data_kind,
                 resolution=job.resolution,
                 publication_lag=self._publication_lag,
+                schedule=schedule,
             )
         except MarketDataValidationError:
             return self._abort(
@@ -608,7 +683,12 @@ class BacktestOrchestrator:
             )
         assessment = self._assessor.assess(
             job.requirements,
-            observations_from_events(job.requirements, events, job.bar_interval),
+            observations_from_events(
+                job.requirements,
+                events,
+                job.bar_interval,
+                schedule=schedule,
+            ),
         )
 
         if assessment.status is AvailabilityStatus.UNAVAILABLE:
@@ -624,7 +704,7 @@ class BacktestOrchestrator:
             )
             return _with_missing(outcome, missing)
 
-        clock = MarketEventClock(self._schedule(job.execution_policy), events)
+        clock = MarketEventClock(schedule, events)
 
         # Police the attempt before the plan replay, which is the single
         # longest-running call in the run.
@@ -634,17 +714,8 @@ class BacktestOrchestrator:
             return _from_attempt_failure(job, assessment, (), failure, coordinator)
 
         replay = self._replay_factory(clock=clock, assessment=assessment)
-        try:
-            evaluations = tuple(replay.run())
-        except Exception:
-            return self._abort(
-                job, coordinator, lease, "PLAN_REPLAY_FAILED",
-                retryable=False, status=ReplayStatus.FAILED,
-                availability=assessment.status,
-            )
-
         return self._execute(
-            job, events, evaluations, replay.gate, assessment, coordinator, lease, monitor
+            job, events, replay, replay.gate, assessment, coordinator, lease, monitor
         )
 
     # -- execution pass ---------------------------------------------------
@@ -653,7 +724,7 @@ class BacktestOrchestrator:
         self,
         job: BacktestJob,
         events: tuple[MarketDataEvent, ...],
-        evaluations: tuple[Any, ...],
+        replay: PlanReplay,
         gate: ExecutionGate,
         assessment: AvailabilityAssessment,
         coordinator: AttemptCoordinator,
@@ -669,11 +740,8 @@ class BacktestOrchestrator:
         events_at: dict[datetime, list[MarketDataEvent]] = {}
         for event in events:
             events_at.setdefault(event.occurred_at, []).append(event)
-        evaluation_at = {
-            evaluation.occurred_at: evaluation for evaluation in evaluations
-        }
-
         steps: list[ReplayStep] = []
+        evaluations: list[Any] = []
         for sequence, instant in enumerate(sorted(events_at), start=1):
             try:
                 lease = coordinator.heartbeat(
@@ -684,15 +752,50 @@ class BacktestOrchestrator:
                     job, assessment, tuple(steps), failure, coordinator
                 )
 
-            evaluation = evaluation_at.get(instant)
-            fill_allowed = gate.is_fill_allowed(instant)
+            if gate.is_fill_allowed(instant):
+                fillable_events = tuple(events_at[instant])
+            elif gate.session_status_at(instant) is MarketSessionStatus.REGULAR_OPEN:
+                # A data gap at an otherwise-open instant remains authoritative.
+                fillable_events = ()
+            else:
+                # A session-closing bar becomes visible at the close, when the
+                # market is no longer open. A resting order is nevertheless
+                # evaluated at that bar's open, which is the historical instant
+                # at which the fill would have happened.
+                fillable_events = tuple(
+                    event
+                    for event in events_at[instant]
+                    if gate.is_fill_allowed(event.payload["bar"].starts_at)
+                )
+            fill_allowed = bool(fillable_events)
             order_allowed = gate.is_order_trigger_allowed(instant)
             evaluation_allowed = gate.is_evaluation_allowed(instant)
 
             fill_count = 0
             if fill_allowed:
-                for event in events_at[instant]:
+                for event in fillable_events:
                     fill_count += self._engine.settle(event)
+
+            visible_events = tuple(
+                event
+                for event in events
+                if event.available_at <= instant and event.occurred_at <= instant
+            )
+            runtime_values_provider = getattr(self._engine, "runtime_values", None)
+            runtime_values = (
+                runtime_values_provider(instant, tuple(events_at[instant]))
+                if runtime_values_provider is not None
+                else {}
+            )
+            try:
+                evaluation = replay.evaluate_at(instant, visible_events, runtime_values)
+            except Exception:
+                return self._abort(
+                    job, coordinator, lease, "PLAN_REPLAY_FAILED",
+                    retryable=False, status=ReplayStatus.FAILED,
+                    availability=assessment.status, steps=tuple(steps),
+                )
+            evaluations.append(evaluation)
 
             candidates = tuple(evaluation.candidates) if evaluation else ()
             placed: tuple[str, ...] = ()
@@ -728,7 +831,7 @@ class BacktestOrchestrator:
             )
 
         return self._publish(
-            job, assessment, evaluations, tuple(steps), coordinator, lease
+            job, assessment, tuple(evaluations), tuple(steps), coordinator, lease
         )
 
     def _publish(

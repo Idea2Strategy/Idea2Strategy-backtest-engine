@@ -131,6 +131,22 @@ class OfficialSessionSchedule:
         assessed_at = _utc(instant, "instant")
         return self._by_date.get(assessed_at.astimezone(ET).date())
 
+    def session_on(self, trading_date_et: date) -> OfficialTradingSession | None:
+        """The official regular session for an ET trading date, if one exists."""
+
+        if not isinstance(trading_date_et, date) or isinstance(trading_date_et, datetime):
+            raise EventClockValidationError("trading_date_et must be a date")
+        return self._by_date.get(trading_date_et)
+
+    def next_session_after(self, instant: datetime) -> OfficialTradingSession | None:
+        """The first official session whose open is strictly after ``instant``."""
+
+        assessed_at = _utc(instant, "instant")
+        return next(
+            (session for session in self.sessions if session.opens_at > assessed_at),
+            None,
+        )
+
     def status_at(
         self, instant: datetime
     ) -> tuple[OfficialTradingSession | None, MarketSessionStatus]:
@@ -241,7 +257,14 @@ class MarketEventClock:
             official_order.add(order_key)
 
             session = self._schedule.session_at(event.occurred_at)
-            if session is None or not session.contains(event.occurred_at):
+            closes_regular_bar = (
+                session is not None
+                and event.event_type == "BAR_CLOSED"
+                and event.occurred_at == session.closes_at
+            )
+            if session is None or (
+                not session.contains(event.occurred_at) and not closes_regular_bar
+            ):
                 raise EventClockValidationError(
                     "event occurred_at is outside an official regular session"
                 )

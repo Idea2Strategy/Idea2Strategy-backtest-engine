@@ -290,6 +290,22 @@ class RunRepository(_Repository):
             missing_requirements=None if missing_requirements is None else list(missing_requirements),
         )
 
+    def mark_cancelled(
+        self,
+        run_id: UUID,
+        cancelled_at: datetime,
+        reason_code: str,
+    ) -> RunRow:
+        current = self.get(run_id)
+        return self._transition(
+            run_id,
+            RunStatus.CANCELLED,
+            completed_at=cancelled_at,
+            cancellation_requested_at=current.cancellation_requested_at or cancelled_at,
+            cancellation_reason_code=current.cancellation_reason_code or reason_code,
+            cancelled_at=cancelled_at,
+        )
+
     def request_cancellation(self, run_id: UUID, *, reason_code: str) -> RunRow:
         """Serialize cancellation with claim and terminal publication using DB time."""
         if not reason_code.strip():

@@ -454,6 +454,50 @@ def test_listing_is_scoped_to_the_authenticated_owner(
     assert theirs["items"] == []
 
 
+def test_owner_can_cancel_a_queued_run_immediately(
+    harness: Harness, official_request: dict[str, Any]
+) -> None:
+    _accept(harness, official_request)
+
+    response = harness.client.post(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}/cancellation",
+        json={"reasonCode": "USER_CANCELLED"},
+        headers=harness.owner(),
+    )
+
+    assert response.status_code == 202
+    run = response.json()["run"]
+    assert run["status"] == "CANCELLED"
+    assert run["cancellationReasonCode"] == "USER_CANCELLED"
+    assert run["cancellationRequestedAt"] is not None
+    assert run["cancelledAt"] is not None
+
+
+def test_running_cancellation_is_cooperative_and_owner_scoped(
+    harness: Harness, official_request: dict[str, Any]
+) -> None:
+    _accept(harness, official_request)
+    harness.gateway.transition(
+        UUID(EXPECTED_RUN_ID),
+        RunStatus.RUNNING,
+        started_at=datetime(2026, 7, 31, 12, 5, tzinfo=timezone.utc),
+    )
+
+    forbidden = harness.client.post(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}/cancellation", headers=harness.other()
+    )
+    accepted = harness.client.post(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}/cancellation", headers=harness.owner()
+    )
+
+    assert forbidden.status_code == 403
+    run = accepted.json()["run"]
+    assert run["status"] == "RUNNING"
+    assert run["cancellationReasonCode"] == "USER_CANCELLED"
+    assert run["cancellationRequestedAt"] is not None
+    assert run["cancelledAt"] is None
+
+
 def test_result_ingestion_requires_its_own_scope(
     harness: Harness, official_request: dict[str, Any]
 ) -> None:

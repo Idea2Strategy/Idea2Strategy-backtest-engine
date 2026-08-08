@@ -28,6 +28,7 @@ from backtest_engine.execution_policy import ExecutionPolicyCatalog
 from backtest_engine.feature_outputs import (
     FEATURE_SERIES_SCHEMA,
     FeatureOutputBindingError,
+    _expected_feature_feed_id,
     resolve_feature_materialization_pins,
 )
 from backtest_engine.lifecycle import StaticCompiledPlanSource, StaticDatasetManifestSource
@@ -321,6 +322,46 @@ def test_proposed_rsi_seed_reproduces_the_exact_deterministic_feed_identity() ->
     resolved, _reader = _resolve(records={MATERIALIZATION_ID: record}, body=body)
 
     assert resolved[0].feature_id == "RSI_14"
+
+
+@pytest.mark.parametrize(
+    ("feature_id", "definition_hash", "resolution", "feed_id"),
+    [
+        (
+            "4b1c6801-0259-5176-a857-0e5ea923d898",
+            "363f534dc77c6af0ebfe58f35be4fd2aa208906b1eaa36b550b17e9acb8692e4",
+            "30m",
+            "57794d8c-2254-53e4-966e-44f97edd9e6a",
+        ),
+        (
+            "2e18c093-5d4e-5d9a-bd22-b7e5679f1a3e",
+            "9b8512c0502ca80e1804711ac624eb4a3b4e294a875dac2364e3510e284cc8b9",
+            "1h",
+            "28012549-4f45-56d3-8bb6-329e4c7a9d77",
+        ),
+        (
+            "1b2785bd-20f0-50a2-ae96-6a1f7bad74b9",
+            "da3aff028a1fdef861abb1d68852e2ba3a91ed3917f7c7196e2d43ef48176b2c",
+            "4h",
+            "e1d7d508-aaf1-5ae9-8098-c4af870f6fa4",
+        ),
+        (
+            "eddfb2d4-8586-5260-8fc9-9c8125990270",
+            "0cf646eb9cacf5826d26f7dcb982bf7cec9213cc438b99716ac47883aa04ba04",
+            "1d",
+            "6d2647f8-5caf-55ee-8821-869dc693f68a",
+        ),
+    ],
+)
+def test_each_production_resolution_has_one_deterministic_rsi_feed_identity(
+    feature_id: str, definition_hash: str, resolution: str, feed_id: str
+) -> None:
+    assert _expected_feature_feed_id({
+        "feature_definition_id": feature_id,
+        "definition_hash": definition_hash,
+        "calculator_version": "rsi:1.0.0",
+        "resolution": resolution,
+    }) == feed_id
 
 
 def test_definition_hash_requires_the_canonical_prefixed_representation() -> None:

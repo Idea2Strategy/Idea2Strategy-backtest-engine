@@ -56,10 +56,11 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, replace
+from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_FLOOR, Decimal, localcontext
 from typing import Any, Protocol, cast
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
@@ -93,9 +94,9 @@ from .elements import PinnedFeatureSeries
 from .event_clock import MarketDataEvent, MarketEventClock
 from .execution_model import (
     BacktestExecutionModel,
+    ExecutionBar,
     ExecutionMicrostructurePolicy,
     InstrumentFractionalPolicy,
-    MinuteBar,
     OrderRequest,
     OrderSide,
     OrderStatus,
@@ -339,13 +340,13 @@ class ExecutionModelEngine:
     * **sizing** -- turn an unsized ``OrderCandidate`` into an ``OrderRequest``
       under :data:`SIZING_RULES_VERSION`;
     * **bar translation** -- turn the orchestrator's ``MarketDataEvent`` into
-      the ``MinuteBar`` the matching engine consumes;
+      the resolution-aware ``ExecutionBar`` the matching engine consumes;
     * **evidence** -- accumulate the ``ResultRecord`` stream the result snapshot
       is built from, so a rejected or expired order is still visible.
 
-    Only 1-minute bars are supported, because ``MinuteBar`` is defined as
-    exactly one minute. A coarser resolution is refused rather than silently
-    re-labelled.
+    The adapter preserves the plan-pinned resolution. Session-ending partial
+    bars remain explicitly marked instead of being relabelled as a shorter
+    resolution.
     """
 
     def __init__(
@@ -363,6 +364,11 @@ class ExecutionModelEngine:
         self._records: list[ResultRecord] = []
         self._instruments: set[str] = set()
         self._declined: list[str] = []
+        self._opened_at: dict[str, datetime] = {}
+        self._tracked_average: dict[str, Decimal] = {}
+        self._peak_price: dict[str, Decimal] = {}
+        self._holding_bars: dict[tuple[str, str], int] = {}
+        self._last_runtime_instant: datetime | None = None
 
     # -- evidence ---------------------------------------------------------
 
@@ -420,6 +426,7 @@ class ExecutionModelEngine:
         return order_id if order.status is OrderStatus.ACCEPTED else None
 
     def settle(self, event: MarketDataEvent) -> int:
+        before = self._model.position(event.instrument_id)
         bar = self._bar_of(event)
         for expired in self._model.advance_time(bar.starts_at):
             self._records.append(
@@ -436,7 +443,60 @@ class ExecutionModelEngine:
                     self._positions(),
                 )
             )
+        after = self._model.position(event.instrument_id)
+        if before.quantity <= _ZERO < after.quantity:
+            self._opened_at[event.instrument_id] = bar.starts_at
+        if after.quantity <= _ZERO:
+            self._clear_position_runtime(event.instrument_id)
         return len(fills)
+
+    def runtime_values(
+        self, instant: datetime, events: tuple[MarketDataEvent, ...]
+    ) -> Mapping[str, Mapping[str, str]]:
+        """Publish the same position metrics the live Basic runtime evaluates."""
+        current_prices = {
+            event.instrument_id: event.payload["bar"].close for event in events
+        }
+        if self._last_runtime_instant != instant:
+            for event in events:
+                position = self._model.position(event.instrument_id)
+                if position.quantity > _ZERO:
+                    key = (event.instrument_id, event.payload["resolution"])
+                    self._holding_bars[key] = self._holding_bars.get(key, 0) + 1
+            self._last_runtime_instant = instant
+
+        published: dict[str, Mapping[str, str]] = {}
+        market_zone = ZoneInfo("America/New_York")
+        for instrument_id in self._instruments | set(current_prices):
+            position = self._model.position(instrument_id)
+            price = current_prices.get(instrument_id)
+            if position.quantity <= _ZERO or price is None:
+                continue
+            average = position.cost_basis / position.quantity
+            if self._tracked_average.get(instrument_id) != average:
+                self._tracked_average[instrument_id] = average
+                self._peak_price[instrument_id] = average
+                self._holding_bars = {
+                    key: value for key, value in self._holding_bars.items() if key[0] != instrument_id
+                }
+            peak = max(self._peak_price.get(instrument_id, average), price)
+            self._peak_price[instrument_id] = peak
+            opened_at = self._opened_at.get(instrument_id, instant)
+            opened = opened_at.astimezone(market_zone).date()
+            current = instant.astimezone(market_zone).date()
+            values = {
+                "position.averageEntryPrice": str(average),
+                "position.returnPercent": str(_metric_percent(price - average, average)),
+                "position.peakReturnPercent": str(_metric_percent(peak - average, average)),
+                "position.drawdownPercent": str(_metric_percent(peak - price, peak)),
+                "position.holdingTradingDays": str(_weekdays_between(opened, current)),
+            }
+            for resolution in ("30m", "1h", "4h", "1d"):
+                values[f"position.holdingBars.{resolution}"] = str(
+                    self._holding_bars.get((instrument_id, resolution), 0)
+                )
+            published[instrument_id] = values
+        return published
 
     def summary(self) -> ExecutionSummary:
         return ExecutionSummary(
@@ -449,6 +509,14 @@ class ExecutionModelEngine:
             },
         )
 
+    def _clear_position_runtime(self, instrument_id: str) -> None:
+        self._opened_at.pop(instrument_id, None)
+        self._tracked_average.pop(instrument_id, None)
+        self._peak_price.pop(instrument_id, None)
+        self._holding_bars = {
+            key: value for key, value in self._holding_bars.items() if key[0] != instrument_id
+        }
+
     # -- internals ---------------------------------------------------------
 
     def _size(self, candidate: Any, side: OrderSide, *, fractional_eligible: bool) -> Decimal:
@@ -457,7 +525,9 @@ class ExecutionModelEngine:
         if side is OrderSide.SELL:
             # A disposal is sized by the held position, never by a cash budget.
             held = self._model.position(str(candidate.instrument_id)).quantity
-            return _floor_to_quantum(held, quantum)
+            return _floor_to_quantum(
+                held * Decimal(candidate.order_percent) / Decimal(100), quantum
+            )
 
         allocation = candidate.allocation
         if allocation is None:
@@ -472,6 +542,7 @@ class ExecutionModelEngine:
         with localcontext() as context:
             context.prec = _WORKING_PRECISION
             share = budget * Decimal(allocation.numerator) / Decimal(allocation.denominator)
+            share = share * Decimal(candidate.order_percent) / Decimal(100)
         share = quantize_money(share, "allocated_budget")
 
         reference_price = candidate.reference_price
@@ -491,15 +562,15 @@ class ExecutionModelEngine:
             label="order quantity",
         )
 
-    def _bar_of(self, event: MarketDataEvent) -> MinuteBar:
+    def _bar_of(self, event: MarketDataEvent) -> ExecutionBar:
         payload = event.payload
         series_bar = payload["bar"]
-        if series_bar.ends_at - series_bar.starts_at != timedelta(minutes=1):
+        if series_bar.resolution != payload["resolution"]:
             raise WiringError(
-                "the execution model consumes one-minute bars only; this run pinned "
-                f"resolution {payload['resolution']!r}"
+                "the bar resolution does not match the event's pinned resolution: "
+                f"{series_bar.resolution!r} != {payload['resolution']!r}"
             )
-        return MinuteBar(
+        return ExecutionBar(
             instrument_id=event.instrument_id,
             starts_at=series_bar.starts_at,
             ends_at=series_bar.ends_at,
@@ -508,6 +579,8 @@ class ExecutionModelEngine:
             low=payload["low"],
             close=series_bar.close,
             volume=series_bar.volume,
+            resolution=series_bar.resolution,
+            session_truncated=series_bar.session_truncated,
         )
 
     def _positions(self) -> tuple[PositionAfter, ...]:
@@ -518,6 +591,21 @@ class ExecutionModelEngine:
                 held.append(PositionAfter(instrument_id, snapshot.quantity, snapshot.cost_basis))
         return tuple(held)
 
+
+def _metric_percent(numerator: Decimal, denominator: Decimal) -> Decimal:
+    if denominator == _ZERO:
+        return _ZERO
+    return (numerator * Decimal(100) / denominator).quantize(Decimal("0.00000001"))
+
+
+def _weekdays_between(start: date, end: date) -> int:
+    count = 0
+    cursor = start
+    while cursor <= end:
+        if cursor.weekday() < 5:
+            count += 1
+        cursor += timedelta(days=1)
+    return max(0, count - 1)
 
 # ==========================================================================
 # object_store.StorageObjectWritePort
@@ -689,14 +777,24 @@ class PersistenceExecutionKeyStore:
         if status is ExecutionRecordStatus.IN_PROGRESS:
             raise ValueError("finish requires a terminal status")
         attempt_id, claim_token = self._claim_ids(claim)
-        work_status = WorkStatus.SUCCEEDED if status is ExecutionRecordStatus.SUCCEEDED else WorkStatus.FAILED
+        work_status = {
+            ExecutionRecordStatus.SUCCEEDED: WorkStatus.SUCCEEDED,
+            ExecutionRecordStatus.CANCELLED: WorkStatus.CANCELLED,
+            ExecutionRecordStatus.FAILED: WorkStatus.FAILED,
+        }[status]
         with self._persistence.unit_of_work() as uow:
             uow.attempts.close_fenced(
                 attempt_id,
                 claim_token,
                 status=work_status,
                 terminal_reason_code=status.value,
-                failure_code=None if work_status is WorkStatus.SUCCEEDED else "EXECUTION_FAILED",
+                failure_code=(
+                    None
+                    if work_status is WorkStatus.SUCCEEDED
+                    else "EXECUTION_CANCELLED"
+                    if work_status is WorkStatus.CANCELLED
+                    else "EXECUTION_FAILED"
+                ),
             )
 
     def status(self, key: str) -> ExecutionRecordStatus | None:
@@ -717,6 +815,8 @@ class PersistenceExecutionKeyStore:
 def _execution_status(status: WorkStatus) -> ExecutionRecordStatus:
     if status is WorkStatus.SUCCEEDED:
         return ExecutionRecordStatus.SUCCEEDED
+    if status is WorkStatus.CANCELLED:
+        return ExecutionRecordStatus.CANCELLED
     if status in (WorkStatus.PENDING, WorkStatus.RUNNING):
         return ExecutionRecordStatus.IN_PROGRESS
     return ExecutionRecordStatus.FAILED
@@ -1453,6 +1553,16 @@ class OrchestratorJobHandler:
             )
         manifest = primary[0][1]
         plan = self._runtime.load(plan_document, compiled_plan_checksum=plan_checksum)
+        if plan.reference_series[1] == "$DATASET":
+            dataset_resolution = str(manifest.get("resolution", ""))
+            if dataset_resolution not in {"30m", "1h", "4h", "1d"}:
+                raise JobNotSatisfiable(
+                    "a position-only plan requires a production-resolution dataset manifest",
+                    reason_code="REQUIRED_INPUT_UNAVAILABLE",
+                )
+            plan = replace(
+                plan, reference_series=(plan.reference_series[0], dataset_resolution)
+            )
         evaluation_from, evaluation_through = evaluation_window(manifest, plan)
         feature_series: tuple[PinnedFeatureSeries, ...] = ()
         if self._feature_materializations is not None or envelope.feature_materializations:
@@ -1564,6 +1674,18 @@ class OrchestratorJobHandler:
                 missingRequirements=list(outcome.missing_requirements) or [reason_code],
             )
             return JobOutcome(JobResult.PERMANENT_FAILURE, reason_code=reason_code)
+
+        if outcome.status is ReplayStatus.CANCELLED:
+            self._publish(
+                envelope,
+                binding.correlation_id,
+                status="CANCELLED",
+                delivery_attempt=context.receive_count,
+                cancelledAt=_utc_text(now),
+                attempt=context.attempt_number,
+                reasonCode=reason_code,
+            )
+            return JobOutcome(JobResult.CANCELLED, reason_code=reason_code)
 
         if coordinator.state is RunState.WAITING:
             # Retryable. `FAILED` is terminal in `backtest.run_status`, so

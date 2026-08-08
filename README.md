@@ -2,70 +2,82 @@
 
 출시된 잠긴 봇 스냅샷을 검증된 시장 데이터로 재현 가능하게 백테스트하기 위한 Python 저장소입니다.
 
-이 문서는 **현재 저장소에 실제로 존재하는 것**만 기술합니다. 아직 구현되지 않은 것은
-아래 "아직 구현되지 않은 것"에 그대로 남겨 둡니다.
+이 문서는 **현재 저장소에 실제로 존재하는 것**만 기술합니다.
 
 ## 실제 디렉터리 구조
 
 ```text
 src/backtest_engine/
-  api.py                      # FastAPI 앱 (health, POST /backtests, GET /backtests/{id})
-  worker.py                   # 프로세스 수명주기 껍데기. 도메인 실행 없음
+  api.py                      # 인증·소유자 범위를 적용한 /api/v1 HTTP API
+  worker.py                   # SQS 소비, 재전달, 실행 키 CAS, DLQ, 취소 ack
   contracts.py                # 요청/결과 계약 검증
   execution_policy.py         # 실행 정책 카탈로그
-  money.py                    # 금액 정밀도 유틸
-  lifecycle.py                # 접수·큐 발행·상태 전이 (in-memory store)
-  attempt_coordinator.py      # 시도/리스/재시도 (in-process)
-  event_clock.py              # ET 세션 시계
+  lifecycle.py                # 접수·큐 발행·결과 상태 전이
+  attempt_coordinator.py      # 시도, 리스, 재시도, 취소 조정
+  event_clock.py              # XNYS 정규장 세션 시계
   data_availability.py        # 입력 가용성 판정
-  basic_runtime.py            # BASIC 모드 런타임 조각
+  basic_runtime.py            # BASIC 컴파일 계획 평가
   execution_model.py          # 주문·체결·비용 모델
   market_data.py              # Parquet 시장데이터 리더
+  feature_outputs.py          # 고정된 feature materialization 검증·로딩
+  orchestrator.py             # 결정론적 이벤트 재생과 결과 발행
+  wiring.py                   # API/worker/오케스트레이터 조립
+  production.py               # PostgreSQL, S3, HTTP 운영 어댑터
   monthly_judgment.py         # 월별 판정 요약
-  result_snapshot.py          # 결과 스냅샷 빌더 (in-memory store)
-  detail_object_manifest.py   # 상세 오브젝트 매니페스트 (in-memory store)
-  result_query.py             # 소유자 범위 조회 프로젝션 (in-memory store)
-  persistence/                # ★ SQLAlchemy Core 영속성 (본 단계에서 신설)
-    tables.py                 #   정본 backtest.* 9개 테이블 + storage.objects 메타데이터
-    rows.py                   #   테이블별 행 dataclass, numeric(24,8) 검증
-    repositories.py           #   리포지토리 + BacktestUnitOfWork
-    publish.py                #   완료 실행의 원자적 다중 테이블 publish
-    engine.py                 #   엔진 생성, 런타임 가드, 트랜잭션 경계
-    schema_guard.py           #   기동 시 스키마 정합 검증 (drift 시 즉시 실패)
-    contribution.py           #   db/migration-contributions 계약 리더
-    protocols.py              #   후속 단계가 의존할 Protocol과 호환성 한계 기록
-db/migration-contributions/   # ★ COM07 기여 루트 (본 단계에서 신설)
-tests/
-  conftest.py                 # Testcontainers PostgreSQL 16 하네스
-  persistence/                # 영속성 단위/통합 테스트
-  test_*.py                   # 기존 도메인 테스트
+  result_snapshot.py          # 요약·상세 결과 스냅샷 빌더
+  object_store/               # 상세 Parquet와 매니페스트 경계
+  result_query.py             # 소유자 범위 조회 프로젝션
+  persistence/                # SQLAlchemy Core 영속성 및 스키마 가드
 ```
 
-Polars 의존성은 없습니다. 표 데이터 처리는 **PyArrow**만 사용합니다.
-`apps/api/`, `workers/`, `src/backtest_engine/{strategy_runtime,simulation,order_model,
-portfolio,performance,market_data,manifests}/` 는 존재하지 않습니다.
+표 데이터 처리는 **PyArrow**를 사용합니다.
 
-## 지금 실제로 동작하는 것
+## 비즈니스 로직 흐름
 
-- `backtest.*` 9개 테이블과 `storage.objects` 에 대한 SQLAlchemy Core 영속성.
-  정본 DDL과 컬럼 단위로 대조되며(`tests/persistence/test_table_metadata.py`),
-  PostgreSQL 16 컨테이너에 **정본 Flyway 번들을 그대로 적용해** 통합 테스트합니다.
-- 멱등성·중복 워커 억제·원자적 publish를 DB 제약으로 강제합니다.
-- 런타임은 DDL을 실행할 수 없고, 선언한 `backtest` 스키마 밖으로 write 할 수 없습니다.
-- 기동 시 스키마 drift를 감지하면 즉시 실패합니다.
-- `GET /health`, `POST /backtests`, `GET /backtests/{id}` 세 엔드포인트 (아직 in-memory store).
+1. API 또는 요청 intake가 봇 스냅샷, 컴파일 계획, 시장 데이터/feature 해시를 고정합니다.
+2. worker가 SQS 메시지를 받고 `worker_execution_key` CAS로 중복 실행을 차단합니다.
+3. 오케스트레이터가 고정된 Parquet를 읽고 정규장 세션별 `BAR_CLOSED` 이벤트를 만듭니다.
+4. BASIC 런타임이 봉 종료 시점까지 알려진 값만 사용해 신호를 평가합니다.
+5. 실행 모델이 다음 체결 가능 시점부터 주문을 처리하고 슬리피지·수수료를 적용합니다.
+6. 성과, 월별 판정, 상세 Parquet를 만들고 DB와 오브젝트 결과를 발행합니다.
+7. `COMPLETED`, `FAILED`, `UNAVAILABLE`, `CANCELLED` 결과를 API로 전달하고 큐 메시지를
+   성공, 재시도, DLQ 또는 취소 ack로 마무리합니다.
 
-## 아직 구현되지 않은 것
+재현성 경계는 스냅샷 해시, 입력 번들 fingerprint, 실행 정책 버전, 시장 데이터 및 feature
+materialization 결과 해시입니다. 같은 입력은 같은 이벤트 순서와 replay digest를 가져야 합니다.
 
-| 항목 | 현재 상태 |
-|---|---|
-| 오케스트레이터 | `src/` 에 없습니다. 12개 모듈을 조립하는 코드는 `tests/d_reproducibility_testkit.py` 안에만 있습니다. |
-| Worker | `worker.py` 는 `threading.Event().wait()` 뿐입니다. SQS consumer도 도메인 실행도 없습니다. |
-| 오브젝트 스토리지 | S3/로컬 어댑터가 없습니다. `storage.objects` 는 **읽기 전용**이며 행을 만들지 않습니다. |
-| 큐 | `SqsBacktestJobQueue` 는 발행만 합니다. 소비자, DLQ, 재전달 처리가 없습니다. |
-| API 표면 | `/api/v1` prefix, 인증, 소유자 스코프, 5개 조회 엔드포인트, 결과 수신 엔드포인트가 없습니다. |
-| 호출부 전환 | 도메인 모듈은 여전히 `InMemory*Store` 를 씁니다. 영속성 리포지토리로의 교체는 후속 단계입니다. |
-| 마이그레이션 SQL | `db/migration-contributions/migrations/` 에 `V20260802094500__backtest_run_input_pins.sql` 1건이 있습니다. 나머지 테이블은 이미 정본 baseline에 있습니다. DBML 변경 요청은 `db/migration-contributions/change-requests/` 에 **제안 상태**로만 있습니다. |
+## 지원 봉 주기와 세션 규칙
+
+| 입력 | ISO-8601 | 동작 |
+|---|---|---|
+| `30m` | `PT30M` | 30분 봉 |
+| `1h` | `PT1H` | 1시간 봉 |
+| `4h` | `PT4H` | 4시간 봉. 정규장 종료를 넘는 마지막 봉은 장 마감에서 잘립니다 |
+| `1d` | `PT24H` | 거래일 정규장 1개를 한 봉으로 취급합니다 |
+
+새로 발행되는 전략은 위 네 주기 중 하나만 사용할 수 있습니다. `1m`, `5m`, `15m`는 활성
+카탈로그에서 제거되었으며, 이미 릴리스된 bot을 동일하게 재현할 때만 구 catalog reader가
+해석합니다. 모든 주기는 UTC timestamp를 쓰되, 거래 가능 여부와 거래일은 XNYS 정규장(ET)
+기준입니다. 공급자가 일봉 시작을 자정으로
+표시해도 `session_date_et`의 정규장 시가/종가로 정규화합니다.
+
+4시간 봉처럼 세션 끝에서 짧아진 봉은 `session_truncated=true`인 경우에만 허용합니다.
+봉 종료로 생성된 신호는 그 봉에 소급 체결하지 않습니다. 특히 일봉과 세션 마지막 봉의
+신호는 다음 정규장 시가부터 주문 체결 대상이 됩니다.
+
+## 구현 경계
+
+- API는 `/api/v1` 접수·목록·상세·시도·성과·월별 요약·상세 매니페스트·입력·결과 수신을
+  제공하고 인증 및 소유자 범위를 적용합니다.
+- worker는 SQS long poll, visibility heartbeat, 재전달, DLQ, 중복 실행 방지를 구현합니다.
+  취소는 실패가 아니므로 DLQ로 보내지 않고 `CANCELLED`로 저장한 뒤 메시지를 삭제합니다.
+- 소유자는 `POST /api/v1/backtests/{runId}/cancellation`으로 취소를 요청합니다. `QUEUED`는
+  즉시 취소되고 `RUNNING`은 worker 안전 지점에서 협력 취소되며 요청·완료 시각이 보존됩니다.
+- 운영 어댑터는 PostgreSQL, S3 versioned object, 결과 수신 HTTP를 연결합니다.
+- 런타임은 long-only 주문 모델입니다. 공매도와 정규장 외 체결은 지원하지 않습니다.
+- `basic-elements:2026-08-08`의 전체 14개 블록과 주문 비율·최대 실행·재진입 대기 의미는
+  live virtual trading runtime과 동일하게 구현됩니다. 두 서비스는 별도 배포 단위이므로
+  정확히 호환되는 root submodule pointer를 하나의 release candidate로 검증해야 합니다.
 
 ## 실행
 

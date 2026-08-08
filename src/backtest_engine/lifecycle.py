@@ -395,6 +395,10 @@ class RunGateway(Protocol):
 
     def transition(self, run_id: UUID, target: RunStatus, **values: Any) -> RunRow: ...
 
+    def request_cancellation(
+        self, run_id: UUID, *, reason_code: str, requested_at: datetime
+    ) -> RunRow: ...
+
 
 class PersistenceRunGateway:
     """Durable `RunGateway` over the canonical schema, in SQLAlchemy Core."""
@@ -496,6 +500,12 @@ class PersistenceRunGateway:
                         values["failure_code"],
                         retryable=values.get("retryable"),
                     )
+                if target is RunStatus.CANCELLED:
+                    return uow.runs.mark_cancelled(
+                        run_id,
+                        values["cancelled_at"],
+                        values["cancellation_reason_code"],
+                    )
                 if target is RunStatus.UNAVAILABLE:
                     return uow.runs.mark_unavailable(
                         run_id,
@@ -506,6 +516,16 @@ class PersistenceRunGateway:
                 raise InvalidStatusTransition(f"{target.value} is not a reachable result status")
         except PersistedInvalidStatusTransition as exc:
             raise InvalidStatusTransition(str(exc)) from exc
+        except RowNotFound as exc:
+            raise BacktestRunNotFound(str(exc)) from exc
+
+    def request_cancellation(
+        self, run_id: UUID, *, reason_code: str, requested_at: datetime
+    ) -> RunRow:
+        del requested_at  # Production ordering uses PostgreSQL clock_timestamp().
+        try:
+            with self._write() as uow:
+                return uow.runs.request_cancellation(run_id, reason_code=reason_code)
         except RowNotFound as exc:
             raise BacktestRunNotFound(str(exc)) from exc
 
@@ -617,6 +637,31 @@ class InMemoryRunGateway:
                     f"backtest run {run_id} is {current.status.value}; it cannot move to {target.value}"
                 )
             updated = replace(current, status=target, **values)
+            self._runs[run_id] = updated
+            return updated
+
+    def request_cancellation(
+        self, run_id: UUID, *, reason_code: str, requested_at: datetime
+    ) -> RunRow:
+        if not reason_code.strip():
+            raise ValueError("reason_code must not be blank")
+        with self._lock:
+            current = self.get(run_id)
+            if current.status in {
+                RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.UNAVAILABLE,
+            }:
+                return current
+            values: dict[str, Any] = {
+                "cancellation_requested_at": requested_at,
+                "cancellation_reason_code": reason_code,
+            }
+            if current.status is RunStatus.QUEUED:
+                values.update(
+                    status=RunStatus.CANCELLED,
+                    cancelled_at=requested_at,
+                    completed_at=requested_at,
+                )
+            updated = replace(current, **values)
             self._runs[run_id] = updated
             return updated
 
@@ -851,6 +896,32 @@ class BacktestLifecycleService:
         self.get(run_id, owner_account_id=owner_account_id)
         return self.gateway.manifests(run_id)
 
+    def request_cancellation(
+        self,
+        run_id: UUID,
+        *,
+        owner_account_id: UUID,
+        reason_code: str = "USER_CANCELLED",
+        requested_at: datetime | None = None,
+    ) -> BacktestRun:
+        """Cancel a queued run immediately or mark a running run for cooperative stop."""
+        current = self.get(run_id, owner_account_id=owner_account_id)
+        reason = reason_code.strip()
+        if not reason:
+            raise ValueError("reason_code must not be blank")
+        if current.status in {
+            RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.UNAVAILABLE,
+        }:
+            raise InvalidStatusTransition(
+                f"backtest run {run_id} is already {current.status.value}"
+            )
+        row = self.gateway.request_cancellation(
+            run_id,
+            reason_code=reason,
+            requested_at=requested_at or datetime.now(timezone.utc),
+        )
+        return self._load(row)
+
     def _require_owner(self, run: BacktestRun, owner_account_id: UUID) -> None:
         if run.owner_account_id != owner_account_id:
             raise NotRunOwner(f"backtest run {run.backtest_run_id} belongs to another account")
@@ -943,6 +1014,16 @@ class BacktestLifecycleService:
                 completed_at=_parse_timestamp(event["failedAt"]),
                 failure_code=event["failureCode"],
                 retryable=bool(event["retryable"]),
+            )
+        if status is RunStatus.CANCELLED:
+            cancelled_at = _parse_timestamp(event["cancelledAt"])
+            return self.gateway.transition(
+                run_id,
+                RunStatus.CANCELLED,
+                completed_at=cancelled_at,
+                cancelled_at=cancelled_at,
+                cancellation_requested_at=cancelled_at,
+                cancellation_reason_code=event["reasonCode"],
             )
         return self.gateway.transition(
             run_id,

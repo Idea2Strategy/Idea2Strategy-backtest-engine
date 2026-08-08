@@ -15,13 +15,15 @@ them.
 from __future__ import annotations
 
 import copy
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from fractions import Fraction
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from backtest_engine.attempt_coordinator import RunState
 from backtest_engine.basic_runtime import (
     BAR_CLOSED_EVENT_TYPE,
     BasicPlanReplay,
@@ -30,15 +32,21 @@ from backtest_engine.basic_runtime import (
 )
 from backtest_engine.calendar import XNYS_CALENDAR
 from backtest_engine.data_availability import (
+    AvailabilityStatus,
     DataAvailabilityAssessor,
     DataObservation,
     TimeInterval,
 )
-from backtest_engine.elements import SeriesBar
+from backtest_engine.elements import SeriesBar, resolution_period
 from backtest_engine.elements.orders import OrderCandidate
 from backtest_engine.event_clock import MarketDataEvent, MarketEventClock
 from backtest_engine.execution_model import BacktestExecutionModel, RiskLimits
-from backtest_engine.orchestrator import PlanReplay, bar_events_from_table
+from backtest_engine.orchestrator import (
+    PlanReplay,
+    ReplayOutcome,
+    ReplayStatus,
+    bar_events_from_table,
+)
 from backtest_engine.result_snapshot import ResultRecordKind, RunSnapshot
 from backtest_engine.wiring import (
     COST_MODEL_VERSION,
@@ -46,10 +54,12 @@ from backtest_engine.wiring import (
     BasicPlanReplayFactory,
     ExecutionModelEngine,
     JobNotSatisfiable,
+    OrchestratorJobHandler,
     WiringError,
     dataset_coverage,
     evaluation_window,
 )
+from backtest_engine.worker import JobContext, JobResult
 from d_reproducibility_testkit import (
     BAR,
     CLOSES,
@@ -132,7 +142,7 @@ def _candidate(
 
 
 def _bar_event(index: int, *, resolution: str = "1m") -> MarketDataEvent:
-    period = timedelta(minutes=1) if resolution == "1m" else timedelta(minutes=15)
+    period = resolution_period(resolution)
     starts_at = FIRST_BAR_START + BAR * index
     close = Decimal(CLOSES[index])
     previous = Decimal(CLOSES[index - 1]) if index else close
@@ -344,12 +354,12 @@ def test_settlement_translates_the_orchestrator_event_into_a_matching_bar() -> N
     assert summary.ledger_entry_count == 3
 
 
-def test_a_bar_that_is_not_one_minute_is_refused_rather_than_relabelled() -> None:
-    """`MinuteBar` is defined as exactly one minute; silence here would be a lie."""
+@pytest.mark.parametrize("resolution", ["30m", "1h", "4h", "1d"])
+def test_settlement_accepts_each_backtest_market_data_resolution(resolution: str) -> None:
     engine = _engine()
+    engine.place(_candidate())
 
-    with pytest.raises(WiringError, match="one-minute bars only"):
-        engine.settle(_bar_event(0, resolution="15m"))
+    assert engine.settle(_bar_event(15, resolution=resolution)) == 1
 
 
 def test_settlement_never_fills_an_order_on_the_bar_that_decided_it() -> None:
@@ -375,6 +385,54 @@ def test_events_built_by_the_orchestrator_are_settleable(tmp_path: Any) -> None:
 
     assert len(events) == len(CLOSES)
     assert fills == 1
+
+
+def test_cancelled_replay_is_published_and_acknowledged_as_cancelled() -> None:
+    class Sink:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        def publish(self, event: Any, *, delivery_attempt: int) -> None:
+            self.events.append(dict(event) | {"deliveryAttempt": delivery_attempt})
+
+    sink = Sink()
+    handler = object.__new__(OrchestratorJobHandler)
+    handler._sink = sink
+    handler._wall_clock = lambda: COMPLETED_AT
+    envelope = SimpleNamespace(
+        run_id="55555555-5555-4555-8555-555555555555",
+        bot_id="00000000-0000-4000-8000-0000000000b1",
+        owner_account_id="66666666-6666-4666-8666-666666666666",
+        expected_snapshot_hash="sha256:" + "1" * 64,
+        input_bundle_fingerprint="sha256:" + "2" * 64,
+        execution_policy_version="official-backtest-policy-v1",
+    )
+    binding = SimpleNamespace(
+        envelope=envelope,
+        correlation_id="77777777-7777-4777-8777-777777777777",
+    )
+    context = JobContext("execution-key", 2, 3, "message-1", "worker-1")
+    outcome = ReplayOutcome(
+        run_id=str(envelope.run_id),
+        status=ReplayStatus.CANCELLED,
+        availability_status=AvailabilityStatus.AVAILABLE,
+        steps=(),
+        replay_digest="",
+        reason_code="USER_CANCELLED",
+    )
+
+    reported = handler._report(
+        binding,
+        outcome,
+        SimpleNamespace(state=RunState.CANCELLED),
+        context,
+    )
+
+    assert reported.result is JobResult.CANCELLED
+    assert sink.events[0]["status"] == "CANCELLED"
+    assert sink.events[0]["metadata"]["messageType"] == "BACKTEST_CANCELLED"
+    assert sink.events[0]["reasonCode"] == "USER_CANCELLED"
+    assert sink.events[0]["deliveryAttempt"] == 3
 
 
 # ==========================================================================

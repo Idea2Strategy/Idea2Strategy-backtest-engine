@@ -29,6 +29,7 @@ from backtest_engine.attempt_coordinator import AttemptPolicy, ProcessResourceMo
 from backtest_engine.backtest_request_intake import PostgresRequestReceiptStore, RequestLane
 from backtest_engine.basic_runtime import BasicPlanRuntime
 from backtest_engine.calendar import XNYS_CALENDAR
+from backtest_engine.elements import bar_resolution
 from backtest_engine.execution_model import (
     ExecutionMicrostructurePolicy,
     InstrumentFractionalPolicy,
@@ -72,9 +73,7 @@ def service_endpoint(environ: Mapping[str, str], service: str) -> str | None:
     for SQS, so the service-specific variables must win when present.
     """
 
-    return environ.get(f"AWS_ENDPOINT_URL_{service.upper()}") or environ.get(
-        "AWS_ENDPOINT_URL"
-    )
+    return environ.get(f"AWS_ENDPOINT_URL_{service.upper()}") or environ.get("AWS_ENDPOINT_URL")
 
 
 def _engine(environ: Mapping[str, str] = os.environ) -> Engine:
@@ -179,10 +178,13 @@ class PostgresDatasetManifestSource:
     def by_id(self, manifest_id: uuid.UUID) -> Mapping[str, Any] | None:
         manifest_sql = text(
             """
-            SELECT id, revision_number, status, dataset_hash, schema_version,
-                   period_start, period_end, available_at
-              FROM market_data.dataset_manifests
-             WHERE id = :manifest_id
+            SELECT manifest.id, manifest.revision_number, manifest.status,
+                   manifest.dataset_hash, manifest.schema_version,
+                   manifest.period_start, manifest.period_end, manifest.available_at,
+                   feed.resolution AS feed_resolution
+              FROM market_data.dataset_manifests manifest
+              JOIN market_data.feeds feed ON feed.id = manifest.feed_id
+             WHERE manifest.id = :manifest_id
             """
         )
         objects_sql = text(
@@ -227,6 +229,15 @@ class PostgresDatasetManifestSource:
         available_at = row["available_at"]
         if available_at is None:
             raise ConfigurationError(f"dataset manifest {manifest_id} has no available_at evidence")
+        raw_resolution = str(row["feed_resolution"])
+        try:
+            resolution = bar_resolution(raw_resolution)
+        except ValueError:
+            resolution = raw_resolution
+        if resolution not in {"30m", "1h", "4h", "1d"}:
+            raise ConfigurationError(
+                f"dataset manifest {manifest_id} has unsupported production resolution {raw_resolution}"
+            )
         return {
             "contract_id": "com06.dataset-manifest",
             "schema_version": 1,
@@ -236,6 +247,7 @@ class PostgresDatasetManifestSource:
             "status": str(row["status"]),
             "dataset_hash": str(row["dataset_hash"]),
             "schema_id": str(row["schema_version"]),
+            "resolution": resolution,
             "period_start": _utc_text(row["period_start"]),
             "period_end": _utc_text(row["period_end"]),
             "available_at": _utc_text(available_at),
@@ -309,9 +321,7 @@ class PostgresFeatureMaterializationSource:
             """
         )
         with self._engine.connect() as connection:
-            row = connection.execute(
-                statement, {"materialization_id": materialization_id}
-            ).mappings().first()
+            row = connection.execute(statement, {"materialization_id": materialization_id}).mappings().first()
         if row is None:
             return None
         resolved = dict(row)
@@ -333,13 +343,9 @@ class S3VersionedFeatureObjectReader:
     def __init__(self, client: Any) -> None:
         self._client = client
 
-    def read_version(
-        self, provider: str, bucket: str, key: str, version_id: str
-    ) -> bytes:
+    def read_version(self, provider: str, bucket: str, key: str, version_id: str) -> bytes:
         if provider != "S3_COMPATIBLE":
-            raise ConfigurationError(
-                f"S3 feature reader cannot read storage provider {provider!r}"
-            )
+            raise ConfigurationError(f"S3 feature reader cannot read storage provider {provider!r}")
         response = self._client.get_object(
             Bucket=bucket,
             Key=key,
@@ -395,12 +401,8 @@ class PostgresQueuedRunSource:
             if row is None:
                 return None
             bundle_id = uuid.UUID(str(row["input_bundle_id"]))
-            dataset_rows = connection.execute(
-                dataset_statement, {"input_bundle_id": bundle_id}
-            ).mappings().all()
-            feature_rows = connection.execute(
-                feature_statement, {"input_bundle_id": bundle_id}
-            ).mappings().all()
+            dataset_rows = connection.execute(dataset_statement, {"input_bundle_id": bundle_id}).mappings().all()
+            feature_rows = connection.execute(feature_statement, {"input_bundle_id": bundle_id}).mappings().all()
         try:
             datasets = tuple(
                 PinnedDataset(
@@ -426,9 +428,7 @@ class PostgresQueuedRunSource:
                 datasets=datasets,
                 feature_materializations=tuple(
                     PinnedFeatureMaterialization(
-                        feature_materialization_id=uuid.UUID(
-                            str(item["feature_materialization_id"])
-                        ),
+                        feature_materialization_id=uuid.UUID(str(item["feature_materialization_id"])),
                         locked_result_hash=str(item["locked_result_hash"]),
                     )
                     for item in feature_rows
@@ -856,9 +856,7 @@ def backtest_request_handler(
             {
                 RequestLane.BASIC: _required(environ, "BACKTEST_BASIC_QUEUE_URL"),
                 RequestLane.CUSTOM: _required(environ, "BACKTEST_CUSTOM_QUEUE_URL"),
-                RequestLane.COMPETITION: _required(
-                    environ, "BACKTEST_COMPETITION_QUEUE_URL"
-                ),
+                RequestLane.COMPETITION: _required(environ, "BACKTEST_COMPETITION_QUEUE_URL"),
             },
         ),
     )

@@ -74,15 +74,18 @@ RESOLUTION_PERIODS: Mapping[str, timedelta] = MappingProxyType(
         "1m": timedelta(minutes=1),
         "5m": timedelta(minutes=5),
         "15m": timedelta(minutes=15),
+        "30m": timedelta(minutes=30),
         "1h": timedelta(hours=1),
+        "4h": timedelta(hours=4),
+        "1d": timedelta(days=1),
     }
 )
-"""Intraday periodicities this build implements.
+"""Normalized periods this build accepts from compiled plans and datasets.
 
-Daily and coarser resolutions are deliberately absent: their period depends on
-the session calendar rather than on a fixed duration, so a bar-count window
-would not be a pure function of the series. Adding them is a new feature
-definition version, not a new dictionary entry.
+``1d`` is the backend contract's normalized ``PT24H`` token. Its market-data
+completion boundary is still aligned to the official session by the
+orchestrator; the fixed duration here is used only for plan checksums and
+bar-count warm-up arithmetic.
 """
 
 SUPPORTED_RESOLUTIONS: tuple[str, ...] = tuple(RESOLUTION_PERIODS)
@@ -93,7 +96,10 @@ ISO8601_RESOLUTIONS: Mapping[str, str] = MappingProxyType(
         "PT1M": "1m",
         "PT5M": "5m",
         "PT15M": "15m",
+        "PT30M": "30m",
         "PT1H": "1h",
+        "PT4H": "4h",
+        "PT24H": "1d",
     }
 )
 """B's ``requiredFeature.resolution`` vocabulary mapped to this build's tokens.
@@ -300,17 +306,24 @@ class SeriesBar:
     ends_at: datetime
     close: Decimal
     volume: Decimal
+    session_truncated: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "instrument_id", _uuid(self.instrument_id, "instrument_id"))
         starts_at = _utc(self.starts_at, "starts_at")
         ends_at = _utc(self.ends_at, "ends_at")
         period = resolution_period(self.resolution)
-        if ends_at - starts_at != period:
+        actual_period = ends_at - starts_at
+        if actual_period <= timedelta(0) or (
+            actual_period != period
+            and (not self.session_truncated or actual_period > period)
+        ):
             raise ElementEvaluationError(
-                f"bar must span exactly its declared resolution {self.resolution} "
-                f"({period}), got {ends_at - starts_at}"
+                f"bar must span its declared resolution {self.resolution} ({period}) "
+                f"or be a shorter session-truncated bar, got {actual_period}"
             )
+        if not isinstance(self.session_truncated, bool):
+            raise ElementEvaluationError("session_truncated must be boolean")
         object.__setattr__(self, "starts_at", starts_at)
         object.__setattr__(self, "ends_at", ends_at)
         if _decimal(self.close, "close") <= 0:
@@ -454,6 +467,7 @@ class InstrumentInput:
     series: tuple[InstrumentSeries, ...]
     feature_series: tuple[PinnedFeatureSeries, ...] = ()
     require_pinned_features: bool = False
+    values: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "instrument_id", _uuid(self.instrument_id, "instrument_id"))
@@ -479,6 +493,10 @@ class InstrumentInput:
                 "every feature series must belong to the input instrument"
             )
         object.__setattr__(self, "feature_series", feature_series)
+        values = dict(self.values)
+        if any(not isinstance(key, str) or not isinstance(value, str) for key, value in values.items()):
+            raise ElementEvaluationError("instrument input values must map strings to strings")
+        object.__setattr__(self, "values", MappingProxyType(values))
 
     def series_for(self, data_kind: str, resolution: str) -> InstrumentSeries | None:
         for item in self.series:

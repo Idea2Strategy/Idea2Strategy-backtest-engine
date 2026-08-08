@@ -24,7 +24,7 @@
     "requiredFeatureSetHash": {"$ref": "#/$defs/sha256"},
     "requiredFeatures": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 0,
       "items": {"$ref": "#/$defs/requiredFeature"}
     },
     "executionSnapshot": {"$ref": "#/$defs/executionSnapshot"},
@@ -126,7 +126,7 @@
       "properties": {
         "sequence": {"type": "integer", "minimum": 1},
         "operation": {
-          "enum": ["LOAD_FEATURE", "COMPARE", "EMIT_ORDER_CANDIDATE"]
+          "enum": ["LOAD_FEATURE", "COMPARE", "PRICE_COMPARE", "PRICE_CHANGE_PERCENT", "VOLUME_COMPARE", "STREAK", "SMA_CROSS", "RSI_CROSS", "MACD_CROSS", "BOLLINGER_REVERSAL", "POSITION_RETURN", "HOLDING_PERIOD", "PEAK_RETURN", "DRAWDOWN_FROM_PEAK", "SCHEDULE", "EMIT_ORDER_CANDIDATE"]
         },
         "arguments": {
           "type": "object",

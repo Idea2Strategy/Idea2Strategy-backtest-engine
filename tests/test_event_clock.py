@@ -234,15 +234,6 @@ def test_allows_last_bar_to_become_available_at_the_exclusive_close() -> None:
             ),
             "outside an official regular session",
         ),
-        (
-            _event(
-                "at-close",
-                "2025-11-28T18:00:00Z",
-                "2025-11-28T18:00:00Z",
-                1,
-            ),
-            "outside an official regular session",
-        ),
     ],
 )
 def test_rejects_lookahead_and_events_outside_regular_session(
@@ -250,6 +241,19 @@ def test_rejects_lookahead_and_events_outside_regular_session(
 ) -> None:
     with pytest.raises(EventClockValidationError, match=message):
         _clock([_session()], [event])
+
+
+def test_a_completed_bar_may_be_published_at_the_exact_official_close() -> None:
+    event = _event(
+        "at-close",
+        "2025-11-28T18:00:00Z",
+        "2025-11-28T18:00:00Z",
+        1,
+    )
+
+    clock = _clock([_session()], [event])
+
+    assert clock.advance_to(_utc("2025-11-28T18:00:00Z")).released_events == (event,)
 
 
 def test_rejects_duplicate_official_order_and_clock_reversal() -> None:
