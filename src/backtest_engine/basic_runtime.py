@@ -1515,6 +1515,7 @@ class BasicPlanReplay:
         self.gate = ExecutionGate(clock.schedule, assessment)
         self._evaluations: tuple[PlanEvaluation, ...] | None = None
         self._execution_states: dict[tuple[str, str], _ReplayExecutionState] = {}
+        self._position_identities: dict[str, str | None] = {}
 
     def run(self) -> tuple[PlanEvaluation, ...]:
         """Replay the whole stream. Idempotent: the clock is advanced once."""
@@ -1582,6 +1583,7 @@ class BasicPlanReplay:
                 session_closes_at=candidate_session.closes_at,
                 eligible_at=eligible_at,
             )
+            self._retire_closed_position_gates(runtime_values)
             candidates = self._apply_execution_policy(result.decisions, candidates)
         return PlanEvaluation(
             evaluation_id=evaluation_id,
@@ -1590,6 +1592,34 @@ class BasicPlanReplay:
             decisions=result.decisions,
             candidates=candidates,
         )
+
+    def _retire_closed_position_gates(
+        self, runtime_values: Mapping[str, Mapping[str, str]] | None
+    ) -> None:
+        """Scope the execution gate to one position cycle, as the live runtime does.
+
+        ``1회만`` means once per position, not once per bot lifetime: a strategy that buys, sells,
+        and buys again is the ordinary case the mode exists for. Live gets this from
+        ``EvaluatingBotRuntime``, which drops an instrument's gates whenever its position snapshot
+        stops matching -- a close, or a re-entry at a different average. Counting for the whole
+        replay instead would backtest that strategy as a single trade while it traded repeatedly in
+        production, which is the one thing an official backtest may not do.
+
+        The published position metrics carry the same signal: an instrument appears with an
+        ``averageEntryPrice`` only while it holds a position, so both a close and a re-entry change
+        the identity observed here.
+        """
+        observed = {
+            instrument_id: values.get("position.averageEntryPrice")
+            for instrument_id, values in (runtime_values or {}).items()
+        }
+        for instrument_id in set(self._position_identities) | set(observed):
+            current = observed.get(instrument_id)
+            if self._position_identities.get(instrument_id) == current:
+                continue
+            self._position_identities[instrument_id] = current
+            for key in [key for key in self._execution_states if key[1] == instrument_id]:
+                del self._execution_states[key]
 
     def _apply_execution_policy(
         self,
@@ -1632,25 +1662,47 @@ class BasicPlanReplay:
         index = sessions.index(session)
         previous = sessions[index - 1] if index else None
         following = sessions[index + 1] if index + 1 < len(sessions) else None
+        # The session an event belongs to comes from the pinned schedule, not from a payload key.
+        # Only the production orchestrator stamps ``sessionDateEt`` onto an event; every other
+        # driver leaves it absent, and reading it there made *every* bar compare equal to None and
+        # so look like the session's first -- which is the one value this flag must never take.
         earlier_today = any(
-            event.occurred_at < instant and event.payload.get("sessionDateEt") == session.trading_date_et
+            event.occurred_at < instant
+            and self.clock.schedule.session_at(event.occurred_at) == session
             for event in visible_events
         )
         current = session.trading_date_et
+        new_trading_day = not earlier_today
+        # Every "first/last trading day of the period" flag is a property of the day, so it is
+        # true once per day -- on its first bar -- exactly as the live BasicMarketSignalState
+        # publishes it. Reporting the day's property on every bar instead would make a 30m clock
+        # fire a month-open rule thirteen times a day in the backtest and once in production.
         return {
             "session.close": str(instant >= session.closes_at).lower(),
-            "schedule.newTradingDay": str(not earlier_today).lower(),
+            "schedule.newTradingDay": str(new_trading_day).lower(),
             "schedule.tradingDayIndex": str(index + 1),
             "schedule.weekFirstTradingDay": str(
-                previous is None or previous.trading_date_et.isocalendar()[:2] != current.isocalendar()[:2]
+                new_trading_day
+                and (
+                    previous is None
+                    or previous.trading_date_et.isocalendar()[:2] != current.isocalendar()[:2]
+                )
             ).lower(),
             "schedule.monthFirstTradingDay": str(
-                previous is None
-                or (previous.trading_date_et.year, previous.trading_date_et.month) != (current.year, current.month)
+                new_trading_day
+                and (
+                    previous is None
+                    or (previous.trading_date_et.year, previous.trading_date_et.month)
+                    != (current.year, current.month)
+                )
             ).lower(),
             "schedule.monthLastTradingDay": str(
-                following is None
-                or (following.trading_date_et.year, following.trading_date_et.month) != (current.year, current.month)
+                new_trading_day
+                and (
+                    following is None
+                    or (following.trading_date_et.year, following.trading_date_et.month)
+                    != (current.year, current.month)
+                )
             ).lower(),
         }
 

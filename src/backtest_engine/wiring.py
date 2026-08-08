@@ -457,6 +457,23 @@ class ExecutionModelEngine:
         current_prices = {
             event.instrument_id: event.payload["bar"].close for event in events
         }
+        # A new cycle has to zero the counters *before* this bar is counted, because this bar is
+        # already the position's first held bar. Live starts a fresh PositionTracker and then counts
+        # the closing bar, so it publishes holdingBars 1 on the entry bar; zeroing afterwards would
+        # publish 0 there and leave every later bar one behind, so an "N bars held" exit fired a bar
+        # late in the backtest and on time in production.
+        for instrument_id in current_prices:
+            position = self._model.position(instrument_id)
+            if position.quantity <= _ZERO:
+                continue
+            average = position.cost_basis / position.quantity
+            if self._tracked_average.get(instrument_id) != average:
+                self._tracked_average[instrument_id] = average
+                self._peak_price[instrument_id] = average
+                self._holding_bars = {
+                    key: value for key, value in self._holding_bars.items() if key[0] != instrument_id
+                }
+
         if self._last_runtime_instant != instant:
             for event in events:
                 position = self._model.position(event.instrument_id)
@@ -473,12 +490,6 @@ class ExecutionModelEngine:
             if position.quantity <= _ZERO or price is None:
                 continue
             average = position.cost_basis / position.quantity
-            if self._tracked_average.get(instrument_id) != average:
-                self._tracked_average[instrument_id] = average
-                self._peak_price[instrument_id] = average
-                self._holding_bars = {
-                    key: value for key, value in self._holding_bars.items() if key[0] != instrument_id
-                }
             peak = max(self._peak_price.get(instrument_id, average), price)
             self._peak_price[instrument_id] = peak
             opened_at = self._opened_at.get(instrument_id, instant)
