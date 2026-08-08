@@ -113,6 +113,7 @@ The worker also requires:
 | --- | --- |
 | `BACKTEST_DATABASE_URL` | Shared PostgreSQL URL. |
 | `BACKTEST_WORKER_ID` | Stable instance identity for attempt evidence. |
+| `BACKTEST_LOG_LEVEL` | Optional Python logging level name; defaults to `INFO`. Invalid names fail startup. Retry transitions include run, attempt, receive count, message, and reason identifiers without payloads or credentials. |
 | `BACKTEST_RESULTS_BUCKET`, `BACKTEST_RESULTS_PREFIX` | Same result store as the API. |
 | `BACKTEST_MARKET_DATA_BUCKET` | Immutable market-data input bucket. |
 | `BACKTEST_MARKET_DATA_CACHE` | Writable private cache directory, normally `/tmp/idea2strategy-market-data`. |
@@ -122,6 +123,11 @@ The worker also requires:
 | `BACKTEST_EXECUTION_POLICY_FILE` | Same read-only policy document as the API. |
 | `BACKTEST_RUNTIME_POLICY_FILE` | Read-only versioned attempt, microstructure, fractional eligibility, and risk-limit document. |
 | `BACKTEST_WORKER_CORRELATION_ID` | Deployment-operation correlation identifier. |
+
+Every retry closes the current `backtest.run_attempts` row with
+`terminal_reason_code=RETRY_RELEASED` and preserves the handler or orchestrator reason in
+`failure_code`; the owning `backtest.runs` row remains non-terminal so a later delivery may create
+the next fenced attempt.
 
 AWS credentials are resolved by the SDK credential chain. On EC2, use the
 instance profile; do not inject access keys. `AWS_REGION` selects the region and

@@ -138,9 +138,26 @@ def test_a_released_attempt_is_closed_and_retry_gets_a_fresh_fence(
     key = worker_execution_key_for(str(run_id), "OFFICIAL_BACKTEST:retried")
     first = store.claim(key, run_id=str(run_id), owner="worker-a", now=T0, lease_duration=LEASE)
 
-    store.release(key, now=T0 + timedelta(seconds=5), claim=first)
+    store.release(
+        key,
+        now=T0 + timedelta(seconds=5),
+        claim=first,
+        reason_code="REQUIRED_DATA_UNAVAILABLE",
+    )
     assert attempt_rows(admin_engine, run_id)[0]["status"] == "FAILED"
     assert store.status(key) is ExecutionRecordStatus.FAILED
+    with admin_engine.connect() as connection:
+        retry_reason = connection.execute(
+            text(
+                "SELECT failure_code, terminal_reason_code "
+                "FROM backtest.run_attempts WHERE id = CAST(:id AS uuid)"
+            ),
+            {"id": first.attempt_id},
+        ).mappings().one()
+    assert dict(retry_reason) == {
+        "failure_code": "REQUIRED_DATA_UNAVAILABLE",
+        "terminal_reason_code": "RETRY_RELEASED",
+    }
 
     reclaimed = store.claim(
         key, run_id=str(run_id), owner="worker-b", now=T0 + timedelta(seconds=6), lease_duration=LEASE

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import threading
 import time
@@ -27,6 +28,7 @@ from typing import Any
 import boto3
 import pytest
 
+from backtest_engine import worker as worker_module
 from backtest_engine.worker import (
     WORKER_EXECUTION_KEY_MAX_LENGTH,
     BacktestWorker,
@@ -46,6 +48,38 @@ from backtest_engine.worker import (
 SQS_ENDPOINT = os.environ.get("BACKTEST_TEST_SQS_ENDPOINT", "http://127.0.0.1:24566")
 RUN_ID = "55555555-5555-4555-8555-555555555555"
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(
+    ("environ", "expected_level"),
+    [
+        ({}, logging.INFO),
+        ({"BACKTEST_LOG_LEVEL": "debug"}, logging.DEBUG),
+    ],
+)
+def test_worker_entrypoint_configures_runtime_logging(
+    monkeypatch: pytest.MonkeyPatch,
+    environ: Mapping[str, str],
+    expected_level: int,
+) -> None:
+    configured: list[dict[str, object]] = []
+    monkeypatch.setattr(worker_module.logging, "basicConfig", lambda **values: configured.append(values))
+
+    level_name = worker_module._configure_logging(environ)
+
+    assert level_name == logging.getLevelName(expected_level)
+    assert configured == [
+        {
+            "level": expected_level,
+            "format": "%(asctime)s %(levelname)s %(name)s %(message)s",
+            "force": True,
+        }
+    ]
+
+
+def test_worker_entrypoint_rejects_an_unknown_log_level() -> None:
+    with pytest.raises(WorkerConfigurationError, match="BACKTEST_LOG_LEVEL"):
+        worker_module._configure_logging({"BACKTEST_LOG_LEVEL": "chatty"})
 
 
 def test_sqs_client_uses_the_explicit_runtime_region(monkeypatch: pytest.MonkeyPatch) -> None:
