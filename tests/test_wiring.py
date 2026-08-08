@@ -494,3 +494,75 @@ def test_dataset_coverage_reads_the_objects_not_the_dataset_window() -> None:
 def test_the_pinned_completion_instant_follows_every_replay_instant() -> None:
     """Guards the fixture: `completed_at` must not precede a result record."""
     assert COMPLETED_AT > FIRST_BAR_START + BAR * len(CLOSES)
+
+
+# ==========================================================================
+# Position metrics published to the strategy -- live parity
+# ==========================================================================
+
+
+STRATEGY_RESOLUTION = "30m"
+"""``holdingBars`` is published for the four strategy clocks only, never a display bar."""
+
+
+def _holding_bars(engine: ExecutionModelEngine, index: int) -> str:
+    """The ``holdingBars`` value the strategy reads at the bar with this index."""
+    event = _bar_event(index, resolution=STRATEGY_RESOLUTION)
+    values = engine.runtime_values(event.occurred_at, (event,))
+    return values[INSTRUMENT_ID][f"position.holdingBars.{STRATEGY_RESOLUTION}"]
+
+
+def _settle(engine: ExecutionModelEngine, index: int) -> int:
+    return engine.settle(_bar_event(index, resolution=STRATEGY_RESOLUTION))
+
+
+def test_the_entry_bar_publishes_one_held_bar() -> None:
+    """Live counts the entry bar itself, so the backtest must not start at zero.
+
+    ``EvaluatingBotRuntime`` builds a fresh ``PositionTracker`` for the new position and then
+    counts the bar that just closed, publishing 1. Zeroing the counter after counting instead
+    left every later bar one behind, so an "N bars held" exit fired a bar late in the backtest
+    and on time in production.
+    """
+    engine = _engine()
+    engine.place(_candidate())
+    _settle(engine, 15)
+
+    assert _holding_bars(engine, 15) == "1"
+
+
+def test_each_later_bar_adds_one_held_bar() -> None:
+    engine = _engine()
+    engine.place(_candidate())
+    _settle(engine, 15)
+    _holding_bars(engine, 15)
+
+    assert [_holding_bars(engine, index) for index in (16, 17)] == ["2", "3"]
+
+
+def test_re_reading_the_same_bar_does_not_count_it_twice() -> None:
+    engine = _engine()
+    engine.place(_candidate())
+    _settle(engine, 15)
+
+    assert [_holding_bars(engine, 15) for _ in range(3)] == ["1", "1", "1"]
+
+
+def test_a_new_position_restarts_the_count_at_one() -> None:
+    """A re-entry is a new cycle, and its first held bar is again bar one."""
+    engine = _engine()
+    engine.place(_candidate())
+    _settle(engine, 15)
+    _holding_bars(engine, 15)
+    _holding_bars(engine, 16)
+
+    engine.place(_candidate(side="SELL", allocation=None,
+                            decided_at=datetime(2024, 1, 2, 14, 47, tzinfo=UTC)))
+    _settle(engine, 17)
+    assert engine.summary().positions[INSTRUMENT_ID] == Decimal(0)
+
+    # Bar 19 opens at 14:49, after this decision, so it is the bar that may fill it.
+    engine.place(_candidate(decided_at=datetime(2024, 1, 2, 14, 48, tzinfo=UTC)))
+
+    assert _settle(engine, 19) == 1
+    assert _holding_bars(engine, 19) == "1"

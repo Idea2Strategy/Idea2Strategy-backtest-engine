@@ -408,8 +408,22 @@ class PinnedFeatureSeries:
     """A version-verified feature series injected into ``LOAD_FEATURE``.
 
     A value belongs to the source bar beginning at ``bar_start_at`` and becomes
-    visible only when that bar has completed. The exact preceding instant is
-    required so a missing bar cannot silently reuse a stale value.
+    visible only when that bar has completed, so the value read at a boundary is
+    the one produced by the bar that closed there.
+
+    That bar is not always a full period long. A US equity session runs 09:30 to
+    16:00 ET, which is 6.5 hours, so the last bar of every session is short at
+    every resolution that does not divide it: the ``1d`` bar spans 6.5 hours
+    rather than 24, the second ``4h`` bar spans 2.5, and the last ``1h`` bar
+    spans 30 minutes. Only ``30m`` lands on a regular grid.
+
+    So the bar is identified by the window it must have started in rather than by
+    an exact start instant: it is the latest bar beginning before the boundary,
+    and it must begin no earlier than one full period before it. A bar can be
+    shorter than its period but never longer, which is what makes the bound safe
+    -- a genuinely missing bar leaves only an older one, that one falls outside
+    the window, and the gap is still reported instead of a stale value being
+    reused.
     """
 
     feature_id: str
@@ -440,12 +454,13 @@ class PinnedFeatureSeries:
 
     def value_at(self, as_of: datetime) -> Decimal:
         boundary = _utc(as_of, "as_of")
-        expected_start = boundary - resolution_period(self.resolution)
+        earliest_start = boundary - resolution_period(self.resolution)
         for item in reversed(self.values):
-            if item.bar_start_at == expected_start:
+            if item.bar_start_at >= boundary:
+                continue
+            if item.bar_start_at >= earliest_start:
                 return item.value
-            if item.bar_start_at < expected_start:
-                break
+            break
         raise ElementInputMissing(
             f"pinned {self.feature_id}/{self.resolution} has a data gap at "
             f"{boundary.isoformat()}",
@@ -454,7 +469,7 @@ class PinnedFeatureSeries:
                 "feature": self.feature_id,
                 "resolution": self.resolution,
                 "asOf": boundary.isoformat(),
-                "expectedBarStartAt": expected_start.isoformat(),
+                "earliestBarStartAt": earliest_start.isoformat(),
             },
         )
 
