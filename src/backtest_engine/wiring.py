@@ -58,7 +58,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
-from decimal import ROUND_FLOOR, Decimal, localcontext
+from decimal import ROUND_FLOOR, ROUND_HALF_EVEN, Decimal, localcontext
 from typing import Any, Protocol, cast
 from zoneinfo import ZoneInfo
 
@@ -604,9 +604,19 @@ class ExecutionModelEngine:
 
 
 def _metric_percent(numerator: Decimal, denominator: Decimal) -> Decimal:
+    """A published position metric, under ``precision:1.0.0``: 8 digits, ROUND_HALF_EVEN.
+
+    The rounding is named rather than inherited. Quantizing without it takes whatever mode the
+    ambient decimal context happens to carry, so an unrelated caller that set ROUND_HALF_UP
+    anywhere in the process would silently change what this backtest published -- and these are
+    the values a POSITION_RETURN step compares against a threshold. The live runtime rounds the
+    same way for the same reason.
+    """
     if denominator == _ZERO:
         return _ZERO
-    return (numerator * Decimal(100) / denominator).quantize(Decimal("0.00000001"))
+    return (numerator * Decimal(100) / denominator).quantize(
+        Decimal("0.00000001"), rounding=ROUND_HALF_EVEN
+    )
 
 
 def _weekdays_between(start: date, end: date) -> int:

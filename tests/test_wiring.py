@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import copy
 from datetime import UTC, date, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal, localcontext
 from fractions import Fraction
 from types import SimpleNamespace
 from typing import Any
@@ -56,6 +56,7 @@ from backtest_engine.wiring import (
     JobNotSatisfiable,
     OrchestratorJobHandler,
     WiringError,
+    _metric_percent,
     dataset_coverage,
     evaluation_window,
 )
@@ -566,3 +567,27 @@ def test_a_new_position_restarts_the_count_at_one() -> None:
 
     assert _settle(engine, 19) == 1
     assert _holding_bars(engine, 19) == "1"
+
+
+def test_a_published_position_metric_rounds_half_even() -> None:
+    """precision:1.0.0 names the rounding, so an exact tie cannot go two ways.
+
+    The live runtime rounded these HALF_UP, so one position published two different return
+    percentages depending on which runtime computed it -- and the rendered form reaches the
+    step trace a POSITION_RETURN threshold is judged from.
+    """
+    # 0.00000000025 / 1 is 0.000000025 percent: an exact tie at the ninth decimal whose
+    # eighth digit is even, which is the only place the two modes disagree.
+    assert _metric_percent(Decimal("0.00000000025"), Decimal("1")) == Decimal("0.00000002")
+
+
+def test_a_published_position_metric_ignores_the_ambient_rounding_mode() -> None:
+    """Quantizing without naming a mode would inherit whatever the process last set."""
+    with localcontext() as context:
+        context.rounding = ROUND_HALF_UP
+
+        assert _metric_percent(Decimal("0.00000000025"), Decimal("1")) == Decimal("0.00000002")
+
+
+def test_a_zero_denominator_publishes_zero_rather_than_raising() -> None:
+    assert _metric_percent(Decimal("1"), Decimal("0")) == Decimal("0")
