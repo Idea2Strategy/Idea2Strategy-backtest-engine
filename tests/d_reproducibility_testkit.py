@@ -82,6 +82,9 @@ PROVIDER_SYMBOL = "AAPL"
 #: Correlation id of B's published request fixture.
 CORRELATION_ID = "00000000-0000-4000-8000-000000000202"
 MESSAGE_ID = "00000000-0000-4000-8000-000000000213"
+RUN_ID = "76a6a20c-0651-5748-8187-6bf0ae155194"
+FEATURE_MATERIALIZATION_ID = "00000000-0000-4000-8000-000000000204"
+FEATURE_RESULT_HASH = "sha256:" + "6" * 64
 
 DATASET_ID = "00000000-0000-4000-8000-0000000000d2"
 STORAGE_OBJECT_ID = "00000000-0000-4000-8000-0000000000d3"
@@ -316,18 +319,25 @@ def official_backtest_request(
     *,
     plan: Mapping[str, Any] | None = None,
     occurred_at: str = "2024-01-03T01:01:00Z",
+    expected_dataset_hash: str | None = None,
 ) -> dict[str, Any]:
     """B's ``OFFICIAL_BACKTEST_REQUESTED``, re-addressed to the seeded bot.
 
-    Only ``botId`` and ``occurredAt`` differ from B's published fixture, and both
-    have to: ``backtest.runs.bot_id`` is a foreign key into ``bot.bots`` and the
-    execution policy is selected by the ET release quarter of ``occurredAt``. The
-    ``idempotencyKey`` is then B's own canonical material for *this* message --
-    the same function B's ``StrategyBotContractFixtures`` uses -- because an
-    unchanged key copied from a different message would be a forgery, not a
-    fixture.
+    The identifiers and execution window address the seeded 2024-Q1 stack rather
+    than B's published 2026-Q3 example. The ``idempotencyKey`` is B's own
+    canonical material for *this* message -- the same function B's
+    ``StrategyBotContractFixtures`` uses -- because an unchanged key copied from
+    a different message would be a forgery, not a fixture.
     """
     document = plan if plan is not None else compiled_plan()
+    if expected_dataset_hash is None:
+        parquet_bytes = market_bars_parquet()
+        manifest = dataset_manifest(
+            hashlib.sha256(parquet_bytes).hexdigest(),
+            row_count=BAR_COUNT,
+            coverage_end=FIRST_BAR_START + BAR * BAR_COUNT,
+        )
+        expected_dataset_hash = f"sha256:{manifest['dataset_hash']}"
     request: dict[str, Any] = {
         "metadata": {
             "contractVersion": STRATEGY_BOT_CONTRACT_VERSION,
@@ -337,14 +347,27 @@ def official_backtest_request(
             "correlationId": CORRELATION_ID,
             "idempotencyKey": "",
         },
+        "runId": RUN_ID,
+        "lane": "BASIC",
+        "aggregateSequence": 1,
         "botId": str(BOT_ID),
         "expectedSnapshotHash": document["executionSnapshot"]["immutableStrategyVersion"][
             "snapshotHash"
         ],
         "compiledPlanChecksum": document["planChecksum"],
         "datasetManifestId": str(DATASET_MANIFEST_ID),
+        "expectedDatasetHash": expected_dataset_hash,
+        "periodStart": E2E_EXECUTION_POLICY.period_start.astimezone(ET).date().isoformat(),
+        "periodEnd": E2E_EXECUTION_POLICY.period_end.astimezone(ET).date().isoformat(),
         "assumptionsVersion": "accounting:1.0.0",
+        "executionPolicyVersion": E2E_EXECUTION_POLICY.version,
         "requestReason": "STRATEGY_RELEASE",
+        "featureMaterializations": [
+            {
+                "featureMaterializationId": FEATURE_MATERIALIZATION_ID,
+                "lockedResultHash": FEATURE_RESULT_HASH,
+            }
+        ],
     }
     request["metadata"]["idempotencyKey"] = compute_message_idempotency_key(
         contract_version=STRATEGY_BOT_CONTRACT_VERSION,
@@ -353,6 +376,9 @@ def official_backtest_request(
         snapshot_hash=request["expectedSnapshotHash"],
         operation_key=official_backtest_operation_key(request),
     )
+    request["requestHash"] = "sha256:" + hashlib.sha256(
+        json.dumps(request, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     return request
 
 

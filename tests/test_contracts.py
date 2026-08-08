@@ -287,6 +287,15 @@ def test_vendored_official_request_requires_every_provider_runtime_field(
         validate_official_backtest_request(request)
 
 
+def test_runnable_reproducibility_request_keeps_the_provider_runtime_shape() -> None:
+    from d_reproducibility_testkit import official_backtest_request
+
+    request = official_backtest_request()
+
+    assert validate_official_backtest_request(request) == request
+    assert set(OFFICIAL_REQUEST_REQUIRED_RUNTIME_FIELDS) <= request.keys()
+
+
 def test_request_whose_dataset_manifest_was_swapped_fails_its_idempotency_key(
     official_request: dict[str, Any],
 ) -> None:
