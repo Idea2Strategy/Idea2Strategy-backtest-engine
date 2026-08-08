@@ -79,11 +79,11 @@ OWNER_TOKEN = "owner-token"
 OTHER_TOKEN = "other-owner-token"
 WORKER_TOKEN = "worker-token"
 
-# B's `metadata.idempotencyKey` from the published fixture, and the run id `uuid5`
-# derives from it. Pinned so a change to the derivation is a visible test failure and
-# not a silently re-addressed run.
+# B's published idempotency key and provider-registered run id. Both are pinned so
+# the consumer cannot silently re-address an already-created run.
 B_IDEMPOTENCY_KEY = "sha256:c6dd5229151352a530ff8312f050258107370cf26ea943c68473bf81936f6c1e"
-EXPECTED_RUN_ID = "f876f259-4158-5a9a-8973-db21764024dc"
+EXPECTED_RUN_ID = "00000000-0000-4000-8000-000000000214"
+DERIVED_RUN_ID = "f876f259-4158-5a9a-8973-db21764024dc"
 
 SNAPSHOT_HASH = "sha256:" + "1" * 64
 RESULT_HASH = "sha256:" + "a" * 64
@@ -296,7 +296,7 @@ class Harness:
 #: loosening the catalog's "no substitution" rule.
 POLICY_2026Q3 = replace(
     D17_EXECUTION_POLICY_FIXTURE,
-    version="official-backtest-policy-v2",
+    version="backtest-policy:1.0.0",
     release_quarter="2026-Q3",
     period_start=et_quarter_start(2026, 3),
     period_end=et_quarter_start(2026, 4),
@@ -537,7 +537,7 @@ def test_the_run_id_is_derived_from_bs_idempotency_key_not_invented(
     official_request: dict[str, Any],
 ) -> None:
     """Pinned literal: a random id would make redelivery create a second run."""
-    assert str(run_id_for(B_IDEMPOTENCY_KEY)) == EXPECTED_RUN_ID
+    assert str(run_id_for(B_IDEMPOTENCY_KEY)) == DERIVED_RUN_ID
     assert official_request["metadata"]["idempotencyKey"] == B_IDEMPOTENCY_KEY
 
 

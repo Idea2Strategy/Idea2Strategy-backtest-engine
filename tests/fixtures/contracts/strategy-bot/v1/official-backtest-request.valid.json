@@ -7,10 +7,24 @@
     "correlationId": "00000000-0000-4000-8000-000000000202",
     "idempotencyKey": "sha256:c6dd5229151352a530ff8312f050258107370cf26ea943c68473bf81936f6c1e"
   },
+  "runId": "00000000-0000-4000-8000-000000000214",
+  "lane": "BASIC",
+  "aggregateSequence": 1,
   "botId": "00000000-0000-4000-8000-000000000201",
   "expectedSnapshotHash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
   "compiledPlanChecksum": "sha256:88d61198d46dce161c2a929702a7fd1cee5c9b044c470d2590b96f3825fcacb3",
   "datasetManifestId": "00000000-0000-4000-8000-000000000203",
+  "expectedDatasetHash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "periodStart": "2025-01-01",
+  "periodEnd": "2025-12-31",
   "assumptionsVersion": "accounting:1.0.0",
-  "requestReason": "STRATEGY_RELEASE"
+  "executionPolicyVersion": "backtest-policy:1.0.0",
+  "requestReason": "STRATEGY_RELEASE",
+  "featureMaterializations": [
+    {
+      "featureMaterializationId": "00000000-0000-4000-8000-000000000215",
+      "lockedResultHash": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+    }
+  ],
+  "requestHash": "sha256:4df5ec8056b0857c8c841fc3a9e4f4d75c90196aef1e7ece7716445284523f33"
 }

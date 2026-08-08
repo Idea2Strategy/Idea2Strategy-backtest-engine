@@ -58,6 +58,18 @@ B_SNAPSHOT_HASH = "sha256:" + "1" * 64
 B_BOT_ID = "00000000-0000-4000-8000-000000000201"
 B_DATASET_MANIFEST_ID = "00000000-0000-4000-8000-000000000203"
 
+OFFICIAL_REQUEST_REQUIRED_RUNTIME_FIELDS = (
+    "runId",
+    "lane",
+    "aggregateSequence",
+    "expectedDatasetHash",
+    "periodStart",
+    "periodEnd",
+    "executionPolicyVersion",
+    "featureMaterializations",
+    "requestHash",
+)
+
 RUN_ID = "77777777-7777-4777-8777-777777777777"
 OWNER_ACCOUNT_ID = "66666666-6666-4666-8666-666666666666"
 INPUT_BUNDLE_FINGERPRINT = "sha256:" + "e" * 64
@@ -258,6 +270,21 @@ def test_consumer_accepts_bs_official_backtest_request_verbatim(
     assert accepted["expectedSnapshotHash"] == B_SNAPSHOT_HASH
     assert accepted["datasetManifestId"] == B_DATASET_MANIFEST_ID
     assert accepted["requestReason"] == "STRATEGY_RELEASE"
+
+
+@pytest.mark.parametrize("field", OFFICIAL_REQUEST_REQUIRED_RUNTIME_FIELDS)
+def test_vendored_official_request_requires_every_provider_runtime_field(
+    field: str,
+) -> None:
+    request = _load(
+        STRATEGY_BOT_FIXTURES / "official-backtest-request.valid.json"
+    )
+    assert field in request, f"vendored provider fixture is missing {field}"
+
+    request.pop(field)
+
+    with pytest.raises(ContractValidationError, match=field):
+        validate_official_backtest_request(request)
 
 
 def test_request_whose_dataset_manifest_was_swapped_fails_its_idempotency_key(

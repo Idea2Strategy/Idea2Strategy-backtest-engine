@@ -48,7 +48,7 @@ class Queue:
 
 def projection(request: dict[str, Any], lane: RequestLane) -> QueuedRunProjection:
     period = (
-        ("2024-01-01", "2024-12-31")
+        (request["periodStart"], request["periodEnd"])
         if lane is RequestLane.BASIC
         else (request["periodStart"], request["periodEnd"])
         if lane is RequestLane.CUSTOM
@@ -81,11 +81,7 @@ def projection(request: dict[str, Any], lane: RequestLane) -> QueuedRunProjectio
                     {
                         "datasetManifestId": request["datasetManifestId"],
                         "purposeCode": "MARKET_BARS",
-                        "expectedDatasetHash": (
-                            "sha256:" + "4" * 64
-                            if lane is RequestLane.BASIC
-                            else request["expectedDatasetHash"]
-                        ),
+                        "expectedDatasetHash": request["expectedDatasetHash"],
                     },
                 )
             )
@@ -98,6 +94,8 @@ def projection(request: dict[str, Any], lane: RequestLane) -> QueuedRunProjectio
             for item in (
                 request["periods"][0]["featureMaterializations"]
                 if lane is RequestLane.COMPETITION
+                else request["featureMaterializations"]
+                if lane is RequestLane.BASIC
                 else ()
             )
         ),
@@ -238,23 +236,17 @@ def test_competition_refuses_feature_pins_that_differ_from_the_provider_bundle()
         publisher(request, RequestLane.COMPETITION)
 
 
-def test_basic_job_uses_provider_pinned_features_not_unpinned_message_fields() -> None:
+def test_basic_request_refuses_feature_pins_that_differ_from_the_provider_bundle() -> None:
     request = basic_request()
     feature = PinnedFeatureMaterialization(uuid.uuid4(), "sha256:" + "9" * 64)
     run = replace(
         projection(request, RequestLane.BASIC),
         feature_materializations=(feature,),
     )
-    queue = Queue()
+    publisher = BacktestRequestJobPublisher(Source(run), Queue())
 
-    BacktestRequestJobPublisher(Source(run), queue)(request, RequestLane.BASIC)
-
-    assert queue.jobs[0][1]["featureMaterializations"] == [
-        {
-            "featureMaterializationId": str(feature.feature_materialization_id),
-            "lockedResultHash": feature.locked_result_hash,
-        }
-    ]
+    with pytest.raises(RequestProcessingError, match="RUN_IDENTITY_MISMATCH"):
+        publisher(request, RequestLane.BASIC)
 
 
 def test_basic_request_is_dispatched_through_the_same_pinned_two_stage_boundary() -> None:
@@ -278,16 +270,16 @@ def test_basic_request_is_dispatched_through_the_same_pinned_two_stage_boundary(
                 "executionPolicyVersion": request["executionPolicyVersion"],
                 "compiledPlanChecksum": request["compiledPlanChecksum"],
                 "datasetManifestId": request["datasetManifestId"],
-                "expectedDatasetHash": "sha256:" + "4" * 64,
+                "expectedDatasetHash": request["expectedDatasetHash"],
                 "expectedSnapshotHash": request["expectedSnapshotHash"],
                 "datasets": [
                     {
                         "datasetManifestId": request["datasetManifestId"],
                         "purposeCode": "MARKET_BARS",
-                        "expectedDatasetHash": "sha256:" + "4" * 64,
+                        "expectedDatasetHash": request["expectedDatasetHash"],
                     }
                 ],
-                "featureMaterializations": [],
+                "featureMaterializations": request["featureMaterializations"],
             },
         )
     ]
