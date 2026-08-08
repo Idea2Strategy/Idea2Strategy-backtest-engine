@@ -1337,6 +1337,22 @@ def _instrument_inputs(
     }
 
 
+LIVE_SERIES_BARS = 180
+"""Bars of each resolution a strategy can see, matching ``BasicMarketSignalState.MAX_BARS``.
+
+The live runtime is a long-running process and keeps a bounded rolling window, so a strategy
+never sees more than this many bars however long the bot has run. The backtest must show it the
+same window.
+
+The bound is not cosmetic. ``MACD_CROSS`` reads an EMA, which is an unbounded recursion: its
+value depends on every bar that came before, so an uncapped replay and a capped live runtime
+compute different histograms for the same instant and never converge. The histogram is compared
+against zero to detect a crossing, so near a crossing that difference decides the trade. This is
+the reason the official feature catalog admits only bounded-window methods; MACD predates that
+rule, and capping the input is what makes it reproducible anyway.
+"""
+
+
 def _published_values(
     instrument_id: str,
     payloads: Mapping[tuple[str, str], list[MarketDataEvent]],
@@ -1350,7 +1366,7 @@ def _published_values(
     for (candidate, resolution), events in payloads.items():
         if candidate != instrument_id:
             continue
-        ordered = sorted(events, key=lambda item: item.occurred_at)
+        ordered = sorted(events, key=lambda item: item.occurred_at)[-LIVE_SERIES_BARS:]
         values[f"closes.{resolution}"] = ",".join(str(item.payload["bar"].close) for item in ordered)
         values[f"volumes.{resolution}"] = ",".join(str(item.payload["bar"].volume) for item in ordered)
         values[f"opens.{resolution}"] = ",".join(
