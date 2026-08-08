@@ -782,10 +782,22 @@ class PersistenceExecutionKeyStore:
         with self._persistence.unit_of_work() as uow:
             uow.attempts.heartbeat_fenced(attempt_id, claim_token, lease_duration=lease_duration)
 
-    def release(self, key: str, *, now: datetime, claim: ExecutionClaim | None = None) -> None:
+    def release(
+        self,
+        key: str,
+        *,
+        now: datetime,
+        claim: ExecutionClaim | None = None,
+        reason_code: str | None = None,
+    ) -> None:
         attempt_id, claim_token = self._claim_ids(claim)
         with self._persistence.unit_of_work() as uow:
-            uow.attempts.release_fenced(attempt_id, claim_token, terminal_reason_code="RETRY_RELEASED")
+            uow.attempts.release_fenced(
+                attempt_id,
+                claim_token,
+                terminal_reason_code="RETRY_RELEASED",
+                failure_code=reason_code or "RETRY_REQUESTED",
+            )
 
     def finish(
         self,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from collections import deque
@@ -421,10 +422,28 @@ def test_scheduler_acknowledges_only_after_durable_finish() -> None:
     assert client.deleted == [message["ReceiptHandle"]]
 
 
-def test_scheduler_retry_releases_the_claim_and_returns_message_to_its_lane() -> None:
+def test_scheduler_retry_releases_the_claim_and_returns_message_to_its_lane(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     message = _message(BacktestLane.CUSTOM, 2)
     client = OneMessageSqs(message)
-    store = InMemoryExecutionKeyStore()
+
+    class RetryReasonStore(InMemoryExecutionKeyStore):
+        released_reason_code: str | None = None
+
+        def release(
+            self,
+            key: str,
+            *,
+            now: datetime,
+            claim: Any = None,
+            reason_code: str | None = None,
+        ) -> None:
+            self.released_reason_code = reason_code
+            super().release(key, now=now, claim=claim, reason_code=reason_code)
+
+    store = RetryReasonStore()
+    caplog.set_level(logging.INFO, logger="backtest_engine.worker")
     worker = BacktestWorker(
         client=client,
         config=WorkerConfig(
@@ -453,3 +472,41 @@ def test_scheduler_retry_releases_the_claim_and_returns_message_to_its_lane() ->
     assert [item.disposition for item in completed] == [MessageDisposition.RETURNED]
     assert client.visibility_changes == [0]
     assert client.deleted == []
+    assert store.released_reason_code == "TRANSIENT_DEPENDENCY"
+    assert "reason_code=TRANSIENT_DEPENDENCY" in caplog.text
+
+
+def test_handler_exception_emits_traceback_and_a_stable_retry_reason(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    message = _message(BacktestLane.BASIC, 3)
+    client = OneMessageSqs(message)
+
+    def fail(_job: Mapping[str, Any], _context: Any) -> JobOutcome:
+        raise OSError("simulated data read failure")
+
+    worker = BacktestWorker(
+        client=client,
+        config=WorkerConfig(
+            queue_url="https://sqs.local/basic",
+            dead_letter_queue_url="https://sqs.local/basic-dlq",
+            worker_id="lane-worker",
+            max_receive_count=3,
+            visibility_timeout=timedelta(seconds=30),
+            wait_time=timedelta(0),
+            max_messages=1,
+            heartbeat_interval=timedelta(seconds=10),
+        ),
+        handler=fail,
+        store=InMemoryExecutionKeyStore(),
+        clock=lambda: T0,
+    )
+    caplog.set_level(logging.INFO, logger="backtest_engine.worker")
+
+    handled = worker.handle_message(message)
+
+    assert handled.disposition is MessageDisposition.RETURNED
+    assert handled.reason_code == "HANDLER_ERROR:OSError"
+    assert "backtest job handler raised" in caplog.text
+    assert "simulated data read failure" in caplog.text
+    assert "reason_code=HANDLER_ERROR:OSError" in caplog.text

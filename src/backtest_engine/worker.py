@@ -174,7 +174,14 @@ class ExecutionKeyStore(Protocol):
 
     def heartbeat(self, key: str, claim: ExecutionClaim, *, lease_duration: timedelta) -> None: ...
 
-    def release(self, key: str, *, now: datetime, claim: ExecutionClaim | None = None) -> None: ...
+    def release(
+        self,
+        key: str,
+        *,
+        now: datetime,
+        claim: ExecutionClaim | None = None,
+        reason_code: str | None = None,
+    ) -> None: ...
 
     def finish(
         self,
@@ -236,7 +243,14 @@ class InMemoryExecutionKeyStore:
     def heartbeat(self, key: str, claim: ExecutionClaim, *, lease_duration: timedelta) -> None:
         return None
 
-    def release(self, key: str, *, now: datetime, claim: ExecutionClaim | None = None) -> None:
+    def release(
+        self,
+        key: str,
+        *,
+        now: datetime,
+        claim: ExecutionClaim | None = None,
+        reason_code: str | None = None,
+    ) -> None:
         """Hand a retryable attempt back so the next delivery can re-claim it."""
         with self._lock:
             record = self._records.pop(key, None)
@@ -487,9 +501,24 @@ class BacktestWorker:
         if outcome.result is JobResult.RETRY:
             # Release the CAS record so the redelivery is a *new* attempt, then
             # make the message immediately visible again.
-            self._store.release(key, now=self._clock(), claim=claim)
+            reason_code = outcome.reason_code or "RETRY_REQUESTED"
+            _LOGGER.info(
+                "backtest job retry released run_id=%s attempt=%s receive_count=%s "
+                "reason_code=%s message_id=%s",
+                run_id,
+                context.attempt_number,
+                context.receive_count,
+                reason_code,
+                message_id,
+            )
+            self._store.release(
+                key,
+                now=self._clock(),
+                claim=claim,
+                reason_code=reason_code,
+            )
             self._return_to_queue(receipt)
-            return HandledMessage(message_id, MessageDisposition.RETURNED, outcome.reason_code, key)
+            return HandledMessage(message_id, MessageDisposition.RETURNED, reason_code, key)
 
         self._store.finish(key, ExecutionRecordStatus.FAILED, now=self._clock(), claim=claim)
         return self._dead_letter(message, receipt, outcome.reason_code or "PERMANENT_FAILURE", message_id, key)
@@ -509,6 +538,13 @@ class BacktestWorker:
         try:
             return self._handler(job, context)
         except Exception as exc:
+            _LOGGER.exception(
+                "backtest job handler raised run_id=%s attempt=%s receive_count=%s message_id=%s",
+                job.get("backtestRunId"),
+                context.attempt_number,
+                context.receive_count,
+                context.message_id,
+            )
             return JobOutcome(JobResult.RETRY, reason_code=f"HANDLER_ERROR:{type(exc).__name__}")
         finally:
             done.set()
@@ -817,6 +853,20 @@ _LANE_LIMIT_DEFAULTS: Mapping[BacktestLane, int] = {
     BacktestLane.COMPETITION: 1,
 }
 
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+
+
+def _configure_logging(environ: Mapping[str, str]) -> str:
+    """Configure the dedicated console process before any worker components start."""
+    level_name = environ.get("BACKTEST_LOG_LEVEL", "INFO").strip().upper() or "INFO"
+    level = logging.getLevelNamesMapping().get(level_name)
+    if not isinstance(level, int):
+        raise WorkerConfigurationError(
+            f"BACKTEST_LOG_LEVEL must be a Python logging level name, got {level_name!r}"
+        )
+    logging.basicConfig(level=level, format=_LOG_FORMAT, force=True)
+    return level_name
+
 
 def _config_from_env(environ: Mapping[str, str]) -> WorkerConfig:
     missing = [name for name in _REQUIRED_ENV if not environ.get(name)]
@@ -975,11 +1025,18 @@ def _runtime_sqs_client(environ: Mapping[str, str]) -> Any:
 
 
 def run() -> None:
+    log_level = _configure_logging(os.environ)
     lane_mode = any(os.environ.get(f"BACKTEST_{lane.value.upper()}_QUEUE_URL") for lane in BacktestLane)
     if lane_mode:
         configs, lane_limits, global_limit = _lane_configs_from_env(os.environ)
     else:
         config = _config_from_env(os.environ)
+    _LOGGER.info(
+        "backtest worker starting worker_id=%s lane_mode=%s log_level=%s",
+        os.environ.get("BACKTEST_WORKER_ID", ""),
+        lane_mode,
+        log_level,
+    )
     handler: JobHandler = load_factory(os.environ["BACKTEST_JOB_HANDLER"], "BACKTEST_JOB_HANDLER")
     # No in-memory fallback. `InMemoryExecutionKeyStore` is a process-local dictionary;
     # a deployment that got it by leaving one variable unset would silently lose the
