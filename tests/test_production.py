@@ -18,6 +18,7 @@ from backtest_engine.production import (
     ConfigurationError,
     JwtAuthenticator,
     PostgresCompiledPlanSource,
+    PostgresDatasetManifestSource,
     PostgresFeatureMaterializationSource,
     PostgresOwnerDirectory,
     PostgresQueuedRunSource,
@@ -29,6 +30,7 @@ from backtest_engine.production import (
     orchestrator_job_handler,
     service_endpoint,
 )
+from backtest_engine.wiring import JobNotSatisfiable
 
 
 ACCOUNT_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -88,6 +90,9 @@ class _Rows:
     def all(self) -> list[dict[str, object]]:
         return self._rows
 
+    def __iter__(self):
+        return iter(self._rows)
+
 
 class _Connection:
     def __init__(self, rows: list[list[dict[str, object]]]) -> None:
@@ -135,6 +140,102 @@ def test_compiled_plan_source_returns_the_immutable_launch_contract_document() -
     source = PostgresCompiledPlanSource(_Engine({"plan_document": plan}))  # type: ignore[arg-type]
 
     assert source.by_checksum(plan["planChecksum"]) == plan
+
+
+def _dataset_manifest_source(
+    manifest_id: UUID,
+    object_keys: list[str],
+) -> PostgresDatasetManifestSource:
+    manifest = {
+        "id": manifest_id,
+        "revision_number": 1,
+        "status": "AVAILABLE",
+        "dataset_hash": "sha256:" + "a" * 64,
+        "schema_version": "market-bars/1",
+        "period_start": datetime(2024, 1, 1, tzinfo=UTC),
+        "period_end": datetime(2024, 2, 1, tzinfo=UTC),
+        "available_at": datetime(2026, 8, 9, tzinfo=UTC),
+        "feed_resolution": "30m",
+    }
+    objects = [
+        {
+            "storage_object_id": UUID(f"00000000-0000-4000-8000-{index:012d}"),
+            "object_key": object_key,
+            "content_hash": "sha256:" + f"{index:x}" * 64,
+            "object_kind": "MARKET_BARS",
+            "partition_granularity": "YEAR",
+            "partition_start": date(2024, 1, 1),
+            "partition_end": date(2025, 1, 1),
+            "period_start": datetime(2024, 1, 1, tzinfo=UTC),
+            "period_end": datetime(2024, 2, 1, tzinfo=UTC),
+            "shard_key": f"{index:02d}-of-{len(object_keys):02d}",
+            "part_number": 1,
+            "row_count": 10,
+            "schema_version": "market-bars/1",
+            "status": "AVAILABLE",
+        }
+        for index, object_key in enumerate(object_keys, start=1)
+    ]
+    return PostgresDatasetManifestSource(_Engine(manifest, objects))  # type: ignore[arg-type]
+
+
+def test_dataset_manifest_source_accepts_the_deployed_legacy_loader_binding() -> None:
+    manifest_id = UUID("7f7113c9-3b02-4098-97ec-0baa07e2b3b0")
+    prefix = (
+        "historical/provider=alpaca/feed=sip/adjustment=all/session=regular/"
+        "resolution=30m/revision=00000001/year=2024"
+    )
+    object_keys = [
+        f"{prefix}/shard={shard:02d}-of-08/manifest_id={manifest_id}/part-00001.parquet"
+        for shard in range(8)
+    ]
+
+    resolved = _dataset_manifest_source(manifest_id, object_keys).by_id(manifest_id)
+
+    assert resolved is not None
+    assert resolved["manifest_id"] == str(manifest_id)
+    assert resolved["dataset_id"] == str(manifest_id)
+    assert [item["object_key"] for item in resolved["objects"]] == object_keys
+
+
+def test_dataset_manifest_source_preserves_the_canonical_logical_dataset_binding() -> None:
+    manifest_id = UUID("7f7113c9-3b02-4098-97ec-0baa07e2b3b0")
+    dataset_id = UUID("11111111-1111-4111-8111-111111111111")
+    object_keys = [
+        f"market-data/provider=ALPACA/feed=SIP/dataset={dataset_id}/revision=1/part-{part:05d}.parquet"
+        for part in range(1, 3)
+    ]
+
+    resolved = _dataset_manifest_source(manifest_id, object_keys).by_id(manifest_id)
+
+    assert resolved is not None
+    assert resolved["dataset_id"] == str(dataset_id)
+
+
+@pytest.mark.parametrize(
+    "object_keys",
+    [
+        [
+            "historical/dataset=11111111-1111-4111-8111-111111111111/part-00001.parquet",
+            "historical/manifest_id=7f7113c9-3b02-4098-97ec-0baa07e2b3b0/part-00002.parquet",
+        ],
+        [
+            "historical/manifest_id=22222222-2222-4222-8222-222222222222/part-00001.parquet",
+        ],
+        ["historical/dataset=not-a-uuid/part-00001.parquet"],
+        ["historical/revision=00000001/part-00001.parquet"],
+    ],
+    ids=["mixed-conventions", "wrong-legacy-manifest", "invalid-uuid", "missing-binding"],
+)
+def test_dataset_manifest_source_classifies_invalid_catalog_bindings_as_terminal(
+    object_keys: list[str],
+) -> None:
+    manifest_id = UUID("7f7113c9-3b02-4098-97ec-0baa07e2b3b0")
+
+    with pytest.raises(JobNotSatisfiable) as failure:
+        _dataset_manifest_source(manifest_id, object_keys).by_id(manifest_id)
+
+    assert failure.value.reason_code == "REQUIRED_INPUT_UNAVAILABLE"
 
 
 def test_feature_materialization_source_returns_definition_manifest_and_object_evidence() -> None:
