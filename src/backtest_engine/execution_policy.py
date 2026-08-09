@@ -12,8 +12,9 @@ Two different quarters live in this module and must not be conflated:
     The ET calendar quarter of strategy releases this policy governs. It is the
     catalog selection key.
 ``period_start`` / ``period_end``
-    The pinned evaluation window. It must span whole ET calendar quarters; a
-    policy cannot present a 60-minute window as a quarterly official backtest.
+    The pinned evaluation window. It is independent of ``release_quarter``:
+    Development may publish a shorter immutable evaluation period when that is
+    the complete locked dataset available for the release.
 
 Order horizons
 --------------
@@ -33,7 +34,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import MappingProxyType
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .money import PRECISION_RULES_VERSION
 
@@ -125,14 +126,17 @@ class ExecutionPolicy:
             raise ValueError("execution policy period must use UTC")
         if self.period_start >= self.period_end:
             raise ValueError("execution policy period must be increasing")
-
-        start_index = _quarter_index(self.period_start)
-        end_index = _quarter_index(self.period_end)
-        if start_index is None or end_index is None:
-            raise ValueError(
-                "execution policy period must span whole ET calendar quarter "
-                "boundaries"
-            )
+        try:
+            policy_zone = ZoneInfo(self.timezone)
+        except (ValueError, ZoneInfoNotFoundError) as exc:
+            raise ValueError(f"execution policy timezone is invalid: {self.timezone!r}") from exc
+        for field_name in ("period_start", "period_end"):
+            local = getattr(self, field_name).astimezone(policy_zone)
+            if (local.hour, local.minute, local.second, local.microsecond) != (0, 0, 0, 0):
+                raise ValueError(
+                    "execution policy period must use local calendar-day boundaries: "
+                    f"{field_name}={local.isoformat()}"
+                )
 
         if self.fee_rate < 0:
             raise ValueError("execution policy rates must not be negative")
@@ -171,10 +175,11 @@ class ExecutionPolicy:
 
     @property
     def quarter_count(self) -> int:
-        """Number of whole ET calendar quarters covered by the period."""
+        """Number of whole ET quarters, for quarter-aligned policy fixtures."""
         start_index = _quarter_index(self.period_start)
         end_index = _quarter_index(self.period_end)
-        assert start_index is not None and end_index is not None
+        if start_index is None or end_index is None:
+            raise ValueError("execution policy period is not aligned to ET quarter boundaries")
         return end_index - start_index
 
     @property

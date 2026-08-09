@@ -202,7 +202,7 @@ def test_catalog_rejects_unpublished_quarter_and_naive_release_time() -> None:
 
 def test_policy_rejects_an_intraday_period_presented_as_a_quarter() -> None:
     # The pre-rebuild D17 fixture declared 2024-Q1 with a 60-minute period.
-    with pytest.raises(ValueError, match="ET calendar quarter"):
+    with pytest.raises(ValueError, match="local calendar-day boundaries"):
         _policy(
             "2024-Q1",
             "official-backtest-policy-v1",
@@ -211,14 +211,16 @@ def test_policy_rejects_an_intraday_period_presented_as_a_quarter() -> None:
         )
 
 
-def test_policy_rejects_a_period_that_ends_mid_quarter() -> None:
-    with pytest.raises(ValueError, match="ET calendar quarter"):
-        _policy(
-            "2024-Q1",
-            "official-backtest-policy-v1",
-            et_quarter_start(2024, 1),
-            datetime(2024, 2, 1, 5, 0, tzinfo=timezone.utc),
-        )
+def test_policy_accepts_a_complete_et_calendar_month() -> None:
+    policy = _policy(
+        "2024-Q1",
+        "official-backtest-policy-v1",
+        et_quarter_start(2024, 1),
+        datetime(2024, 2, 1, 5, 0, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(ValueError, match="not aligned to ET quarter"):
+        _ = policy.quarter_count
 
 
 def test_policy_rejects_a_reversed_period() -> None:

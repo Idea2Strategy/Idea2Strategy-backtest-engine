@@ -260,6 +260,8 @@ def test_compiled_plan_source_returns_the_immutable_launch_contract_document() -
 def _dataset_manifest_source(
     manifest_id: UUID,
     object_keys: list[str],
+    *,
+    object_overrides: dict[str, object] | None = None,
 ) -> PostgresDatasetManifestSource:
     manifest = {
         "id": manifest_id,
@@ -270,6 +272,9 @@ def _dataset_manifest_source(
         "period_start": datetime(2024, 1, 1, tzinfo=UTC),
         "period_end": datetime(2024, 2, 1, tzinfo=UTC),
         "available_at": datetime(2026, 8, 9, tzinfo=UTC),
+        "provider_code": "ALPACA",
+        "feed_code": "ALPACA_SIP_ALL_30M",
+        "data_layer": "ADJUSTED",
         "feed_resolution": "30m",
     }
     objects = [
@@ -287,10 +292,17 @@ def _dataset_manifest_source(
             "part_number": 1,
             "row_count": 10,
             "schema_version": "market-bars/1",
+            "storage_provider": "S3",
+            "bucket_name": "market",
+            "provider_version_id": f"version-{index}",
+            "file_format": "PARQUET",
+            "media_type": "application/vnd.apache.parquet",
             "status": "AVAILABLE",
         }
         for index, object_key in enumerate(object_keys, start=1)
     ]
+    for item in objects:
+        item.update(object_overrides or {})
     return PostgresDatasetManifestSource(_Engine(manifest, objects))  # type: ignore[arg-type]
 
 
@@ -311,6 +323,26 @@ def test_dataset_manifest_source_accepts_the_deployed_legacy_loader_binding() ->
     assert resolved["manifest_id"] == str(manifest_id)
     assert resolved["dataset_id"] == str(manifest_id)
     assert [item["object_key"] for item in resolved["objects"]] == object_keys
+    assert [item["provider_version_id"] for item in resolved["objects"]] == [
+        f"version-{index}" for index in range(1, 9)
+    ]
+
+
+def test_dataset_manifest_source_rejects_an_object_without_an_immutable_s3_version() -> None:
+    manifest_id = UUID("7f7113c9-3b02-4098-97ec-0baa07e2b3b0")
+    key = (
+        "historical/provider=alpaca/feed=sip/adjustment=all/session=regular/"
+        "resolution=30m/revision=00000001/year=2024/shard=00-of-01/"
+        f"manifest_id={manifest_id}/part-00001.parquet"
+    )
+    source = _dataset_manifest_source(
+        manifest_id,
+        [key],
+        object_overrides={"provider_version_id": None},
+    )
+
+    with pytest.raises(JobNotSatisfiable, match="immutable S3 version evidence"):
+        source.by_id(manifest_id)
 
 
 def test_dataset_manifest_source_preserves_the_canonical_logical_dataset_binding() -> None:
@@ -614,7 +646,11 @@ def test_s3_reader_materializes_to_a_private_cache_before_delegate_read(tmp_path
 
     class _S3:
         def get_object(self, **kwargs: str) -> dict[str, object]:
-            assert kwargs == {"Bucket": "market", "Key": "year/part.parquet"}
+            assert kwargs == {
+                "Bucket": "market",
+                "Key": "year/part.parquet",
+                "VersionId": "immutable-version-1",
+            }
             return {"Body": _Body()}
 
     reader = S3ParquetMarketDataReader(bucket="market", cache_root=tmp_path, client=_S3())
@@ -623,6 +659,9 @@ def test_s3_reader_materializes_to_a_private_cache_before_delegate_read(tmp_path
             {
                 "object_key": "year/part.parquet",
                 "content_hash": hashlib.sha256(body).hexdigest(),
+                "storage_provider": "S3",
+                "bucket_name": "market",
+                "provider_version_id": "immutable-version-1",
             }
         ]
     }
@@ -647,5 +686,43 @@ def test_s3_reader_removes_a_download_whose_checksum_does_not_match(tmp_path: Pa
     reader = S3ParquetMarketDataReader(bucket="market", cache_root=tmp_path, client=client)
 
     with pytest.raises(ConfigurationError, match="checksum"):
-        reader.materialize({"objects": [{"object_key": "part.parquet", "content_hash": "a" * 64}]})
+        reader.materialize(
+            {
+                "objects": [
+                    {
+                        "object_key": "part.parquet",
+                        "content_hash": "a" * 64,
+                        "storage_provider": "S3",
+                        "bucket_name": "market",
+                        "provider_version_id": "immutable-version-1",
+                    }
+                ]
+            }
+        )
     assert not (tmp_path / "part.parquet").exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("storage_provider", "LOCAL"),
+        ("bucket_name", "other-market"),
+        ("provider_version_id", ""),
+    ],
+)
+def test_s3_reader_rejects_mutable_or_substituted_object_evidence(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    metadata = {
+        "object_key": "part.parquet",
+        "content_hash": "a" * 64,
+        "storage_provider": "S3",
+        "bucket_name": "market",
+        "provider_version_id": "immutable-version-1",
+    }
+    metadata[field] = value
+    client = SimpleNamespace(get_object=lambda **_kwargs: pytest.fail("must fail before S3"))
+    reader = S3ParquetMarketDataReader(bucket="market", cache_root=tmp_path, client=client)
+
+    with pytest.raises(ConfigurationError):
+        reader.materialize({"objects": [metadata]})

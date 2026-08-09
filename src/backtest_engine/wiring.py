@@ -114,6 +114,11 @@ from .feature_outputs import (
     FeatureOutputBindingError,
     resolve_feature_materialization_pins,
 )
+from .legacy_market_data import (
+    is_legacy_market_loader_manifest,
+    legacy_period_matches,
+    validate_legacy_market_loader_manifest,
+)
 from .lifecycle import BacktestLifecycleService, PersistenceRunGateway, SqsBacktestJobQueue
 from .money import PRECISION_RULES_VERSION, QUANTITY_QUANTUM, apply_rate, quantize_money, quantize_quantity
 from .monthly_judgment import (
@@ -1392,7 +1397,22 @@ def require_compatible_execution_window(
     problems: list[str] = []
     manifest_start = _parse_instant(manifest.get("period_start"))
     manifest_end = _parse_instant(manifest.get("period_end"))
-    if manifest_start != policy.period_start or manifest_end != policy.period_end:
+    legacy = is_legacy_market_loader_manifest(manifest)
+    if legacy:
+        try:
+            validate_legacy_market_loader_manifest(manifest)
+            period_matches = legacy_period_matches(
+                manifest,
+                policy.period_start,
+                policy.period_end,
+                policy.timezone,
+            )
+        except ValueError as exc:
+            problems.append(f"legacy dataset manifest is invalid: {exc}")
+            period_matches = False
+    else:
+        period_matches = manifest_start == policy.period_start and manifest_end == policy.period_end
+    if not period_matches:
         problems.append(
             "dataset manifest period "
             f"{manifest_start.isoformat()}..{manifest_end.isoformat()} does not match "
