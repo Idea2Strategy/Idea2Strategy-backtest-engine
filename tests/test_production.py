@@ -11,6 +11,7 @@ from uuid import UUID
 
 import pytest
 
+import backtest_engine.production as production
 from backtest_engine.api import RESULT_INGEST_SCOPE
 from backtest_engine.backtest_request_intake import RequestLane
 from backtest_engine.production import (
@@ -25,12 +26,25 @@ from backtest_engine.production import (
     SqsExecutionJobQueue,
     api_authenticator,
     load_execution_policy_catalog,
+    orchestrator_job_handler,
     service_endpoint,
 )
 
 
 ACCOUNT_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 BOT_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+
+
+def test_worker_correlation_id_is_rejected_before_other_worker_dependencies_are_built() -> None:
+    with pytest.raises(ConfigurationError, match="BACKTEST_WORKER_CORRELATION_ID must be a UUID"):
+        orchestrator_job_handler({"BACKTEST_WORKER_CORRELATION_ID": "i-07a6870a8c4c199dc"})
+
+
+def test_worker_correlation_id_is_normalized_to_the_result_event_uuid_format() -> None:
+    assert production._required_uuid(  # type: ignore[attr-defined]
+        {"BACKTEST_WORKER_CORRELATION_ID": "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"},
+        "BACKTEST_WORKER_CORRELATION_ID",
+    ) == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
 
 def test_service_specific_aws_endpoint_overrides_the_legacy_shared_endpoint() -> None:
