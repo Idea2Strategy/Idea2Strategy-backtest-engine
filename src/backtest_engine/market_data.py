@@ -54,6 +54,7 @@ READABLE_MANIFEST_STATUS = "AVAILABLE"
 
 DEFAULT_BATCH_SIZE = 65_536
 _HASH_CHUNK_SIZE = 1024 * 1024
+_OrderState = tuple[tuple[str, int], tuple[int, str], bool, bool]
 
 
 def _utc_timestamp(value: object, label: str) -> datetime:
@@ -129,8 +130,11 @@ class ParquetMarketDataReader:
     def _verify_batch_rows(
         batch: pa.RecordBatch,
         policy: ExecutionPolicy,
-        previous_timestamp_micros: int | None,
-    ) -> int | None:
+        order_state: _OrderState | None,
+    ) -> _OrderState | None:
+        instrument_values = batch.column(
+            batch.schema.get_field_index("instrument_id")
+        ).to_pylist()
         timestamp_values = batch.column(
             batch.schema.get_field_index("bar_start_at")
         ).cast(pa.int64()).to_pylist()
@@ -140,14 +144,32 @@ class ParquetMarketDataReader:
         period_start_micros = int(policy.period_start.timestamp() * 1_000_000)
         period_end_micros = int(policy.period_end.timestamp() * 1_000_000)
         zone = ZoneInfo(policy.timezone)
-        for timestamp_micros, session_date in zip(
-            timestamp_values, session_dates, strict=True
+        if order_state is None:
+            previous_instrument_key = None
+            previous_time_key = None
+            instrument_major = True
+            time_major = True
+        else:
+            (
+                previous_instrument_key,
+                previous_time_key,
+                instrument_major,
+                time_major,
+            ) = order_state
+        for instrument_id, timestamp_micros, session_date in zip(
+            instrument_values, timestamp_values, session_dates, strict=True
         ):
-            if (
-                previous_timestamp_micros is not None
-                and timestamp_micros < previous_timestamp_micros
-            ):
-                raise MarketDataValidationError("bar_start_at must be ordered")
+            instrument_key = (str(instrument_id), timestamp_micros)
+            time_key = (timestamp_micros, str(instrument_id))
+            if previous_instrument_key is not None and instrument_key <= previous_instrument_key:
+                instrument_major = False
+            if previous_time_key is not None and time_key <= previous_time_key:
+                time_major = False
+            if not instrument_major and not time_major:
+                raise MarketDataValidationError(
+                    "rows must be uniquely ordered by instrument_id, bar_start_at "
+                    "or by bar_start_at, instrument_id"
+                )
             if not period_start_micros <= timestamp_micros < period_end_micros:
                 raise MarketDataValidationError("bar_start_at is outside the pinned period")
             timestamp = datetime.fromtimestamp(
@@ -158,8 +180,16 @@ class ParquetMarketDataReader:
                 raise MarketDataValidationError(
                     "session_date_et does not match bar_start_at in policy timezone"
                 )
-            previous_timestamp_micros = timestamp_micros
-        return previous_timestamp_micros
+            previous_instrument_key = instrument_key
+            previous_time_key = time_key
+        if previous_instrument_key is None or previous_time_key is None:
+            return order_state
+        return (
+            previous_instrument_key,
+            previous_time_key,
+            instrument_major,
+            time_major,
+        )
 
     @staticmethod
     def _content_hash(path: Path) -> str:
@@ -253,19 +283,34 @@ class ParquetMarketDataReader:
         """Yield verified bounded batches without loading an object as one byte string.
 
         Hash verification is deliberately a streaming first pass. Parquet decoding is
-        then bounded by ``batch_size`` and validates ordering across row-group and
-        object boundaries before yielding each batch.
+        then bounded by ``batch_size``. Producer objects are canonically ordered
+        by either ``instrument_id, bar_start_at`` or ``bar_start_at, instrument_id``;
+        the event clock later forms the global time order without forcing this reader
+        to materialize the dataset.
         """
         self._validate_manifest(manifest, policy)
-        previous_timestamp_micros: int | None = None
+        schema: pa.Schema | None = None
+        parquets: list[pq.ParquetFile] = []
         for metadata in manifest["objects"]:
             parquet = self._parquet_file(metadata, policy)
+            object_schema = parquet.schema_arrow
+            if schema is None:
+                schema = object_schema
+            # Producers may attach shard-local provenance metadata. Each object
+            # already proves the required schema_version above; the logical
+            # Arrow fields, not unrelated file metadata, must match across the stream.
+            elif not schema.equals(object_schema, check_metadata=False):
+                raise MarketDataValidationError("Parquet object schemas do not match")
+            parquets.append(parquet)
+
+        if schema is None:  # pragma: no cover - both manifest contracts require objects
+            return
+
+        for parquet in parquets:
+            order_state: _OrderState | None = None
             try:
-                batches = parquet.iter_batches(batch_size=self._batch_size)
-                for batch in batches:
-                    previous_timestamp_micros = self._verify_batch_rows(
-                        batch, policy, previous_timestamp_micros
-                    )
+                for batch in parquet.iter_batches(batch_size=self._batch_size):
+                    order_state = self._verify_batch_rows(batch, policy, order_state)
                     yield batch
             except MarketDataValidationError:
                 raise
