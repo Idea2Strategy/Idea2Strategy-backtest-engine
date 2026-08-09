@@ -13,11 +13,12 @@ import hmac
 import json
 import os
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from time import sleep
 from typing import Any, BinaryIO
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -612,10 +613,28 @@ class SqsDeadLetterSink:
 
 
 class HttpResultSink:
-    def __init__(self, base_url: str, token: str, *, timeout_seconds: float = 10.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        *,
+        timeout_seconds: float = 10.0,
+        max_transport_attempts: int = 3,
+        retry_backoff_seconds: float = 0.25,
+        sleeper: Callable[[float], None] = sleep,
+    ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        if not 1 <= max_transport_attempts <= 5:
+            raise ValueError("max_transport_attempts must be between 1 and 5")
+        if not 0 <= retry_backoff_seconds <= 5:
+            raise ValueError("retry_backoff_seconds must be between 0 and 5")
         self._base_url = base_url.rstrip("/")
         self._token = token
         self._timeout = timeout_seconds
+        self._max_transport_attempts = max_transport_attempts
+        self._retry_backoff = retry_backoff_seconds
+        self._sleep = sleeper
 
     def publish(self, event: Mapping[str, Any], *, delivery_attempt: int) -> None:
         run_id = str(event["backtestRunId"])
@@ -629,13 +648,26 @@ class HttpResultSink:
                 "X-Delivery-Attempt": str(delivery_attempt),
             },
         )
-        try:
-            with urlopen(request, timeout=self._timeout) as response:
-                status = response.status
-        except (HTTPError, URLError, TimeoutError) as exc:
-            raise RuntimeError(f"backtest result ingestion failed: {exc}") from exc
-        if status != 200:
-            raise RuntimeError(f"backtest result ingestion returned HTTP {status}")
+        for transport_attempt in range(1, self._max_transport_attempts + 1):
+            try:
+                with urlopen(request, timeout=self._timeout) as response:
+                    status = response.status
+            except HTTPError as exc:
+                # The endpoint answered. Retrying a deterministic HTTP response can
+                # only duplicate load and must not disguise a rejected event as a
+                # transient network outage.
+                raise RuntimeError(f"backtest result ingestion failed: {exc}") from exc
+            except (URLError, TimeoutError) as exc:
+                if transport_attempt == self._max_transport_attempts:
+                    raise RuntimeError(
+                        "backtest result ingestion failed after "
+                        f"{transport_attempt} transport attempts: {exc}"
+                    ) from exc
+                self._sleep(self._retry_backoff * (2 ** (transport_attempt - 1)))
+                continue
+            if status != 200:
+                raise RuntimeError(f"backtest result ingestion returned HTTP {status}")
+            return
 
 
 class S3ParquetMarketDataReader:
