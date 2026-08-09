@@ -302,10 +302,10 @@ def _input_model_payload(view: InputModelView, overview: BacktestOverview) -> di
     plausible-looking default.
     """
     market_bars = tuple(item for item in view.datasets if item.purpose_code == "MARKET_BARS")
-    if len(market_bars) != 1:
+    if not market_bars:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="canonical input bundle must contain exactly one MARKET_BARS dataset",
+            detail="canonical input bundle must contain at least one MARKET_BARS dataset",
         )
     primary = market_bars[0]
     return {
@@ -314,8 +314,8 @@ def _input_model_payload(view: InputModelView, overview: BacktestOverview) -> di
         "status": overview.status,
         "strategySnapshotHash": view.strategy_snapshot_hash,
         "compiledPlanChecksum": view.compiled_plan_checksum,
-        # Kept for client compatibility; both values are projections of the one
-        # canonical MARKET_BARS child, never duplicate pin-row columns.
+        # Kept for client compatibility as a deterministic representative; the
+        # complete immutable input set is always returned in datasets.
         "datasetManifestId": primary.dataset_manifest_id,
         "datasetHash": primary.locked_dataset_hash,
         "datasets": [

@@ -35,6 +35,7 @@ from backtest_engine.feature_outputs import (
 from backtest_engine.lifecycle import StaticCompiledPlanSource, StaticDatasetManifestSource
 from backtest_engine.production import S3VersionedFeatureObjectReader
 from backtest_engine.wiring import (
+    DatasetPin,
     FeatureMaterializationPin,
     JobEnvelope,
     JobNotSatisfiable,
@@ -841,6 +842,43 @@ def test_job_binding_attaches_only_fully_verified_feature_series() -> None:
 
     assert binding.feature_series[0].feature_id == "RSI_14"
     assert binding.feature_series[0].value_at(EVALUATION_FROM) == Decimal("0.00000000")
+
+
+def test_job_binding_preserves_every_dataset_and_uses_the_plan_reference_resolution() -> None:
+    body = _parquet()
+    record = _record(body)
+    handler = _handler(Source({MATERIALIZATION_ID: record}), Reader(body))
+    primary_id = DATASET_MANIFEST_ID
+    secondary_id = uuid.UUID("40000000-0000-4000-8000-000000000099")
+    market_bytes = market_bars_parquet()
+    primary = dataset_manifest(
+        hashlib.sha256(market_bytes).hexdigest(),
+        row_count=len(CLOSES),
+        coverage_end=EVALUATION_THROUGH,
+    )
+    primary["resolution"] = "1m"
+    secondary = dict(primary)
+    secondary["resolution"] = "30m"
+    secondary["dataset_hash"] = "f" * 64
+    handler._manifests = StaticDatasetManifestSource({
+        primary_id: primary,
+        secondary_id: secondary,
+    })
+    envelope = replace(
+        _envelope(pins=[{
+            "featureMaterializationId": str(MATERIALIZATION_ID),
+            "lockedResultHash": "sha256:" + str(record["result_hash"]),
+        }]),
+        datasets=(
+            DatasetPin(primary_id, "MARKET_BARS", "sha256:" + str(primary["dataset_hash"])),
+            DatasetPin(secondary_id, "MARKET_BARS", "sha256:" + str(secondary["dataset_hash"])),
+        ),
+    )
+
+    binding = handler.bind(envelope, _context())
+
+    assert binding.manifest["resolution"] == "1m"
+    assert {item["resolution"] for item in binding.job.manifests} == {"1m", "30m"}
 
 
 def test_production_feature_binding_refuses_a_job_with_no_required_pin() -> None:

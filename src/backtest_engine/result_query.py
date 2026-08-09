@@ -261,8 +261,8 @@ class RunInputs:
     @property
     def market_bars(self) -> RunDatasetInput:
         matches = tuple(item for item in self.datasets if item.purpose_code == "MARKET_BARS")
-        if len(matches) != 1:
-            raise QueryValidationError("inputs must contain exactly one MARKET_BARS dataset")
+        if not matches:
+            raise QueryValidationError("inputs must contain at least one MARKET_BARS dataset")
         return matches[0]
 
 

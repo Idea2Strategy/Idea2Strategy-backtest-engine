@@ -533,8 +533,13 @@ def compute_message_idempotency_key(
 
 
 def official_backtest_operation_key(request: Mapping[str, Any]) -> str:
+    datasets = request.get("datasets")
+    dataset_ids = [str(request["datasetManifestId"])]
+    if isinstance(datasets, list) and datasets:
+        dataset_ids.extend(str(item["datasetManifestId"]) for item in datasets[1:])
+    dataset_identity = ",".join(dataset_ids)
     return (
-        f"OFFICIAL_BACKTEST|{request['datasetManifestId']}|"
+        f"OFFICIAL_BACKTEST|{dataset_identity}|"
         f"{request['assumptionsVersion']}"
     )
 
@@ -604,6 +609,19 @@ def validate_official_backtest_request(
             "official_backtest_request.metadata.idempotencyKey does not match the "
             f"canonical material: declared {declared_key}, computed {computed_key}"
         )
+
+    datasets = request.get("datasets")
+    if isinstance(datasets, list) and datasets:
+        representative = datasets[0]
+        if (
+            representative["datasetManifestId"] != request["datasetManifestId"]
+            or representative["expectedDatasetHash"]
+            != request["expectedDatasetHash"]
+        ):
+            raise ContractValidationError(
+                "official_backtest_request.datasets[0] must match the legacy "
+                "datasetManifestId and expectedDatasetHash representative"
+            )
 
     if compiled_plan is not None:
         cross_check_request_against_plan(request, validate_basic_compiled_plan(compiled_plan))

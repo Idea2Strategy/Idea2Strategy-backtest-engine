@@ -355,6 +355,25 @@ def test_inputs_and_models_preserve_locked_reproducibility_identity() -> None:
     assert view.execution_model_version == "execution-v5"
 
 
+def test_run_inputs_accept_multiple_market_bar_dataset_pins() -> None:
+    inputs = RunInputs(
+        compiled_plan_checksum="sha256:" + "b" * 64,
+        strategy_snapshot_hash="sha256:" + "a" * 64,
+        input_bundle_fingerprint=FINGERPRINT,
+        input_contract_version="backtest-request.v1",
+        datasets=(
+            RunDatasetInput(DATASET_ID, "MARKET_BARS", "c" * 64),
+            RunDatasetInput("00000000-0000-4000-8000-000000000099", "MARKET_BARS", "f" * 64),
+        ),
+        feature_materializations=(),
+        execution_policy_version="official-policy-v4",
+        precision_rules_version="precision:1.0.0",
+    )
+
+    assert len(inputs.datasets) == 2
+    assert inputs.market_bars.dataset_manifest_id == DATASET_ID
+
+
 def test_complete_query_returns_performance_and_et_monthly_judgments() -> None:
     service, store = _service()
     run, result, details, monthly = _completed_artifacts()

@@ -1650,14 +1650,25 @@ class OrchestratorJobHandler:
                     reason_code="REQUIRED_INPUT_UNAVAILABLE",
                 )
             resolved_manifests.append((pin, resolved))
-        primary = [item for item in resolved_manifests if item[0].manifest_id == envelope.dataset_manifest_id]
-        if len(primary) != 1:
+        for _pin, resolved in resolved_manifests:
+            require_compatible_execution_window(policy, resolved, self._calendar)
+        declared_resolutions = [
+            str(resolved.get("resolution", "")) for _pin, resolved in resolved_manifests
+        ]
+        if len(resolved_manifests) > 1 and (
+            any(not resolution for resolution in declared_resolutions)
+            or len(set(declared_resolutions)) != len(declared_resolutions)
+        ):
             raise JobNotSatisfiable(
-                "the representative dataset is not pinned exactly once",
+                "multiple pinned market datasets must declare unique resolutions",
                 reason_code="REQUIRED_INPUT_UNAVAILABLE",
             )
-        manifest = primary[0][1]
-        require_compatible_execution_window(policy, manifest, self._calendar)
+        coverage_windows = {dataset_coverage(resolved) for _pin, resolved in resolved_manifests}
+        if len(coverage_windows) != 1:
+            raise JobNotSatisfiable(
+                "all pinned market datasets must share one evaluation period",
+                reason_code="REQUIRED_INPUT_UNAVAILABLE",
+            )
         try:
             plan = self._runtime.load(plan_document, compiled_plan_checksum=plan_checksum)
         except BasicPlanCompatibilityError as exc:
@@ -1669,6 +1680,13 @@ class OrchestratorJobHandler:
             # deterministic producer/consumer mismatch to exhaustion.
             raise JobNotSatisfiable(str(exc), reason_code=exc.failure.value) from exc
         if plan.reference_series[1] == "$DATASET":
+            primary = [item for item in resolved_manifests if item[0].manifest_id == envelope.dataset_manifest_id]
+            if len(primary) != 1:
+                raise JobNotSatisfiable(
+                    "the representative dataset is not pinned exactly once",
+                    reason_code="REQUIRED_INPUT_UNAVAILABLE",
+                )
+            manifest = primary[0][1]
             dataset_resolution = str(manifest.get("resolution", ""))
             if dataset_resolution not in {"30m", "1h", "4h", "1d"}:
                 raise JobNotSatisfiable(
@@ -1678,6 +1696,27 @@ class OrchestratorJobHandler:
             plan = replace(
                 plan, reference_series=(plan.reference_series[0], dataset_resolution)
             )
+        else:
+            reference_resolution = plan.reference_series[1]
+            reference_manifests = [
+                resolved for _pin, resolved in resolved_manifests
+                if str(resolved.get("resolution", "")) == reference_resolution
+            ]
+            if (
+                not reference_manifests
+                and len(resolved_manifests) == 1
+                and not str(resolved_manifests[0][1].get("resolution", ""))
+            ):
+                # Legacy single-dataset fixtures and messages predate the
+                # manifest-level resolution field. Multiple datasets never
+                # receive this fallback because their binding must be explicit.
+                reference_manifests = [resolved_manifests[0][1]]
+            if len(reference_manifests) != 1:
+                raise JobNotSatisfiable(
+                    f"the plan reference resolution {reference_resolution} must match exactly one pinned dataset",
+                    reason_code="REQUIRED_INPUT_UNAVAILABLE",
+                )
+            manifest = reference_manifests[0]
         evaluation_from, evaluation_through = evaluation_window(manifest, plan)
         feature_series: tuple[PinnedFeatureSeries, ...] = ()
         if self._feature_materializations is not None or envelope.feature_materializations:
@@ -1732,6 +1771,7 @@ class OrchestratorJobHandler:
                 data_kind=data_kind,
                 resolution=resolution,
                 initial_cash=plan.initial_cash,
+                manifests=tuple(resolved for _pin, resolved in resolved_manifests),
             )
         except OrchestratorError as exc:
             raise JobNotSatisfiable(str(exc), reason_code="REQUIRED_INPUT_UNAVAILABLE") from exc

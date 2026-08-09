@@ -285,6 +285,40 @@ def test_basic_request_is_dispatched_through_the_same_pinned_two_stage_boundary(
     ]
 
 
+def test_basic_request_preserves_every_server_selected_market_dataset() -> None:
+    request = basic_request()
+    second_id = uuid.UUID("95000000-0000-4000-8000-000000000002")
+    request["datasets"] = [
+        {
+            "datasetManifestId": request["datasetManifestId"],
+            "purposeCode": "MARKET_BARS",
+            "expectedDatasetHash": request["expectedDatasetHash"],
+        },
+        {
+            "datasetManifestId": str(second_id),
+            "purposeCode": "MARKET_BARS",
+            "expectedDatasetHash": "sha256:" + "8" * 64,
+        },
+    ]
+    run = replace(
+        projection(request, RequestLane.BASIC),
+        datasets=(
+            PinnedDataset(
+                uuid.UUID(request["datasetManifestId"]),
+                "MARKET_BARS",
+                request["expectedDatasetHash"],
+            ),
+            PinnedDataset(second_id, "MARKET_BARS", "sha256:" + "8" * 64),
+        ),
+    )
+    queue = Queue()
+
+    BacktestRequestJobPublisher(Source(run), queue)(request, RequestLane.BASIC)
+
+    assert queue.jobs[0][1]["datasetManifestId"] == request["datasetManifestId"]
+    assert queue.jobs[0][1]["datasets"] == request["datasets"]
+
+
 def test_changed_feature_output_is_rejected_before_execution() -> None:
     feature_id = uuid.uuid4()
 

@@ -269,6 +269,40 @@ def test_consumer_accepts_bs_official_backtest_request_verbatim(
     assert accepted["compiledPlanChecksum"] == B_PLAN_CHECKSUM
     assert accepted["expectedSnapshotHash"] == B_SNAPSHOT_HASH
     assert accepted["datasetManifestId"] == B_DATASET_MANIFEST_ID
+
+
+def test_official_request_identity_covers_every_server_selected_dataset(
+    official_request: dict[str, Any],
+) -> None:
+    second_id = "00000000-0000-4000-8000-000000000204"
+    official_request["datasets"] = [
+        {
+            "datasetManifestId": official_request["datasetManifestId"],
+            "purposeCode": "MARKET_BARS",
+            "expectedDatasetHash": official_request["expectedDatasetHash"],
+        },
+        {
+            "datasetManifestId": second_id,
+            "purposeCode": "MARKET_BARS",
+            "expectedDatasetHash": "sha256:" + "6" * 64,
+        },
+    ]
+    operation_key = official_backtest_operation_key(official_request)
+    official_request["metadata"]["idempotencyKey"] = compute_message_idempotency_key(
+        contract_version=STRATEGY_BOT_CONTRACT_VERSION,
+        message_type="OFFICIAL_BACKTEST_REQUESTED",
+        aggregate_id=B_BOT_ID,
+        snapshot_hash=B_SNAPSHOT_HASH,
+        operation_key=operation_key,
+    )
+
+    accepted = validate_official_backtest_request(official_request)
+
+    assert operation_key == (
+        "OFFICIAL_BACKTEST|00000000-0000-4000-8000-000000000203,"
+        f"{second_id}|accounting:1.0.0"
+    )
+    assert len(accepted["datasets"]) == 2
     assert accepted["requestReason"] == "STRATEGY_RELEASE"
 
 
@@ -304,6 +338,26 @@ def test_request_whose_dataset_manifest_was_swapped_fails_its_idempotency_key(
 
     with pytest.raises(ContractValidationError, match="idempotencyKey"):
         validate_official_backtest_request(swapped)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("datasetManifestId", "00000000-0000-4000-8000-000000000999"),
+        ("expectedDatasetHash", "sha256:" + "9" * 64),
+    ],
+)
+def test_dataset_array_representative_must_match_legacy_fields(
+    field: str,
+    replacement: str,
+) -> None:
+    request = _load(
+        STRATEGY_BOT_FIXTURES / "official-backtest-request.valid.json"
+    )
+    request["datasets"][0][field] = replacement
+
+    with pytest.raises(ContractValidationError, match=r"datasets\[0\]"):
+        validate_official_backtest_request(request)
 
 
 def test_request_is_rejected_when_it_names_a_different_compiled_plan(
