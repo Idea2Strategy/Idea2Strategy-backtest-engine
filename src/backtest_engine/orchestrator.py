@@ -52,6 +52,7 @@ from .attempt_coordinator import (
     FailureKind,
     ResourceMonitor,
 )
+from .calendar import CalendarCoverageError
 from .data_availability import (
     AvailabilityAssessment,
     AvailabilityStatus,
@@ -651,10 +652,12 @@ class BacktestOrchestrator:
         self._assessor = assessor or DataAvailabilityAssessor()
         self._publication_lag = publication_lag
 
-    def _schedule(self, policy: ExecutionPolicy) -> OfficialSessionSchedule:
-        zone = ZoneInfo(policy.timezone)
-        first = policy.period_start.astimezone(zone).date()
-        last = (policy.period_end - timedelta(microseconds=1)).astimezone(zone).date()
+    def _schedule(self, job: BacktestJob) -> OfficialSessionSchedule:
+        """Resolve only the immutable run window, not the policy's validity envelope."""
+        zone = ZoneInfo(job.execution_policy.timezone)
+        first = min(item.warmup_from for item in job.requirements).astimezone(zone).date()
+        through = max(item.evaluation_through for item in job.requirements)
+        last = (through - timedelta(microseconds=1)).astimezone(zone).date()
         return self._calendar.session_schedule(first, last)
 
     # -- entry point ------------------------------------------------------
@@ -667,7 +670,18 @@ class BacktestOrchestrator:
         lease: AttemptLease,
         monitor: ResourceMonitor,
     ) -> ReplayOutcome:
-        schedule = self._schedule(job.execution_policy)
+        try:
+            schedule = self._schedule(job)
+        except CalendarCoverageError as exc:
+            return self._abort(
+                job,
+                coordinator,
+                lease,
+                "REQUIRED_INPUT_UNAVAILABLE",
+                retryable=False,
+                status=ReplayStatus.UNAVAILABLE,
+                detail=f"{type(exc).__name__}: {exc}",
+            )
         try:
             events = bar_events_from_batches(
                 self._reader.iter_batches(job.manifest, job.execution_policy),

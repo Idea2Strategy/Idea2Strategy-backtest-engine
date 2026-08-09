@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from fractions import Fraction
@@ -539,6 +540,53 @@ def test_orchestrator_uses_bounded_parquet_batches_instead_of_materialized_read(
     outcome, _, _ = _run(tmp_path)
 
     assert outcome.status is ReplayStatus.COMPLETED
+
+
+def test_schedule_uses_the_run_requirement_window_not_the_policy_applicability_window(
+    tmp_path: Path,
+) -> None:
+    """INT03's decade policy must not make a January 2024 run request 2016 sessions."""
+    path = tmp_path / "bars.parquet"
+    write_bars(path)
+    policy = replace(
+        D17_EXECUTION_POLICY_FIXTURE,
+        period_start=datetime(2016, 7, 1, 4, tzinfo=timezone.utc),
+        period_end=datetime(2026, 7, 1, 4, tzinfo=timezone.utc),
+    )
+    job = replace(_job(manifest_for(path)), execution_policy=policy)
+    harness = Harness(tmp_path, StubRuntime(), RecordingEngine(), RecordingPublisher())
+
+    schedule = harness.orchestrator()._schedule(job)
+
+    assert schedule.sessions[0].trading_date_et == date(2024, 1, 2)
+    assert schedule.sessions[-1].trading_date_et == date(2024, 1, 2)
+
+
+def test_calendar_coverage_mismatch_is_one_permanent_input_failure(tmp_path: Path) -> None:
+    path = tmp_path / "bars.parquet"
+    write_bars(path)
+    outside = DataRequirement(
+        requirement_id="outside-calendar",
+        instrument_id=AAPL,
+        data_kind=DATA_KIND,
+        resolution=RESOLUTION,
+        warmup_from=datetime(2023, 12, 29, 14, 30, tzinfo=timezone.utc),
+        evaluation_from=datetime(2023, 12, 29, 14, 30, tzinfo=timezone.utc),
+        evaluation_through=datetime(2023, 12, 29, 15, 0, tzinfo=timezone.utc),
+    )
+    job = _job(manifest_for(path), requirements=(outside,))
+
+    outcome, harness, coordinator = _run(tmp_path, job=job)
+
+    assert outcome.status is ReplayStatus.UNAVAILABLE
+    assert outcome.reason_code == "REQUIRED_INPUT_UNAVAILABLE"
+    assert outcome.retryable is False
+    assert outcome.failure_detail is not None
+    assert outcome.failure_detail.startswith("CalendarCoverageError:")
+    assert harness.publisher.requests == []
+    assert coordinator.state is RunState.FAILED
+    assert len(coordinator.attempts) == 1
+    assert coordinator.attempts[0].state is AttemptState.PERMANENT_FAILED
 
 
 # --------------------------------------------------------------------------
