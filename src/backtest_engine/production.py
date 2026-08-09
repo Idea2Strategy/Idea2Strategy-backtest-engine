@@ -65,6 +65,14 @@ def _required(environ: Mapping[str, str], name: str) -> str:
     return value
 
 
+def _required_uuid(environ: Mapping[str, str], name: str) -> str:
+    value = _required(environ, name)
+    try:
+        return str(uuid.UUID(value))
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be a UUID") from exc
+
+
 def service_endpoint(environ: Mapping[str, str], service: str) -> str | None:
     """Resolve an emulator endpoint without coupling S3 and SQS together.
 
@@ -892,6 +900,7 @@ def _feature_object_reader(environ: Mapping[str, str]) -> S3VersionedFeatureObje
 def orchestrator_job_handler(
     environ: Mapping[str, str] = os.environ,
 ) -> OrchestratorJobHandler:
+    correlation_id = _required_uuid(environ, "BACKTEST_WORKER_CORRELATION_ID")
     policy = load_runtime_policy(Path(_required(environ, "BACKTEST_RUNTIME_POLICY_FILE")))
 
     engine = _engine(environ)
@@ -919,5 +928,5 @@ def orchestrator_job_handler(
         risk_limits=policy.risk_limits,
         runtime=BasicPlanRuntime(),
         wall_clock=lambda: datetime.now(UTC),
-        correlation_id=_required(environ, "BACKTEST_WORKER_CORRELATION_ID"),
+        correlation_id=correlation_id,
     )

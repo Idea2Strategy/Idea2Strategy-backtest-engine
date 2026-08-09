@@ -15,6 +15,8 @@ them.
 from __future__ import annotations
 
 import copy
+import logging
+import uuid
 from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from fractions import Fraction
@@ -53,6 +55,7 @@ from backtest_engine.wiring import (
     EXECUTION_MODEL_VERSION,
     BasicPlanReplayFactory,
     ExecutionModelEngine,
+    JobEnvelope,
     JobNotSatisfiable,
     OrchestratorJobHandler,
     WiringError,
@@ -434,6 +437,88 @@ def test_cancelled_replay_is_published_and_acknowledged_as_cancelled() -> None:
     assert sink.events[0]["metadata"]["messageType"] == "BACKTEST_CANCELLED"
     assert sink.events[0]["reasonCode"] == "USER_CANCELLED"
     assert sink.events[0]["deliveryAttempt"] == 3
+
+
+def _terminal_failure_envelope() -> JobEnvelope:
+    return JobEnvelope(
+        run_id=uuid.UUID("55555555-5555-4555-8555-555555555555"),
+        bot_id=uuid.UUID("00000000-0000-4000-8000-0000000000b1"),
+        owner_account_id=uuid.UUID("66666666-6666-4666-8666-666666666666"),
+        idempotency_key="terminal-publish-failure",
+        input_bundle_id=uuid.UUID("00000000-0000-4000-8000-0000000000b2"),
+        input_bundle_fingerprint="sha256:" + "1" * 64,
+        execution_policy_version="official-backtest-policy-v1",
+        compiled_plan_checksum="sha256:" + "2" * 64,
+        dataset_manifest_id=uuid.UUID("00000000-0000-4000-8000-0000000000b3"),
+        expected_dataset_hash="sha256:" + "3" * 64,
+        expected_snapshot_hash="sha256:" + "4" * 64,
+        datasets=(),
+        feature_materializations=(),
+        evaluation_period_id=None,
+        input_set_hash=None,
+    )
+
+
+def _terminal_failure_handler() -> OrchestratorJobHandler:
+    handler = object.__new__(OrchestratorJobHandler)
+    handler._wall_clock = lambda: COMPLETED_AT
+    handler._correlation_id = "77777777-7777-4777-8777-777777777777"
+
+    def unsatisfiable(*_args: Any) -> None:
+        raise JobNotSatisfiable("compiled plan is not resolvable", reason_code="REQUIRED_INPUT_UNAVAILABLE")
+
+    handler.bind = unsatisfiable  # type: ignore[method-assign]
+    return handler
+
+
+def test_unsatisfiable_binding_publishes_the_terminal_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Sink:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        def publish(self, event: Any, *, delivery_attempt: int) -> None:
+            self.events.append(dict(event) | {"deliveryAttempt": delivery_attempt})
+
+    envelope = _terminal_failure_envelope()
+    sink = Sink()
+    handler = _terminal_failure_handler()
+    handler._sink = sink
+    context = JobContext("execution-key", 1, 1, "message-1", "worker-1")
+    monkeypatch.setattr(JobEnvelope, "parse", classmethod(lambda _cls, _job: envelope))
+
+    outcome = handler({}, context)
+
+    assert outcome.result is JobResult.PERMANENT_FAILURE
+    assert outcome.reason_code == "REQUIRED_INPUT_UNAVAILABLE"
+    assert sink.events[0]["status"] == "FAILED"
+    assert sink.events[0]["failureCode"] == "REQUIRED_INPUT_UNAVAILABLE"
+    assert sink.events[0]["retryable"] is False
+    assert sink.events[0]["metadata"]["correlationId"] == "77777777-7777-4777-8777-777777777777"
+
+
+def test_terminal_binding_failure_survives_its_failure_event_publish_failing(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    envelope = _terminal_failure_envelope()
+    handler = _terminal_failure_handler()
+
+    def unavailable_sink(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("result sink unavailable")
+
+    handler._publish = unavailable_sink  # type: ignore[method-assign]
+    context = JobContext("execution-key", 1, 1, "message-1", "worker-1")
+    monkeypatch.setattr(JobEnvelope, "parse", classmethod(lambda _cls, _job: envelope))
+
+    with caplog.at_level(logging.ERROR):
+        outcome = handler({}, context)
+
+    assert outcome.result is JobResult.PERMANENT_FAILURE
+    assert outcome.reason_code == "REQUIRED_INPUT_UNAVAILABLE"
+    assert "result sink unavailable" in caplog.text
+    assert "REQUIRED_INPUT_UNAVAILABLE" in caplog.text
 
 
 # ==========================================================================

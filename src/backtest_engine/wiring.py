@@ -53,6 +53,7 @@ remove.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -179,6 +180,9 @@ from .worker import (
     WorkerConfigurationError,
     load_factory,
 )
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 __all__ = [
@@ -1486,16 +1490,25 @@ class OrchestratorJobHandler:
         try:
             binding = self.bind(envelope, context)
         except JobNotSatisfiable as exc:
-            self._publish(
-                envelope,
-                self._correlation_id,
-                status="FAILED",
-                delivery_attempt=context.receive_count,
-                failedAt=_utc_text(self._wall_clock()),
-                attempt=context.attempt_number,
-                failureCode=exc.reason_code,
-                retryable=False,
-            )
+            try:
+                self._publish(
+                    envelope,
+                    self._correlation_id,
+                    status="FAILED",
+                    delivery_attempt=context.receive_count,
+                    failedAt=_utc_text(self._wall_clock()),
+                    attempt=context.attempt_number,
+                    failureCode=exc.reason_code,
+                    retryable=False,
+                )
+            except Exception:
+                _LOGGER.exception(
+                    "terminal backtest result publish failed run_id=%s attempt=%s reason_code=%s; "
+                    "preserving permanent failure",
+                    envelope.run_id,
+                    context.attempt_number,
+                    exc.reason_code,
+                )
             return JobOutcome(JobResult.PERMANENT_FAILURE, reason_code=exc.reason_code)
 
         started_at = self._wall_clock()
