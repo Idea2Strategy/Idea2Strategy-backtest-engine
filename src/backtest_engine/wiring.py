@@ -82,6 +82,7 @@ from .basic_runtime import (
     ReplaySkipReason,
     derive_data_requirements,
 )
+from .calendar import CalendarCoverageError
 from .contracts import build_backtest_result_event
 from .data_availability import AvailabilityAssessment
 from .detail_object_manifest import (
@@ -1377,6 +1378,43 @@ def evaluation_window(manifest: Mapping[str, Any], plan: BasicCompiledPlan) -> t
     return evaluation_from, coverage_end
 
 
+def require_compatible_execution_window(
+    policy: ExecutionPolicy,
+    manifest: Mapping[str, Any],
+    calendar: SessionCalendar,
+) -> None:
+    """Reject immutable execution inputs that cannot describe one run.
+
+    The worker must not silently shrink a policy or manifest period to make an
+    incompatible request executable. This check runs during binding, before a
+    ``RUNNING`` event is published, because redelivery cannot change any input.
+    """
+    problems: list[str] = []
+    manifest_start = _parse_instant(manifest.get("period_start"))
+    manifest_end = _parse_instant(manifest.get("period_end"))
+    if manifest_start != policy.period_start or manifest_end != policy.period_end:
+        problems.append(
+            "dataset manifest period "
+            f"{manifest_start.isoformat()}..{manifest_end.isoformat()} does not match "
+            f"execution policy {policy.version} period "
+            f"{policy.period_start.isoformat()}..{policy.period_end.isoformat()}"
+        )
+
+    zone = ZoneInfo(policy.timezone)
+    first = policy.period_start.astimezone(zone).date()
+    last = (policy.period_end - timedelta(microseconds=1)).astimezone(zone).date()
+    try:
+        calendar.session_schedule(first, last)
+    except CalendarCoverageError as exc:
+        problems.append(f"session calendar does not cover the execution policy period: {exc}")
+
+    if problems:
+        raise JobNotSatisfiable(
+            "execution inputs are mutually incompatible: " + "; ".join(problems),
+            reason_code="REQUIRED_INPUT_UNAVAILABLE",
+        )
+
+
 def _parse_instant(value: object) -> datetime:
     if not isinstance(value, str):  # pragma: no cover - the schema requires a string
         raise JobNotSatisfiable(
@@ -1599,6 +1637,7 @@ class OrchestratorJobHandler:
                 reason_code="REQUIRED_INPUT_UNAVAILABLE",
             )
         manifest = primary[0][1]
+        require_compatible_execution_window(policy, manifest, self._calendar)
         try:
             plan = self._runtime.load(plan_document, compiled_plan_checksum=plan_checksum)
         except BasicPlanCompatibilityError as exc:
