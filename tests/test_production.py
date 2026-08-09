@@ -16,6 +16,7 @@ from backtest_engine.api import RESULT_INGEST_SCOPE
 from backtest_engine.backtest_request_intake import RequestLane
 from backtest_engine.production import (
     ConfigurationError,
+    HttpResultSink,
     JwtAuthenticator,
     PostgresCompiledPlanSource,
     PostgresDatasetManifestSource,
@@ -47,6 +48,120 @@ def test_worker_correlation_id_is_normalized_to_the_result_event_uuid_format() -
         {"BACKTEST_WORKER_CORRELATION_ID": "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"},
         "BACKTEST_WORKER_CORRELATION_ID",
     ) == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+
+class _HttpResultResponse:
+    status = 200
+
+    def __enter__(self) -> _HttpResultResponse:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
+def test_result_sink_retries_a_transient_timeout_with_the_exact_same_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[object] = []
+    sleeps: list[float] = []
+
+    def urlopen(request: object, *, timeout: float) -> _HttpResultResponse:
+        assert timeout == 2.0
+        requests.append(request)
+        if len(requests) == 1:
+            raise TimeoutError("temporary result endpoint timeout")
+        return _HttpResultResponse()
+
+    monkeypatch.setattr(production, "urlopen", urlopen)
+    sink = HttpResultSink(
+        "https://api.example.com",
+        "worker-token",
+        timeout_seconds=2.0,
+        max_transport_attempts=3,
+        retry_backoff_seconds=0.25,
+        sleeper=sleeps.append,
+    )
+
+    sink.publish(
+        {"backtestRunId": str(BOT_ID), "status": "FAILED"},
+        delivery_attempt=1,
+    )
+
+    assert len(requests) == 2
+    assert requests[0].data == requests[1].data  # type: ignore[attr-defined]
+    assert requests[0].headers == requests[1].headers  # type: ignore[attr-defined]
+    assert sleeps == [0.25]
+
+
+def test_result_sink_bounds_transient_transport_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    def urlopen(_request: object, *, timeout: float) -> _HttpResultResponse:
+        nonlocal calls
+        assert timeout == 1.0
+        calls += 1
+        raise TimeoutError("still unavailable")
+
+    monkeypatch.setattr(production, "urlopen", urlopen)
+    sink = HttpResultSink(
+        "https://api.example.com",
+        "worker-token",
+        timeout_seconds=1.0,
+        max_transport_attempts=3,
+        retry_backoff_seconds=0.1,
+        sleeper=sleeps.append,
+    )
+
+    with pytest.raises(RuntimeError, match="after 3 transport attempts"):
+        sink.publish(
+            {"backtestRunId": str(BOT_ID), "status": "FAILED"},
+            delivery_attempt=1,
+        )
+
+    assert calls == 3
+    assert sleeps == [0.1, 0.2]
+
+
+def test_result_sink_does_not_retry_an_http_response_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    def urlopen(_request: object, *, timeout: float) -> _HttpResultResponse:
+        nonlocal calls
+        assert timeout == 1.0
+        calls += 1
+        raise production.HTTPError(
+            "https://api.example.com",
+            503,
+            "Service Unavailable",
+            {},
+            None,
+        )
+
+    monkeypatch.setattr(production, "urlopen", urlopen)
+    sink = HttpResultSink(
+        "https://api.example.com",
+        "worker-token",
+        timeout_seconds=1.0,
+        max_transport_attempts=3,
+        retry_backoff_seconds=0.1,
+        sleeper=sleeps.append,
+    )
+
+    with pytest.raises(RuntimeError, match="HTTP Error 503"):
+        sink.publish(
+            {"backtestRunId": str(BOT_ID), "status": "FAILED"},
+            delivery_attempt=1,
+        )
+
+    assert calls == 1
+    assert sleeps == []
 
 
 def test_service_specific_aws_endpoint_overrides_the_legacy_shared_endpoint() -> None:
