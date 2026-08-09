@@ -368,6 +368,7 @@ class BacktestJob:
     data_kind: str
     resolution: str
     initial_cash: Decimal
+    manifests: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.run_id:
@@ -380,6 +381,10 @@ class BacktestJob:
             raise OrchestratorError("data_kind and resolution must be pinned")
         if self.initial_cash < 0:
             raise OrchestratorError("initial_cash must not be negative")
+        manifests = tuple(self.manifests) or (self.manifest,)
+        if any(not isinstance(item, Mapping) for item in manifests):
+            raise OrchestratorError("manifests must contain dataset manifest mappings")
+        object.__setattr__(self, "manifests", manifests)
         # One source of truth for the bar period: the element catalog's
         # resolution table. A separately configured interval could disagree
         # with the resolution the plan actually reads.
@@ -511,7 +516,7 @@ def observations_from_events(
     tuple, which the assessor turns into ``REQUIRED_SERIES_ABSENT`` rather than
     into a silently empty replay.
     """
-    by_instrument: dict[str, list[TimeInterval]] = {}
+    by_series: dict[tuple[str, str, str], list[TimeInterval]] = {}
     for event in events:
         bar = event.payload.get("bar")
         interval = (
@@ -519,9 +524,9 @@ def observations_from_events(
             if isinstance(bar, SeriesBar)
             else TimeInterval(event.occurred_at - bar_interval, event.occurred_at)
         )
-        by_instrument.setdefault(event.instrument_id, []).append(
-            interval
-        )
+        data_kind = str(event.payload.get("dataKind", ""))
+        resolution = str(event.payload.get("resolution", ""))
+        by_series.setdefault((event.instrument_id, data_kind, resolution), []).append(interval)
     return tuple(
         DataObservation(
             requirement_id=requirement.requirement_id,
@@ -529,7 +534,11 @@ def observations_from_events(
             data_kind=requirement.data_kind,
             resolution=requirement.resolution,
             available_intervals=(
-                tuple(by_instrument.get(requirement.instrument_id, ()))
+                tuple(by_series.get((
+                    requirement.instrument_id,
+                    requirement.data_kind,
+                    requirement.resolution,
+                ), ()))
                 + (
                     _closed_market_intervals(schedule, requirement.required_interval)
                     if schedule is not None
@@ -669,12 +678,30 @@ class BacktestOrchestrator:
     ) -> ReplayOutcome:
         schedule = self._schedule(job.execution_policy)
         try:
-            events = bar_events_from_batches(
-                self._reader.iter_batches(job.manifest, job.execution_policy),
-                data_kind=job.data_kind,
-                resolution=job.resolution,
-                publication_lag=self._publication_lag,
-                schedule=schedule,
+            combined_events: list[MarketDataEvent] = []
+            for manifest in job.manifests:
+                resolution = str(manifest.get("resolution") or (
+                    job.resolution if manifest is job.manifest else ""
+                ))
+                if not resolution:
+                    raise MarketDataValidationError(
+                        "every pinned dataset manifest must declare its resolution"
+                    )
+                manifest_events = bar_events_from_batches(
+                    self._reader.iter_batches(manifest, job.execution_policy),
+                    data_kind=job.data_kind,
+                    resolution=resolution,
+                    publication_lag=self._publication_lag,
+                    schedule=schedule,
+                )
+                combined_events.extend(
+                    replace(event, event_id=f"{event.event_id}:{resolution}")
+                    if len(job.manifests) > 1 else event
+                    for event in manifest_events
+                )
+            events = tuple(
+                replace(event, source_sequence=index)
+                for index, event in enumerate(combined_events, start=1)
             )
         except MarketDataValidationError:
             return self._abort(

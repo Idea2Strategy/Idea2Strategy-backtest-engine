@@ -541,6 +541,75 @@ def test_orchestrator_uses_bounded_parquet_batches_instead_of_materialized_read(
     assert outcome.status is ReplayStatus.COMPLETED
 
 
+def test_orchestrator_reads_every_pinned_resolution_into_one_replay_clock() -> None:
+    rows_15m = pa.Table.from_pylist(
+        [_bar_row(_utc(14, 30), date(2024, 1, 2)),
+         _bar_row(_utc(14, 45), date(2024, 1, 2))],
+        schema=_SCHEMA,
+    )
+    rows_30m = pa.Table.from_pylist(
+        [_bar_row(_utc(14, 30), date(2024, 1, 2))],
+        schema=_SCHEMA,
+    )
+    manifests = ({"resolution": "15m"}, {"resolution": "30m"})
+
+    class Reader:
+        def __init__(self) -> None:
+            self.seen: list[str] = []
+
+        def iter_batches(self, manifest: Mapping[str, Any], _policy: Any) -> Any:
+            resolution = str(manifest["resolution"])
+            self.seen.append(resolution)
+            return (rows_15m if resolution == "15m" else rows_30m).to_batches()
+
+    reader = Reader()
+    runtime = StubRuntime(buy_at=None)
+    harness = Harness(Path(), runtime, RecordingEngine(), RecordingPublisher())
+    orchestrator = BacktestOrchestrator(
+        reader=reader,
+        calendar=XNYS_CALENDAR,
+        replay_factory=harness.factory,
+        engine=harness.engine,
+        publisher=harness.publisher,
+        wall_clock=WallClock(),
+    )
+    requirements = (
+        DataRequirement(
+            requirement_id="aapl-15m", instrument_id=AAPL, data_kind=DATA_KIND,
+            resolution="15m", warmup_from=_utc(14, 30), evaluation_from=_utc(14, 30),
+            evaluation_through=_utc(15, 0),
+        ),
+        DataRequirement(
+            requirement_id="aapl-30m", instrument_id=AAPL, data_kind=DATA_KIND,
+            resolution="30m", warmup_from=_utc(14, 30), evaluation_from=_utc(14, 30),
+            evaluation_through=_utc(15, 0),
+        ),
+    )
+    coordinator = AttemptCoordinator(RUN_ID, _policy(), WALL_T0)
+    outcome = orchestrator.run(
+        BacktestJob(
+            run_id=RUN_ID,
+            idempotency_key="OFFICIAL_BACKTEST:multi-resolution",
+            worker_execution_key=f"BACKTEST_RUN:{RUN_ID}:multi-resolution",
+            manifest=manifests[0],
+            execution_policy=D17_EXECUTION_POLICY_FIXTURE,
+            requirements=requirements,
+            data_kind=DATA_KIND,
+            resolution="15m",
+            initial_cash=Decimal("10000"),
+            manifests=manifests,
+        ),
+        coordinator=coordinator,
+        lease=coordinator.acquire("multi-resolution-worker", WALL_T0),
+        monitor=FixedMonitor(),
+    )
+
+    assert outcome.status is ReplayStatus.COMPLETED
+    assert reader.seen == ["15m", "30m"]
+    visible = runtime.inputs_by_instant[_utc(15, 0)][AAPL]
+    assert {series.resolution for series in visible.series} == {"15m", "30m"}
+
+
 # --------------------------------------------------------------------------
 # The replay loop is genuinely driven by the event clock.
 # --------------------------------------------------------------------------

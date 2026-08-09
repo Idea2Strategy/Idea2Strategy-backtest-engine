@@ -533,8 +533,14 @@ def compute_message_idempotency_key(
 
 
 def official_backtest_operation_key(request: Mapping[str, Any]) -> str:
+    datasets = request.get("datasets")
+    dataset_identity = (
+        ",".join(str(item["datasetManifestId"]) for item in datasets)
+        if isinstance(datasets, list) and datasets
+        else str(request["datasetManifestId"])
+    )
     return (
-        f"OFFICIAL_BACKTEST|{request['datasetManifestId']}|"
+        f"OFFICIAL_BACKTEST|{dataset_identity}|"
         f"{request['assumptionsVersion']}"
     )
 

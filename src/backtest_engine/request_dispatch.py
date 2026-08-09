@@ -82,14 +82,24 @@ def _request_period(
 ) -> tuple[date, date, tuple[PinnedDataset, ...], tuple[PinnedFeatureMaterialization, ...]]:
     try:
         if lane is RequestLane.BASIC:
+            raw_datasets = request.get("datasets") or (
+                {
+                    "datasetManifestId": request["datasetManifestId"],
+                    "purposeCode": "MARKET_BARS",
+                    "expectedDatasetHash": request["expectedDatasetHash"],
+                },
+            )
             return (
                 date.fromisoformat(str(request["periodStart"])),
                 date.fromisoformat(str(request["periodEnd"])),
-                (
+                tuple(
+                    sorted(
                     PinnedDataset(
-                        uuid.UUID(str(request["datasetManifestId"])),
-                        "MARKET_BARS",
-                        str(request["expectedDatasetHash"]),
+                            uuid.UUID(str(item["datasetManifestId"])),
+                            str(item["purposeCode"]),
+                            str(item["expectedDatasetHash"]),
+                        )
+                        for item in raw_datasets
                     ),
                 ),
                 tuple(
@@ -182,9 +192,19 @@ class BacktestRequestJobPublisher:
         stored_datasets = tuple(sorted(run.datasets))
         stored_features = tuple(sorted(run.feature_materializations))
         market_bars = tuple(item for item in stored_datasets if item.purpose_code == "MARKET_BARS")
-        if len(market_bars) != 1:
+        if not market_bars or (lane is not RequestLane.BASIC and len(market_bars) != 1):
             raise RequestProcessingError("MARKET_BARS_DATASET_INVALID", retryable=False)
-        primary = market_bars[0]
+        representative_id = (
+            market_bars[0].dataset_manifest_id
+            if lane is RequestLane.COMPETITION
+            else uuid.UUID(str(request["datasetManifestId"]))
+        )
+        representatives = tuple(
+            item for item in market_bars if item.dataset_manifest_id == representative_id
+        )
+        if len(representatives) != 1:
+            raise RequestProcessingError("MARKET_BARS_DATASET_INVALID", retryable=False)
+        primary = representatives[0]
         if lane is RequestLane.BASIC:
             start, end, requested_datasets, requested_features = _request_period(
                 request, lane
