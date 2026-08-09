@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import hashlib
 from copy import deepcopy
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from backtest_engine.calendar import XNYS_CALENDAR
 from backtest_engine.contracts import canonical_dataset_hash
+from backtest_engine.event_clock import MarketEventClock
 from backtest_engine.execution_policy import D17_EXECUTION_POLICY_FIXTURE
 from backtest_engine.market_data import MarketDataValidationError, ParquetMarketDataReader
+from backtest_engine.orchestrator import bar_events_from_batches
 from d_market_data_testkit import write_small_market_bars
 
 
@@ -111,6 +114,154 @@ def test_reader_streams_hashing_and_parquet_batches_without_whole_file_helpers(
         "AAPL",
         "AAPL",
     ]
+
+
+def test_reader_accepts_eight_shard_instrument_major_data_and_clock_orders_events(
+    tmp_path: Path,
+) -> None:
+    """Pin the actual INT03 publication shape through the production event boundary.
+
+    Seven shards are empty and shard 04 contains two instrument-major series. Its
+    timestamps reset once at the instrument boundary, exactly as the producer's
+    canonical ``instrument_id, bar_start_at`` ordering requires. The event clock,
+    not the bounded Parquet reader, establishes global market-time order.
+    """
+    fixture = write_small_market_bars(tmp_path / "source.parquet")
+    source = pq.read_table(fixture.path)
+    objects: list[dict[str, object]] = []
+    for shard in range(8):
+        path = tmp_path / f"shard-{shard:02d}.parquet"
+        shard_table = source.slice(0, 0)
+        if shard == 4:
+            instruments = []
+            for instrument, symbol in (
+                ("11111111-1111-4111-8111-111111111111", "AAPL"),
+                ("22222222-2222-4222-8222-222222222222", "MSFT"),
+            ):
+                table = source.set_column(
+                    source.schema.get_field_index("instrument_id"),
+                    source.schema.field("instrument_id"),
+                    pa.array([instrument] * source.num_rows, type=pa.string()),
+                )
+                table = table.set_column(
+                    table.schema.get_field_index("provider_symbol"),
+                    table.schema.field("provider_symbol"),
+                    pa.array([symbol] * table.num_rows, type=pa.string()),
+                )
+                instruments.append(table)
+            shard_table = pa.concat_tables(instruments)
+        shard_table = shard_table.replace_schema_metadata(
+            {**(shard_table.schema.metadata or {}), b"shard_provenance": f"s{shard:02d}".encode()}
+        )
+        pq.write_table(shard_table, path, compression="zstd", version="2.6")
+        objects.append(
+            dict(
+                PINNED_OBJECT,
+                storage_object_id=f"33333333-3333-4333-8333-{shard + 1:012d}",
+                object_key=path.name,
+                content_hash=hashlib.sha256(path.read_bytes()).hexdigest(),
+                shard_key=f"s{shard:02d}-of-08",
+                row_count=shard_table.num_rows,
+            )
+        )
+    manifest = _manifest_for(tmp_path / "shard-00.parquet")
+    manifest["objects"] = objects
+    manifest["dataset_hash"] = canonical_dataset_hash(objects)
+
+    batches = list(
+        ParquetMarketDataReader(tmp_path, batch_size=3).iter_batches(
+            manifest,
+            D17_EXECUTION_POLICY_FIXTURE,
+        )
+    )
+    table = pa.Table.from_batches(batches)
+    events = bar_events_from_batches(batches, data_kind="BAR", resolution="30m")
+
+    assert table.num_rows == 4
+    assert list(
+        zip(
+            table["instrument_id"].to_pylist(),
+            table["bar_start_at"].cast(pa.int64()).to_pylist(),
+            strict=True,
+        )
+    ) == sorted(
+        zip(
+            table["instrument_id"].to_pylist(),
+            table["bar_start_at"].cast(pa.int64()).to_pylist(),
+            strict=True,
+        )
+    )
+    assert table["provider_symbol"].to_pylist() == ["AAPL", "AAPL", "MSFT", "MSFT"]
+    assert len(events) == 4
+    schedule = XNYS_CALENDAR.session_schedule(date(2024, 1, 1), date(2024, 3, 31))
+    released = MarketEventClock(schedule, events).advance_to(
+        datetime(2024, 1, 3, tzinfo=timezone.utc)
+    ).released_events
+    assert [event.occurred_at for event in released] == sorted(
+        event.occurred_at for event in released
+    )
+
+
+def test_reader_still_rejects_rows_out_of_order_inside_one_shard(tmp_path: Path) -> None:
+    fixture = write_small_market_bars(tmp_path / "market-bars.parquet")
+    table = pq.read_table(fixture.path).take(pa.array([1, 0]))
+    pq.write_table(table, fixture.path, compression="zstd", version="2.6")
+    manifest = _manifest_for(fixture.path)
+
+    with pytest.raises(MarketDataValidationError, match="uniquely ordered"):
+        ParquetMarketDataReader(tmp_path).read(manifest, D17_EXECUTION_POLICY_FIXTURE)
+
+
+def test_reader_rejects_duplicate_instrument_timestamp_key(tmp_path: Path) -> None:
+    fixture = write_small_market_bars(tmp_path / "market-bars.parquet")
+    table = pq.read_table(fixture.path).take(pa.array([0, 0]))
+    pq.write_table(table, fixture.path, compression="zstd", version="2.6")
+    manifest = _manifest_for(fixture.path)
+
+    with pytest.raises(MarketDataValidationError, match="uniquely ordered"):
+        ParquetMarketDataReader(tmp_path).read(manifest, D17_EXECUTION_POLICY_FIXTURE)
+
+
+def test_reader_rejects_instrument_order_regression(tmp_path: Path) -> None:
+    fixture = write_small_market_bars(tmp_path / "market-bars.parquet")
+    source = pq.read_table(fixture.path)
+    later_instrument = source.set_column(
+        source.schema.get_field_index("instrument_id"),
+        source.schema.field("instrument_id"),
+        pa.array(["22222222-2222-4222-8222-222222222222"] * source.num_rows),
+    )
+    table = pa.concat_tables([later_instrument, source]).take(pa.array([0, 2]))
+    pq.write_table(table, fixture.path, compression="zstd", version="2.6")
+    manifest = _manifest_for(fixture.path)
+
+    with pytest.raises(MarketDataValidationError, match="uniquely ordered"):
+        ParquetMarketDataReader(tmp_path).read(manifest, D17_EXECUTION_POLICY_FIXTURE)
+
+
+def test_reader_verifies_every_object_before_yielding_any_rows(tmp_path: Path) -> None:
+    first = write_small_market_bars(tmp_path / "first.parquet")
+    second = write_small_market_bars(tmp_path / "second.parquet")
+    objects = [
+        dict(
+            PINNED_OBJECT,
+            storage_object_id=f"33333333-3333-4333-8333-{index:012d}",
+            object_key=fixture.path.name,
+            content_hash=hashlib.sha256(fixture.path.read_bytes()).hexdigest(),
+            shard_key=f"s{index - 1:02d}-of-02",
+        )
+        for index, fixture in enumerate((first, second), start=1)
+    ]
+    manifest = _manifest_for(first.path)
+    manifest["objects"] = objects
+    manifest["dataset_hash"] = canonical_dataset_hash(objects)
+    second.path.write_bytes(second.path.read_bytes() + b"tampered")
+
+    batches = ParquetMarketDataReader(tmp_path).iter_batches(
+        manifest,
+        D17_EXECUTION_POLICY_FIXTURE,
+    )
+    with pytest.raises(MarketDataValidationError, match="content_hash"):
+        next(batches)
 
 
 def test_reader_rejects_object_bytes_that_do_not_match_manifest(tmp_path: Path) -> None:
