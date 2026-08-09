@@ -340,6 +340,26 @@ def test_request_whose_dataset_manifest_was_swapped_fails_its_idempotency_key(
         validate_official_backtest_request(swapped)
 
 
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("datasetManifestId", "00000000-0000-4000-8000-000000000999"),
+        ("expectedDatasetHash", "sha256:" + "9" * 64),
+    ],
+)
+def test_dataset_array_representative_must_match_legacy_fields(
+    field: str,
+    replacement: str,
+) -> None:
+    request = _load(
+        STRATEGY_BOT_FIXTURES / "official-backtest-request.valid.json"
+    )
+    request["datasets"][0][field] = replacement
+
+    with pytest.raises(ContractValidationError, match=r"datasets\[0\]"):
+        validate_official_backtest_request(request)
+
+
 def test_request_is_rejected_when_it_names_a_different_compiled_plan(
     official_request: dict[str, Any],
     compiled_plan: dict[str, Any],
