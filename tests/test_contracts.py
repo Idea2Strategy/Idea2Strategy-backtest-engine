@@ -271,6 +271,16 @@ def test_consumer_accepts_bs_official_backtest_request_verbatim(
     assert accepted["datasetManifestId"] == B_DATASET_MANIFEST_ID
 
 
+def test_official_request_accepts_no_feature_materializations(
+    official_request: dict[str, Any],
+) -> None:
+    official_request["featureMaterializations"] = []
+
+    accepted = validate_official_backtest_request(official_request)
+
+    assert accepted["featureMaterializations"] == []
+
+
 def test_official_request_identity_covers_every_server_selected_dataset(
     official_request: dict[str, Any],
 ) -> None:
