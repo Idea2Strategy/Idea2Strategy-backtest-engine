@@ -30,6 +30,12 @@ import pyarrow.parquet as pq
 
 from .contracts import ContractValidationError, validate_dataset_manifest
 from .execution_policy import ExecutionPolicy
+from .legacy_market_data import (
+    LEGACY_MARKET_SCHEMA_ID,
+    is_legacy_market_loader_manifest,
+    legacy_period_matches,
+    validate_legacy_market_loader_manifest,
+)
 
 
 __all__ = [
@@ -168,8 +174,13 @@ class ParquetMarketDataReader:
         metadata: Mapping[str, Any],
         policy: ExecutionPolicy,
     ) -> pq.ParquetFile:
-        if metadata.get("object_kind") != "PARQUET":
-            raise MarketDataValidationError("object_kind must be PARQUET")
+        expected_kind = (
+            "MARKET_BARS"
+            if policy.market_data_schema_version == LEGACY_MARKET_SCHEMA_ID
+            else "PARQUET"
+        )
+        if metadata.get("object_kind") != expected_kind:
+            raise MarketDataValidationError(f"object_kind must be {expected_kind}")
         if metadata.get("schema_version") != policy.market_data_schema_version:
             raise MarketDataValidationError("manifest schema_version does not match policy")
         path = self._object_path(metadata.get("object_key"))
@@ -190,9 +201,13 @@ class ParquetMarketDataReader:
         manifest: Mapping[str, Any],
         policy: ExecutionPolicy,
     ) -> None:
+        legacy = is_legacy_market_loader_manifest(manifest)
         try:
-            validate_dataset_manifest(manifest)
-        except ContractValidationError as exc:
+            if legacy:
+                validate_legacy_market_loader_manifest(manifest)
+            else:
+                validate_dataset_manifest(manifest)
+        except (ContractValidationError, ValueError) as exc:
             raise MarketDataValidationError(str(exc)) from exc
         if self._manifest_validator is not None:
             try:
@@ -210,16 +225,25 @@ class ParquetMarketDataReader:
             )
         if manifest.get("schema_id") != policy.market_data_schema_version:
             raise MarketDataValidationError("manifest schema_id does not match policy")
-        if (
-            _utc_timestamp(manifest.get("period_start"), "manifest.period_start")
-            != policy.period_start
-        ):
-            raise MarketDataValidationError("manifest period_start does not match policy")
-        if (
-            _utc_timestamp(manifest.get("period_end"), "manifest.period_end")
-            != policy.period_end
-        ):
-            raise MarketDataValidationError("manifest period_end does not match policy")
+        if legacy:
+            if not legacy_period_matches(
+                manifest,
+                policy.period_start,
+                policy.period_end,
+                policy.timezone,
+            ):
+                raise MarketDataValidationError("legacy manifest period does not match policy")
+        else:
+            if (
+                _utc_timestamp(manifest.get("period_start"), "manifest.period_start")
+                != policy.period_start
+            ):
+                raise MarketDataValidationError("manifest period_start does not match policy")
+            if (
+                _utc_timestamp(manifest.get("period_end"), "manifest.period_end")
+                != policy.period_end
+            ):
+                raise MarketDataValidationError("manifest period_end does not match policy")
 
     def iter_batches(
         self,

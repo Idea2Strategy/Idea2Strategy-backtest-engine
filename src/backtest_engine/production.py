@@ -215,9 +215,11 @@ class PostgresDatasetManifestSource:
             SELECT manifest.id, manifest.revision_number, manifest.status,
                    manifest.dataset_hash, manifest.schema_version,
                    manifest.period_start, manifest.period_end, manifest.available_at,
-                   feed.resolution AS feed_resolution
+                   provider.code AS provider_code, feed.code AS feed_code,
+                   manifest.data_layer, feed.resolution AS feed_resolution
               FROM market_data.dataset_manifests manifest
               JOIN market_data.feeds feed ON feed.id = manifest.feed_id
+              JOIN market_data.providers provider ON provider.id = feed.provider_id
              WHERE manifest.id = :manifest_id
             """
         )
@@ -226,7 +228,9 @@ class PostgresDatasetManifestSource:
             SELECT o.id AS storage_object_id, o.object_key, o.content_hash,
                    d.object_kind, d.partition_granularity, d.partition_start,
                    d.partition_end, d.period_start, d.period_end, d.shard_key,
-                   d.part_number, d.row_count, o.schema_version, o.status
+                   d.part_number, d.row_count, o.schema_version, o.status,
+                   o.storage_provider, o.bucket_name, o.provider_version_id,
+                   o.file_format, o.media_type
               FROM market_data.dataset_objects d
               JOIN storage.objects o ON o.id = d.object_id
              WHERE d.dataset_manifest_id = :manifest_id
@@ -246,6 +250,15 @@ class PostgresDatasetManifestSource:
             raise _unavailable_manifest(
                 f"dataset manifest {manifest_id} references a non-AVAILABLE object"
             )
+        if any(
+            item["storage_provider"] != "S3"
+            or not item["bucket_name"]
+            or not item["provider_version_id"]
+            for item in object_rows
+        ):
+            raise _unavailable_manifest(
+                f"dataset manifest {manifest_id} lacks immutable S3 version evidence"
+            )
         objects = [
             {
                 "storage_object_id": str(item["storage_object_id"]),
@@ -261,6 +274,11 @@ class PostgresDatasetManifestSource:
                 "part_number": int(item["part_number"]),
                 "row_count": int(item["row_count"]),
                 "schema_version": str(item["schema_version"]),
+                "storage_provider": str(item["storage_provider"]),
+                "bucket_name": str(item["bucket_name"]),
+                "provider_version_id": str(item["provider_version_id"]),
+                "file_format": str(item["file_format"]),
+                "media_type": str(item["media_type"]),
             }
             for item in object_rows
         ]
@@ -285,6 +303,9 @@ class PostgresDatasetManifestSource:
             "status": str(row["status"]),
             "dataset_hash": str(row["dataset_hash"]),
             "schema_id": str(row["schema_version"]),
+            "provider_code": str(row["provider_code"]),
+            "feed_code": str(row["feed_code"]),
+            "data_layer": str(row["data_layer"]),
             "resolution": resolution,
             "period_start": _utc_text(row["period_start"]),
             "period_end": _utc_text(row["period_end"]),
@@ -710,6 +731,15 @@ class S3ParquetMarketDataReader:
         for metadata in manifest.get("objects", []):
             key = str(metadata.get("object_key", ""))
             expected = str(metadata.get("content_hash", ""))
+            storage_provider = str(metadata.get("storage_provider", ""))
+            bucket = str(metadata.get("bucket_name", ""))
+            version_id = str(metadata.get("provider_version_id", ""))
+            if storage_provider != "S3":
+                raise ConfigurationError(f"market-data object is not stored in S3: {key}")
+            if bucket != self._bucket:
+                raise ConfigurationError(f"market-data object bucket does not match configuration: {key}")
+            if not version_id:
+                raise ConfigurationError(f"market-data object has no immutable provider version: {key}")
             target = self._target(key)
             if target.is_file():
                 with target.open("rb") as existing:
@@ -719,7 +749,7 @@ class S3ParquetMarketDataReader:
                 target.unlink()
             target.parent.mkdir(parents=True, exist_ok=True)
             temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.part")
-            response = self._client.get_object(Bucket=self._bucket, Key=key)
+            response = self._client.get_object(Bucket=bucket, Key=key, VersionId=version_id)
             body = response["Body"]
             try:
                 actual = self._copy_and_hash(body, temporary)

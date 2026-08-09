@@ -1,0 +1,79 @@
+{
+  "contract_id": "com06.dataset-manifest",
+  "schema_version": 1,
+  "manifest_id": "7f7113c9-3b02-4098-97ec-0baa07e2b3b0",
+  "dataset_id": "7f7113c9-3b02-4098-97ec-0baa07e2b3b0",
+  "revision": 1,
+  "status": "AVAILABLE",
+  "dataset_hash": "08a848a5f9aa1aac80e215c2d86bcf6d5f96c354400c7c16394dae9ffa9939af",
+  "schema_id": "market-bars/1",
+  "provider_code": "ALPACA",
+  "feed_code": "ALPACA_SIP_ALL_30M",
+  "data_layer": "ADJUSTED",
+  "resolution": "30m",
+  "period_start": "2024-01-01T00:00:00Z",
+  "period_end": "2024-02-01T00:00:00Z",
+  "available_at": "2026-07-30T06:00:29Z",
+  "objects": [
+    {
+      "storage_object_id": "de38b54e-d0fa-448d-bc56-fd11b21785af",
+      "object_key": "historical/provider=alpaca/feed=sip/adjustment=all/session=regular/resolution=30m/revision=00000001/year=2024/shard=00-of-08/manifest_id=7f7113c9-3b02-4098-97ec-0baa07e2b3b0/part-00001.parquet",
+      "content_hash": "256fc05e908c010e863d5ade3bff5776698a37d376605b2fbc2fc197203400d4",
+      "object_kind": "MARKET_BARS",
+      "partition_granularity": "YEAR",
+      "partition_start": "2024-01-01",
+      "partition_end": "2024-02-01",
+      "period_start": "2024-01-01T00:00:00Z",
+      "period_end": "2024-02-01T00:00:00Z",
+      "shard_key": "s00-of-8",
+      "part_number": 1,
+      "row_count": 0,
+      "schema_version": "market-bars/1",
+      "storage_provider": "S3",
+      "bucket_name": "idea2strategy-dev-418553863687-market-data",
+      "provider_version_id": "0jZPVZwe6fmVLMx9jT7sePpYAPETRnYs"
+    },
+    {
+      "storage_object_id": "509f6d2f-ce0e-45d8-b611-3a0669ae62e5",
+      "object_key": "historical/provider=alpaca/feed=sip/adjustment=all/session=regular/resolution=30m/revision=00000001/year=2024/shard=01-of-08/manifest_id=7f7113c9-3b02-4098-97ec-0baa07e2b3b0/part-00001.parquet",
+      "content_hash": "3c82aada0b061ae7c10ff7d46574409c2b5bdc1f48c7531ff467547a9c6d6501",
+      "object_kind": "MARKET_BARS", "partition_granularity": "YEAR", "partition_start": "2024-01-01", "partition_end": "2024-02-01", "period_start": "2024-01-01T00:00:00Z", "period_end": "2024-02-01T00:00:00Z", "shard_key": "s01-of-8", "part_number": 1, "row_count": 0, "schema_version": "market-bars/1", "storage_provider": "S3", "bucket_name": "idea2strategy-dev-418553863687-market-data", "provider_version_id": "hz6laNWy7BrFenHJ6GNOM9t089BOBeLc"
+    },
+    {
+      "storage_object_id": "b5f20f8e-9ced-427c-92b6-f40aabd91530",
+      "object_key": "historical/provider=alpaca/feed=sip/adjustment=all/session=regular/resolution=30m/revision=00000001/year=2024/shard=02-of-08/manifest_id=7f7113c9-3b02-4098-97ec-0baa07e2b3b0/part-00001.parquet",
+      "content_hash": "642897a31f11776bc6240db9aa6543bf046ee94eb14b40588df57e03ced6e215",
+      "object_kind": "MARKET_BARS", "partition_granularity": "YEAR", "partition_start": "2024-01-01", "partition_end": "2024-02-01", "period_start": "2024-01-01T00:00:00Z", "period_end": "2024-02-01T00:00:00Z", "shard_key": "s02-of-8", "part_number": 1, "row_count": 0, "schema_version": "market-bars/1", "storage_provider": "S3", "bucket_name": "idea2strategy-dev-418553863687-market-data", "provider_version_id": "TSekqXJZcU4vhtQPIR2_qa64Umjlp1mc"
+    },
+    {
+      "storage_object_id": "d8aa63e2-e278-4b89-804f-0b66182f2210",
+      "object_key": "historical/provider=alpaca/feed=sip/adjustment=all/session=regular/resolution=30m/revision=00000001/year=2024/shard=03-of-08/manifest_id=7f7113c9-3b02-4098-97ec-0baa07e2b3b0/part-00001.parquet",
+      "content_hash": "379a8e4b065e116fcc5fa5ab0108ac6365b5fe60f5c38c6b4055f38c89478f98",
+      "object_kind": "MARKET_BARS", "partition_granularity": "YEAR", "partition_start": "2024-01-01", "partition_end": "2024-02-01", "period_start": "2024-01-01T00:00:00Z", "period_end": "2024-02-01T00:00:00Z", "shard_key": "s03-of-8", "part_number": 1, "row_count": 0, "schema_version": "market-bars/1", "storage_provider": "S3", "bucket_name": "idea2strategy-dev-418553863687-market-data", "provider_version_id": "p8gqQQYFHac9AAKpU9f0FIrPqgjHo5a_"
+    },
+    {
+      "storage_object_id": "37d91ad1-36dc-45db-b611-3a0669ae62e5",
+      "object_key": "historical/provider=alpaca/feed=sip/adjustment=all/session=regular/resolution=30m/revision=00000001/year=2024/shard=04-of-08/manifest_id=7f7113c9-3b02-4098-97ec-0baa07e2b3b0/part-00001.parquet",
+      "content_hash": "216e4e0540acc13abb61a6e9f5e98703f3bd59fb7778b3513ad8c20841b11ea1",
+      "object_kind": "MARKET_BARS", "partition_granularity": "YEAR", "partition_start": "2024-01-01", "partition_end": "2024-02-01", "period_start": "2024-01-01T00:00:00Z", "period_end": "2024-02-01T00:00:00Z", "shard_key": "s04-of-8", "part_number": 1, "row_count": 546, "schema_version": "market-bars/1", "storage_provider": "S3", "bucket_name": "idea2strategy-dev-418553863687-market-data", "provider_version_id": "F9IO8ByKzDuFrF_EABssaa8mns0pDvPB"
+    },
+    {
+      "storage_object_id": "cbd6445f-db3b-43f2-b8ea-9ed0f4351056",
+      "object_key": "historical/provider=alpaca/feed=sip/adjustment=all/session=regular/resolution=30m/revision=00000001/year=2024/shard=05-of-08/manifest_id=7f7113c9-3b02-4098-97ec-0baa07e2b3b0/part-00001.parquet",
+      "content_hash": "dc491bfaede62887742e370e1726d216fbf0e91d9826e063fc66384be1491720",
+      "object_kind": "MARKET_BARS", "partition_granularity": "YEAR", "partition_start": "2024-01-01", "partition_end": "2024-02-01", "period_start": "2024-01-01T00:00:00Z", "period_end": "2024-02-01T00:00:00Z", "shard_key": "s05-of-8", "part_number": 1, "row_count": 0, "schema_version": "market-bars/1", "storage_provider": "S3", "bucket_name": "idea2strategy-dev-418553863687-market-data", "provider_version_id": "JW0mnJvrNQzVUP9I9h1dU2fPKl.0AWGN"
+    },
+    {
+      "storage_object_id": "23db3489-01ac-488b-8ed6-5a491d98b85a",
+      "object_key": "historical/provider=alpaca/feed=sip/adjustment=all/session=regular/resolution=30m/revision=00000001/year=2024/shard=06-of-08/manifest_id=7f7113c9-3b02-4098-97ec-0baa07e2b3b0/part-00001.parquet",
+      "content_hash": "c3f178e265101aa1c270f8361d32ffebb0ac98285ea7940da5e608a919d2b209",
+      "object_kind": "MARKET_BARS", "partition_granularity": "YEAR", "partition_start": "2024-01-01", "partition_end": "2024-02-01", "period_start": "2024-01-01T00:00:00Z", "period_end": "2024-02-01T00:00:00Z", "shard_key": "s06-of-8", "part_number": 1, "row_count": 0, "schema_version": "market-bars/1", "storage_provider": "S3", "bucket_name": "idea2strategy-dev-418553863687-market-data", "provider_version_id": "aTkdOrYbNNolS0HPg6YLMxSXRYuLo2nQ"
+    },
+    {
+      "storage_object_id": "1fbc2ce0-33ae-4de6-a5f0-aff0ec10a99f",
+      "object_key": "historical/provider=alpaca/feed=sip/adjustment=all/session=regular/resolution=30m/revision=00000001/year=2024/shard=07-of-08/manifest_id=7f7113c9-3b02-4098-97ec-0baa07e2b3b0/part-00001.parquet",
+      "content_hash": "2fbbdb9c5fceba3adf2705a2ed77ca1c451e3288c6e5df97866bf8dec9453866",
+      "object_kind": "MARKET_BARS", "partition_granularity": "YEAR", "partition_start": "2024-01-01", "partition_end": "2024-02-01", "period_start": "2024-01-01T00:00:00Z", "period_end": "2024-02-01T00:00:00Z", "shard_key": "s07-of-8", "part_number": 1, "row_count": 0, "schema_version": "market-bars/1", "storage_provider": "S3", "bucket_name": "idea2strategy-dev-418553863687-market-data", "provider_version_id": "5VxSqchVdkZQrha09_FdtrtdCP54mk9p"
+    }
+  ]
+}
