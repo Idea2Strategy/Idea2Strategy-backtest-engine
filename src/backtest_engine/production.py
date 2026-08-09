@@ -48,6 +48,7 @@ from backtest_engine.request_dispatch import (
     QueuedRunProjection,
 )
 from backtest_engine.wiring import (
+    JobNotSatisfiable,
     OrchestratorJobHandler,
     PersistenceExecutionKeyStore,
     PersistenceStorageObjectWritePort,
@@ -161,20 +162,44 @@ class PostgresCompiledPlanSource:
         return dict(document)
 
 
-def _dataset_id(object_keys: list[str]) -> str:
-    values = {
-        segment.removeprefix("dataset=")
-        for key in object_keys
-        for segment in key.split("/")
-        if segment.startswith("dataset=")
-    }
-    if len(values) != 1:
-        raise ConfigurationError("dataset manifest object keys must bind one logical dataset= UUID")
+def _unavailable_manifest(message: str) -> JobNotSatisfiable:
+    return JobNotSatisfiable(message, reason_code="REQUIRED_INPUT_UNAVAILABLE")
+
+
+def _dataset_id(object_keys: list[str], manifest_id: uuid.UUID) -> str:
+    bindings: list[tuple[str, str]] = []
+    for key in object_keys:
+        key_bindings = [
+            (name, segment.removeprefix(f"{name}="))
+            for segment in key.split("/")
+            for name in ("dataset", "manifest_id")
+            if segment.startswith(f"{name}=")
+        ]
+        if len(key_bindings) != 1:
+            raise _unavailable_manifest(
+                "dataset manifest object keys must each bind exactly one dataset= or manifest_id= UUID"
+            )
+        bindings.extend(key_bindings)
+
+    conventions = {name for name, _value in bindings}
+    values = {value for _name, value in bindings}
+    if len(conventions) != 1 or len(values) != 1:
+        raise _unavailable_manifest(
+            "dataset manifest object keys must use one binding convention and one UUID"
+        )
+    convention = conventions.pop()
     value = values.pop()
     try:
-        return str(uuid.UUID(value))
+        resolved = uuid.UUID(value)
     except ValueError as exc:
-        raise ConfigurationError(f"dataset object key contains invalid dataset id: {value}") from exc
+        raise _unavailable_manifest(
+            f"dataset manifest object key contains an invalid {convention} UUID: {value}"
+        ) from exc
+    if convention == "manifest_id" and resolved != manifest_id:
+        raise _unavailable_manifest(
+            f"legacy dataset object key binds manifest {resolved}, expected {manifest_id}"
+        )
+    return str(resolved)
 
 
 class PostgresDatasetManifestSource:
@@ -212,10 +237,14 @@ class PostgresDatasetManifestSource:
             if row is None:
                 return None
             object_rows = list(connection.execute(objects_sql, {"manifest_id": manifest_id}).mappings())
+        if row["status"] != "AVAILABLE":
+            raise _unavailable_manifest(f"dataset manifest {manifest_id} is not AVAILABLE")
         if not object_rows:
-            raise ConfigurationError(f"dataset manifest {manifest_id} has no objects")
+            raise _unavailable_manifest(f"dataset manifest {manifest_id} has no objects")
         if any(item["status"] != "AVAILABLE" for item in object_rows):
-            raise ConfigurationError(f"dataset manifest {manifest_id} references a non-AVAILABLE object")
+            raise _unavailable_manifest(
+                f"dataset manifest {manifest_id} references a non-AVAILABLE object"
+            )
         objects = [
             {
                 "storage_object_id": str(item["storage_object_id"]),
@@ -236,21 +265,21 @@ class PostgresDatasetManifestSource:
         ]
         available_at = row["available_at"]
         if available_at is None:
-            raise ConfigurationError(f"dataset manifest {manifest_id} has no available_at evidence")
+            raise _unavailable_manifest(f"dataset manifest {manifest_id} has no available_at evidence")
         raw_resolution = str(row["feed_resolution"])
         try:
             resolution = bar_resolution(raw_resolution)
         except ValueError:
             resolution = raw_resolution
         if resolution not in {"30m", "1h", "4h", "1d"}:
-            raise ConfigurationError(
+            raise _unavailable_manifest(
                 f"dataset manifest {manifest_id} has unsupported production resolution {raw_resolution}"
             )
         return {
             "contract_id": "com06.dataset-manifest",
             "schema_version": 1,
             "manifest_id": str(row["id"]),
-            "dataset_id": _dataset_id([item["object_key"] for item in objects]),
+            "dataset_id": _dataset_id([item["object_key"] for item in objects], manifest_id),
             "revision": int(row["revision_number"]),
             "status": str(row["status"]),
             "dataset_hash": str(row["dataset_hash"]),
