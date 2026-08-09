@@ -39,7 +39,7 @@ from backtest_engine.wiring import (
     JobNotSatisfiable,
     OrchestratorJobHandler,
 )
-from backtest_engine.worker import JobContext
+from backtest_engine.worker import JobContext, JobResult
 from d_reproducibility_testkit import (
     BAR,
     CLOSES,
@@ -735,6 +735,39 @@ def _context() -> JobContext:
         message_id="message-1",
         worker_id="worker-1",
     )
+
+
+def test_contract_invalid_compiled_plan_is_one_terminal_binding_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact Development failure cannot be repaired by SQS redelivery."""
+    invalid_plan = _plan_document()
+    invalid_plan["executionSnapshot"]["initialCashAmount"] = "100000"
+    envelope = _envelope(pins=[])
+    handler = _handler(Source({}), Reader(b""))
+    handler._plans = StaticCompiledPlanSource(
+        {invalid_plan["planChecksum"]: invalid_plan}
+    )
+
+    class Sink:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        def publish(self, event: Any, *, delivery_attempt: int) -> None:
+            self.events.append(dict(event) | {"deliveryAttempt": delivery_attempt})
+
+    sink = Sink()
+    handler._sink = sink
+    monkeypatch.setattr(JobEnvelope, "parse", classmethod(lambda _cls, _job: envelope))
+
+    outcome = handler({}, _context())
+
+    assert outcome.result is JobResult.PERMANENT_FAILURE
+    assert outcome.reason_code == "PLAN_CONTRACT_INVALID"
+    assert len(sink.events) == 1
+    assert sink.events[0]["status"] == "FAILED"
+    assert sink.events[0]["failureCode"] == "PLAN_CONTRACT_INVALID"
+    assert sink.events[0]["retryable"] is False
 
 
 def test_job_binding_attaches_only_fully_verified_feature_series() -> None:

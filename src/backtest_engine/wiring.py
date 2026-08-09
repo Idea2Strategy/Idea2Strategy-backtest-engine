@@ -75,6 +75,7 @@ from .attempt_coordinator import (
 from .basic_runtime import (
     BasicCompiledPlan,
     BasicDecisionStatus,
+    BasicPlanCompatibilityError,
     BasicPlanReplay,
     BasicPlanRuntime,
     PlanEvaluation,
@@ -1598,7 +1599,16 @@ class OrchestratorJobHandler:
                 reason_code="REQUIRED_INPUT_UNAVAILABLE",
             )
         manifest = primary[0][1]
-        plan = self._runtime.load(plan_document, compiled_plan_checksum=plan_checksum)
+        try:
+            plan = self._runtime.load(plan_document, compiled_plan_checksum=plan_checksum)
+        except BasicPlanCompatibilityError as exc:
+            # The plan is immutable and addressed by its checksum. A schema,
+            # integrity, or catalog incompatibility therefore cannot become
+            # valid when SQS redelivers the same message. Translate it at the
+            # binding boundary so the existing terminal-result path records
+            # the precise plan-load failure once instead of retrying a
+            # deterministic producer/consumer mismatch to exhaustion.
+            raise JobNotSatisfiable(str(exc), reason_code=exc.failure.value) from exc
         if plan.reference_series[1] == "$DATASET":
             dataset_resolution = str(manifest.get("resolution", ""))
             if dataset_resolution not in {"30m", "1h", "4h", "1d"}:
