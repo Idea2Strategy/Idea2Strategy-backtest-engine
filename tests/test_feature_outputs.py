@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -768,6 +769,57 @@ def test_contract_invalid_compiled_plan_is_one_terminal_binding_failure(
     assert sink.events[0]["status"] == "FAILED"
     assert sink.events[0]["failureCode"] == "PLAN_CONTRACT_INVALID"
     assert sink.events[0]["retryable"] is False
+
+
+def test_incompatible_development_windows_are_one_terminal_binding_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact INT03 policy/manifest/calendar tuple cannot improve on redelivery."""
+    policy = replace(
+        E2E_EXECUTION_POLICY,
+        version="development-official-backtest-2026-q3-v1",
+        release_quarter="2026-Q3",
+        period_start=datetime(2016, 7, 1, 4, tzinfo=UTC),
+        period_end=datetime(2026, 7, 1, 4, tzinfo=UTC),
+    )
+    market_bytes = market_bars_parquet()
+    manifest = dataset_manifest(
+        hashlib.sha256(market_bytes).hexdigest(),
+        row_count=len(CLOSES),
+        coverage_end=EVALUATION_THROUGH,
+    )
+    manifest["period_start"] = "2024-01-01T05:00:00Z"
+    manifest["period_end"] = "2024-02-01T05:00:00Z"
+    handler = _handler(Source({}), Reader(b""))
+    handler._policies = ExecutionPolicyCatalog([policy])
+    handler._manifests = StaticDatasetManifestSource({DATASET_MANIFEST_ID: manifest})
+    envelope = replace(_envelope(pins=[]), execution_policy_version=policy.version)
+
+    class Sink:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        def publish(self, event: Any, *, delivery_attempt: int) -> None:
+            self.events.append(dict(event) | {"deliveryAttempt": delivery_attempt})
+
+    sink = Sink()
+    handler._sink = sink
+    monkeypatch.setattr(JobEnvelope, "parse", classmethod(lambda _cls, _job: envelope))
+
+    with pytest.raises(JobNotSatisfiable) as failure:
+        handler.bind(envelope, _context())
+    assert "dataset manifest period" in str(failure.value)
+    assert "2016-07-01 is outside the pinned XNYS coverage" in str(failure.value)
+
+    outcome = handler({}, _context())
+
+    assert outcome.result is JobResult.PERMANENT_FAILURE
+    assert outcome.reason_code == "REQUIRED_INPUT_UNAVAILABLE"
+    assert len(sink.events) == 1
+    assert sink.events[0]["status"] == "FAILED"
+    assert sink.events[0]["failureCode"] == "REQUIRED_INPUT_UNAVAILABLE"
+    assert sink.events[0]["retryable"] is False
+    assert sink.events[0]["deliveryAttempt"] == 1
 
 
 def test_job_binding_attaches_only_fully_verified_feature_series() -> None:
