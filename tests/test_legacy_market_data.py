@@ -17,6 +17,7 @@ from backtest_engine.legacy_market_data import (
     validate_legacy_market_loader_manifest,
 )
 from backtest_engine.market_data import MarketDataValidationError, ParquetMarketDataReader
+from backtest_engine.object_store.paths import long_path
 from backtest_engine.wiring import require_compatible_execution_window
 from d_market_data_testkit import write_small_market_bars
 
@@ -121,8 +122,9 @@ def test_reader_consumes_legacy_parquet_without_weakening_the_canonical_path(
         / "resolution=30m/revision=00000001/year=2024/shard=00-of-01"
         / "manifest_id=11111111-1111-4111-8111-111111111111"
     )
-    key_root.mkdir(parents=True)
-    fixture = write_small_market_bars(key_root / "part-00001.parquet")
+    extended_key_root = Path(long_path(key_root))
+    extended_key_root.mkdir(parents=True)
+    fixture = write_small_market_bars(extended_key_root / "part-00001.parquet")
     table = pq.read_table(fixture.path).replace_schema_metadata(
         {b"schema_version": b"market-bars/1", b"processing_version": b"market-loader/1.0.0"}
     )
