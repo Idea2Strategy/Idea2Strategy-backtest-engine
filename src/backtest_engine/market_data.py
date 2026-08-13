@@ -30,6 +30,7 @@ import pyarrow.parquet as pq
 
 from .contracts import ContractValidationError, validate_dataset_manifest
 from .execution_policy import ExecutionPolicy
+from .object_store.paths import long_path
 from .legacy_market_data import (
     LEGACY_MARKET_SCHEMA_ID,
     is_legacy_market_loader_manifest,
@@ -106,9 +107,10 @@ class ParquetMarketDataReader:
             candidate.relative_to(self.object_root)
         except ValueError as exc:
             raise MarketDataValidationError("object_key escapes object root") from exc
-        if not candidate.is_file():
+        filesystem_path = Path(long_path(candidate))
+        if not filesystem_path.is_file():
             raise MarketDataValidationError(f"object missing: {object_key}")
-        return candidate
+        return filesystem_path
 
     @staticmethod
     def _verify_schema(schema: pa.Schema, policy: ExecutionPolicy) -> None:
