@@ -27,7 +27,7 @@ import re
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 import pytest
 from sqlalchemy import Connection, Engine, create_engine
@@ -47,6 +47,10 @@ POSTGRES_IMAGE = os.environ.get("BACKTEST_TEST_POSTGRES_IMAGE", "postgres:16-alp
 LOCALSTACK_IMAGE = os.environ.get("BACKTEST_TEST_LOCALSTACK_IMAGE", "localstack/localstack:4.7.0")
 
 _VERSION = re.compile(r"^V(?P<version>[0-9]+)__")
+_COPY_FROM_STDIN = re.compile(r"(?m)^COPY [^\r\n]+ FROM stdin;\r?\n")
+_COPY_TERMINATOR = re.compile(r"(?m)^\\\.\r?(?:\n|$)")
+
+type ScriptChunk = tuple[Literal["sql"], str] | tuple[Literal["copy"], tuple[str, str]]
 
 _BACKTEST_TABLES = (
     "backtest.run_input_pins",
@@ -167,6 +171,27 @@ def _apply_reference_seed(url: str) -> None:
     _execute_scripts(url, [REFERENCE_SEED.read_text(encoding="utf-8")])
 
 
+def _split_copy_from_stdin(script: str) -> Iterator[ScriptChunk]:
+    """Split pg_dump COPY blocks from SQL that psycopg can execute normally."""
+
+    offset = 0
+    while copy_header := _COPY_FROM_STDIN.search(script, offset):
+        if copy_header.start() > offset:
+            yield "sql", script[offset : copy_header.start()]
+
+        terminator = _COPY_TERMINATOR.search(script, copy_header.end())
+        if terminator is None:
+            raise ValueError("unterminated COPY FROM stdin block")
+
+        statement = copy_header.group(0).rstrip("\r\n")
+        payload = script[copy_header.end() : terminator.start()]
+        yield "copy", (statement, payload)
+        offset = terminator.end()
+
+    if offset < len(script):
+        yield "sql", script[offset:]
+
+
 def _execute_scripts(url: str, scripts: list[str]) -> None:
     """Run whole SQL scripts through the raw driver cursor.
 
@@ -181,7 +206,13 @@ def _execute_scripts(url: str, scripts: list[str]) -> None:
         try:
             cursor = raw.cursor()
             for script in scripts:
-                cursor.execute(script)
+                for kind, chunk in _split_copy_from_stdin(script):
+                    if kind == "sql":
+                        cursor.execute(chunk)
+                    else:
+                        statement, payload = cast(tuple[str, str], chunk)
+                        with cursor.copy(statement) as copy:
+                            copy.write(payload)
                 # Flyway commits each versioned migration before applying the next.
                 # This is required when a later migration uses an enum value added
                 # by its predecessor, which PostgreSQL rejects in one transaction.
