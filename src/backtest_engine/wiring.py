@@ -1324,13 +1324,23 @@ def _condition_outcomes(evaluation: PlanEvaluation) -> tuple[ConditionOutcome, .
     outcomes: list[ConditionOutcome] = []
     for decision in evaluation.decisions:
         for trace in decision.trace:
-            outcomes.append(ConditionOutcome(f"{decision.instrument_id}|{trace.step_id}", trace.passed))
+            outcomes.append(
+                ConditionOutcome(
+                    f"{decision.flow_id}|{decision.instrument_id}|{trace.step_id}",
+                    trace.passed,
+                )
+            )
         if decision.status is BasicDecisionStatus.INPUT_MISSING and not decision.trace:
             # An instrument the plan never received data for produced no step
             # trace at all; without this the month would report "no failures" for
             # an evaluation that never ran. A warm-up shortfall *does* leave a
             # trace entry, and that entry is already the failure.
-            outcomes.append(ConditionOutcome(f"{decision.instrument_id}|{decision.first_failure_step_id}", False))
+            outcomes.append(
+                ConditionOutcome(
+                    f"{decision.flow_id}|{decision.instrument_id}|{decision.first_failure_step_id}",
+                    False,
+                )
+            )
     return tuple(outcomes)
 
 
@@ -1549,6 +1559,13 @@ class OrchestratorJobHandler:
         try:
             binding = self.bind(envelope, context)
         except JobNotSatisfiable as exc:
+            _LOGGER.warning(
+                "backtest job is not satisfiable run_id=%s attempt=%s reason_code=%s detail=%s",
+                envelope.run_id,
+                context.attempt_number,
+                exc.reason_code,
+                exc,
+            )
             try:
                 self._publish(
                     envelope,
