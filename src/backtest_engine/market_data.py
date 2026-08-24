@@ -37,6 +37,7 @@ from .legacy_market_data import (
     legacy_period_matches,
     validate_legacy_market_loader_manifest,
 )
+from .object_store.paths import long_path
 
 
 __all__ = [
