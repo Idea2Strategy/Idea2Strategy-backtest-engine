@@ -30,7 +30,6 @@ import pyarrow.parquet as pq
 
 from .contracts import ContractValidationError, validate_dataset_manifest
 from .execution_policy import ExecutionPolicy
-from .object_store.paths import long_path
 from .legacy_market_data import (
     LEGACY_MARKET_SCHEMA_ID,
     is_legacy_market_loader_manifest,
