@@ -200,6 +200,35 @@ def test_the_published_job_carries_the_identity_the_worker_needs(
     assert message["featureMaterializations"] == official_request["featureMaterializations"]
 
 
+def test_feature_materialization_pins_are_part_of_the_fingerprint_and_stored_bundle(
+    service: BacktestLifecycleService, official_request: dict[str, Any]
+) -> None:
+    first = service.accept(official_request)
+    gateway = service.gateway
+    assert isinstance(gateway, InMemoryRunGateway)
+
+    stored = gateway.features_of(first.run.backtest_run_id)
+    assert [
+        {
+            "featureMaterializationId": str(item.feature_materialization_id),
+            "lockedResultHash": item.locked_result_hash,
+        }
+        for item in stored
+    ] == official_request["featureMaterializations"]
+
+    changed = json.loads(json.dumps(official_request))
+    changed["featureMaterializations"][0]["lockedResultHash"] = "sha256:" + "8" * 64
+    comparison_service = replace(
+        service,
+        gateway=InMemoryRunGateway(),
+        queue=InMemoryBacktestJobQueue(),
+    )
+
+    second = comparison_service.accept(changed)
+
+    assert second.run.run.configuration_hash != first.run.run.configuration_hash
+
+
 def test_redelivery_does_not_dispatch_a_second_job(
     service: BacktestLifecycleService, official_request: dict[str, Any]
 ) -> None:

@@ -22,6 +22,7 @@ import pytest
 from backtest_engine.basic_runtime import (
     COMPILER_VERSION,
     INSTRUMENT_CATALOG_VERSIONS,
+    LIVE_SERIES_BARS,
     PLAN_SCHEMA_VERSION,
     RUNTIME_SCHEMA_VERSION,
     BasicDecisionStatus,
@@ -807,6 +808,24 @@ def test_a_declared_floor_above_the_definition_window_widens_the_warm_up() -> No
     )
 
     assert requirements[0].warmup_from == _utc("2025-11-28T14:05:00Z")
+
+
+def test_a_feature_warmup_at_the_live_cache_boundary_is_supported() -> None:
+    plan = _runtime().load(
+        _resealed(_set_feature(requiredObservations=LIVE_SERIES_BARS))
+    )
+
+    assert plan.required_features[0].warmup_bars == LIVE_SERIES_BARS
+
+
+def test_a_feature_warmup_beyond_the_live_cache_is_rejected_before_execution() -> None:
+    with pytest.raises(BasicPlanCompatibilityError) as raised:
+        _runtime().load(
+            _resealed(_set_feature(requiredObservations=LIVE_SERIES_BARS + 1))
+        )
+
+    assert raised.value.failure is PlanLoadFailure.PLAN_CONTRACT_INVALID
+    assert "live series cache" in str(raised.value)
 
 
 # ---------------------------------------------------------------------------

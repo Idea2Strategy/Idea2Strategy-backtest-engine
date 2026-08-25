@@ -223,6 +223,22 @@ def test_bs_published_release_creates_exactly_one_run_row(
 
     assert outcome.disposition is IntakeDisposition.ACCEPTED_CREATED
     assert outcome.backtest_run_id == B_RUN_ID
+    stored_features = sql_all(
+        admin_engine,
+        "SELECT f.feature_materialization_id, f.locked_result_hash "
+        "FROM backtest.input_feature_materializations f "
+        "JOIN backtest.input_bundles b ON b.id = f.input_bundle_id "
+        "WHERE b.run_id = :run_id ORDER BY f.feature_materialization_id",
+        run_id=B_RUN_ID,
+    )
+    assert stored_features == [
+        {
+            "feature_materialization_id": UUID(
+                published["featureMaterializations"][0]["featureMaterializationId"]
+            ),
+            "locked_result_hash": published["featureMaterializations"][0]["lockedResultHash"],
+        }
+    ]
 
     rows = _runs(admin_engine)
     assert len(rows) == 1

@@ -109,18 +109,18 @@ EXPECTED_RUN_ID = "76a6a20c-0651-5748-8187-6bf0ae155194"
 
 #: `backtest.runs.configuration_hash`, published as `inputBundleFingerprint`.
 EXPECTED_INPUT_BUNDLE_FINGERPRINT = (
-    "sha256:0484507333bdd0b424f5f47ec07f3e511c0b4cc0b22a4c77f7499b19a0a6b4e4"
+    "sha256:8b73c1ad86cf42c2360989ecb14b225a95e191eccd9c8a7e3f6ead8ef84add25"
 )
 
 #: `RunSnapshot.snapshot_id`: the pinned run inputs.
-EXPECTED_RUN_SNAPSHOT_ID = "64552e4eb0262d1ee990d3238350ab0121281d145fd76d3da8488a3f2aa51e8c"
+EXPECTED_RUN_SNAPSHOT_ID = "75fd83d0c9cd6356a9c0ed1db9833881f19a0a136042bf96d82617085ba64348"
 
 #: `backtest.performance_summaries.result_hash`.
-EXPECTED_RESULT_HASH = "2bc8eb4749807ca943fb9424812031d8f81198fdc1fb40a517460f42730f668c"
+EXPECTED_RESULT_HASH = "ce53f523451e506c2ec8264043b9221729eefe8c2040088883a30dc922d56c08"
 
 #: `storage.objects.content_hash` of the TRADE_DETAIL Parquet part.
 EXPECTED_TRADE_DETAIL_CONTENT_HASH = (
-    "9cb8608fc80c88f6cda731660f9bb79aceee5fdfbd26b687a0d7ff907e23b6ac"
+    "28977f43a1a3cb811538affd6a2a98903641060089b24e2de48d84d925be5629"
 )
 
 

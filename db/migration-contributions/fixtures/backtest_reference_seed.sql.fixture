@@ -132,6 +132,30 @@ VALUES ('00000000-0000-4000-8000-0000000000e1', '00000000-0000-4000-8000-0000000
         'rh0000000000000000000000000000000000000000000000000000000000000e1',
         'SUCCEEDED', '2026-01-01T00:10:00+00', '2026-01-01T00:00:00+00');
 
+-- B's frozen OFFICIAL_BACKTEST_REQUESTED fixture pins this exact upstream
+-- materialization. It must exist before D can atomically persist the normalized
+-- input bundle; otherwise the production foreign key correctly rejects the pin.
+INSERT INTO market_data.pipeline_runs (
+  id, pipeline_code, pipeline_version, idempotency_key, status, input_hash, output_hash,
+  started_at, completed_at)
+VALUES ('00000000-0000-4000-8000-000000000097', 'FEATURE_MATERIALIZE', '1.0.0',
+        'FIXTURE:FEATURE:B-RELEASE', 'SUCCEEDED',
+        'in000000000000000000000000000000000000000000000000000000000000097',
+        'ou000000000000000000000000000000000000000000000000000000000000097',
+        '2026-07-31T11:50:00+00', '2026-07-31T12:00:00+00');
+
+INSERT INTO market_data.feature_materializations (
+  id, feature_definition_id, instrument_id, pipeline_run_id, input_dataset_set_hash,
+  period_start, period_end, source_watermark, output_dataset_manifest_id, result_hash,
+  status, available_at, created_at)
+VALUES ('00000000-0000-4000-8000-000000000215', '00000000-0000-4000-8000-000000000095',
+        '00000000-0000-4000-8000-000000000093', '00000000-0000-4000-8000-000000000097',
+        'is00000000000000000000000000000000000000000000000000000000000215',
+        '2026-07-01T04:00:00+00', '2026-10-01T04:00:00+00', 'watermark-b-release',
+        '00000000-0000-4000-8000-000000000203',
+        'sha256:5555555555555555555555555555555555555555555555555555555555555555',
+        'SUCCEEDED', '2026-07-31T12:00:00+00', '2026-07-31T11:59:00+00');
+
 INSERT INTO storage.objects (
   id, status, storage_provider, bucket_name, object_key, provider_version_id,
   content_hash, byte_size, file_format, compression_codec, media_type, schema_version,

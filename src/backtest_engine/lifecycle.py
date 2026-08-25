@@ -58,6 +58,8 @@ from .persistence.errors import RowNotFound
 from .persistence.rows import (
     DetailManifestRow,
     InputBundleRow,
+    InputDatasetRow,
+    InputFeatureMaterializationRow,
     MonthlyJudgmentSummaryRow,
     PerformanceSummaryRow,
     RunAttemptRow,
@@ -377,7 +379,13 @@ class SqsBacktestJobQueue:
 class RunGateway(Protocol):
     """Everything the lifecycle needs from durable storage, in one transaction each."""
 
-    def accept(self, row: RunRow, pins: RunInputPinRow) -> tuple[RunRow, bool]: ...
+    def accept(
+        self,
+        row: RunRow,
+        pins: RunInputPinRow,
+        datasets: Sequence[InputDatasetRow] = (),
+        features: Sequence[InputFeatureMaterializationRow] = (),
+    ) -> tuple[RunRow, bool]: ...
 
     def get(self, run_id: UUID) -> RunRow: ...
 
@@ -416,7 +424,13 @@ class PersistenceRunGateway:
         with self._persistence.read_only() as uow:
             yield uow
 
-    def accept(self, row: RunRow, pins: RunInputPinRow) -> tuple[RunRow, bool]:
+    def accept(
+        self,
+        row: RunRow,
+        pins: RunInputPinRow,
+        datasets: Sequence[InputDatasetRow] = (),
+        features: Sequence[InputFeatureMaterializationRow] = (),
+    ) -> tuple[RunRow, bool]:
         """Insert the run and its pinned request inputs in **one** transaction.
 
         Not two calls: a run whose `backtest.run_input_pins` row is missing cannot
@@ -440,8 +454,8 @@ class PersistenceRunGateway:
                         as_of_at=pins.pinned_at,
                         locked_at=pins.pinned_at,
                     ),
-                    datasets=(),
-                    features=(),
+                    datasets=datasets,
+                    features=features,
                 )
                 uow.pins.pin(pins)
                 return accepted, created
@@ -544,6 +558,8 @@ class InMemoryRunGateway:
         self._by_key: dict[str, UUID] = {}
         self._attempts: dict[UUID, list[RunAttemptRow]] = {}
         self._pins: dict[UUID, RunInputPinRow] = {}
+        self._datasets: dict[UUID, tuple[InputDatasetRow, ...]] = {}
+        self._features: dict[UUID, tuple[InputFeatureMaterializationRow, ...]] = {}
         self._lock = threading.RLock()
 
     def pins_of(self, run_id: UUID) -> RunInputPinRow | None:
@@ -552,7 +568,19 @@ class InMemoryRunGateway:
         with self._lock:
             return self._pins.get(run_id)
 
-    def accept(self, row: RunRow, pins: RunInputPinRow) -> tuple[RunRow, bool]:
+    def features_of(self, run_id: UUID) -> tuple[InputFeatureMaterializationRow, ...]:
+        """Test seam for the normalized feature pins stored with a run."""
+
+        with self._lock:
+            return self._features.get(run_id, ())
+
+    def accept(
+        self,
+        row: RunRow,
+        pins: RunInputPinRow,
+        datasets: Sequence[InputDatasetRow] = (),
+        features: Sequence[InputFeatureMaterializationRow] = (),
+    ) -> tuple[RunRow, bool]:
         if pins.run_id != row.id:
             raise IdempotencyConflict(f"pinned inputs belong to run {pins.run_id}, not {row.id}")
         with self._lock:
@@ -588,6 +616,8 @@ class InMemoryRunGateway:
             self._runs[row.id] = row
             self._by_key[row.idempotency_key] = row.id
             self._pins[row.id] = pins
+            self._datasets[row.id] = tuple(datasets)
+            self._features[row.id] = tuple(features)
             return row, True
 
     def get(self, run_id: UUID) -> RunRow:
@@ -715,9 +745,11 @@ class BacktestLifecycleService:
         """
         resolved_plan = compiled_plan if compiled_plan is not None else self._resolve_plan(request)
         validated = validate_official_backtest_request(request, compiled_plan=resolved_plan)
-        row, pins, message = self._build_run(validated, compiled_plan=resolved_plan)
+        row, pins, datasets, features, message = self._build_run(
+            validated, compiled_plan=resolved_plan
+        )
 
-        run_row, created = self.gateway.accept(row, pins)
+        run_row, created = self.gateway.accept(row, pins, datasets, features)
         dispatched = False
         if created:
             self.queue.publish(message)
@@ -743,7 +775,13 @@ class BacktestLifecycleService:
         request: Mapping[str, Any],
         *,
         compiled_plan: Mapping[str, Any] | None,
-    ) -> tuple[RunRow, RunInputPinRow, dict[str, Any]]:
+    ) -> tuple[
+        RunRow,
+        RunInputPinRow,
+        tuple[InputDatasetRow, ...],
+        tuple[InputFeatureMaterializationRow, ...],
+        dict[str, Any],
+    ]:
         missing: list[str] = []
 
         bot_id = UUID(request["botId"])
@@ -778,6 +816,13 @@ class BacktestLifecycleService:
 
         assert plan is not None and manifest is not None and owner_account_id is not None
 
+        raw_feature_pins = sorted(
+            copy.deepcopy(list(request.get("featureMaterializations", ()))),
+            key=lambda item: (item["featureMaterializationId"], item["lockedResultHash"]),
+        )
+        feature_materialization_version = "sha256:" + hashlib.sha256(
+            _canonical({"featureMaterializations": raw_feature_pins}).encode("utf-8")
+        ).hexdigest()
         bundle = {
             "botId": str(bot_id),
             "ownerAccountId": str(owner_account_id),
@@ -785,7 +830,10 @@ class BacktestLifecycleService:
             "compiledPlanChecksum": checksum,
             "datasetManifestId": str(manifest_id),
             "datasetHash": _prefixed(manifest["dataset_hash"]),
-            "featureMaterializationVersion": str(manifest["schema_id"]),
+            # v1 already fingerprints this field. Bind it to the exact, sorted
+            # feature pins instead of a dataset schema label so a pin ID or
+            # result hash change necessarily changes the run identity.
+            "featureMaterializationVersion": feature_materialization_version,
             "executionPolicyVersion": policy.version,
             "precisionRulesVersion": policy.precision_rules_version,
         }
@@ -842,6 +890,22 @@ class BacktestLifecycleService:
             execution_policy_version=policy.version,
             pinned_at=occurred_at,
         )
+        datasets = (
+            InputDatasetRow(
+                input_bundle_id=pins.input_bundle_id,
+                dataset_manifest_id=manifest_id,
+                purpose_code="MARKET_BARS",
+                locked_dataset_hash=_prefixed(manifest["dataset_hash"]),
+            ),
+        )
+        features = tuple(
+            InputFeatureMaterializationRow(
+                input_bundle_id=pins.input_bundle_id,
+                feature_materialization_id=UUID(item["featureMaterializationId"]),
+                locked_result_hash=item["lockedResultHash"],
+            )
+            for item in raw_feature_pins
+        )
         message = {
             "backtestRunId": str(run_id),
             "inputBundleId": str(pins.input_bundle_id),
@@ -853,11 +917,9 @@ class BacktestLifecycleService:
             "compiledPlanChecksum": checksum,
             "datasetManifestId": str(manifest_id),
             "expectedSnapshotHash": request["expectedSnapshotHash"],
-            "featureMaterializations": copy.deepcopy(
-                list(request.get("featureMaterializations", ()))
-            ),
+            "featureMaterializations": raw_feature_pins,
         }
-        return row, pins, message
+        return row, pins, datasets, features, message
 
     # -- queries ----------------------------------------------------------
 

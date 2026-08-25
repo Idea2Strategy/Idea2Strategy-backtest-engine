@@ -765,6 +765,13 @@ class BasicPlanRuntime:
                     definition_bars=definition.required_bars,
                 )
             )
+            if features[-1].warmup_bars > LIVE_SERIES_BARS:
+                raise _reject(
+                    PlanLoadFailure.PLAN_CONTRACT_INVALID,
+                    f"requiredFeature {entry['requirementId']!r} needs "
+                    f"{features[-1].warmup_bars} observations, but the live series cache "
+                    f"supports at most {LIVE_SERIES_BARS}",
+                )
         return tuple(features)
 
     @staticmethod
