@@ -95,7 +95,7 @@ def projection(request: dict[str, Any], lane: RequestLane) -> QueuedRunProjectio
                 request["periods"][0]["featureMaterializations"]
                 if lane is RequestLane.COMPETITION
                 else request["featureMaterializations"]
-                if lane is RequestLane.BASIC
+                if lane in {RequestLane.BASIC, RequestLane.CUSTOM}
                 else ()
             )
         ),

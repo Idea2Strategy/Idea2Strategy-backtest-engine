@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from time import sleep
+from time import monotonic, sleep
 from typing import Any, BinaryIO
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -58,6 +58,25 @@ from backtest_engine.wiring import (
 
 class ConfigurationError(RuntimeError):
     """A production process cannot safely start with the supplied configuration."""
+
+
+class MonotonicUtcClock:
+    """UTC instants that cannot regress when the host wall clock is corrected."""
+
+    def __init__(
+        self,
+        wall_clock: Callable[[], datetime] | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
+    ) -> None:
+        source = wall_clock or (lambda: datetime.now(UTC))
+        self._monotonic = monotonic_clock or monotonic
+        self._anchor = source()
+        self._started = self._monotonic()
+        self._elapsed = 0.0
+
+    def __call__(self) -> datetime:
+        self._elapsed = max(self._monotonic() - self._started, self._elapsed)
+        return self._anchor + timedelta(seconds=self._elapsed)
 
 
 def _required(environ: Mapping[str, str], name: str) -> str:
@@ -1032,6 +1051,7 @@ def orchestrator_job_handler(
 
     engine = _engine(environ)
     persistence = BacktestPersistence(engine)
+    wall_clock = MonotonicUtcClock()
     return OrchestratorJobHandler(
         persistence=persistence,
         policies=execution_policy_catalog(environ),
@@ -1054,6 +1074,6 @@ def orchestrator_job_handler(
         fractional_policy=policy.fractional,
         risk_limits=policy.risk_limits,
         runtime=BasicPlanRuntime(),
-        wall_clock=lambda: datetime.now(UTC),
+        wall_clock=wall_clock,
         correlation_id=correlation_id,
     )

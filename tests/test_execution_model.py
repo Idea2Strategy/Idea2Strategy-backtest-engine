@@ -638,6 +638,7 @@ def test_gtd_beyond_the_canonical_order_horizon_is_rejected_with_a_reason_code()
 
     assert rejected.status is OrderStatus.REJECTED
     assert rejected.reason_code == "ORDER_HORIZON_EXCEEDED"
+    assert model._open_order_ids == set()
 
 
 def test_gtd_exactly_on_the_horizon_boundary_is_accepted() -> None:

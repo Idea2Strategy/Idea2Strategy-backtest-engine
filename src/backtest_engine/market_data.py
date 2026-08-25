@@ -19,6 +19,8 @@ stricter producer-side validator can be injected during integration.
 from __future__ import annotations
 
 import hashlib
+import re
+import uuid
 from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime
 from pathlib import Path
@@ -57,6 +59,7 @@ READABLE_MANIFEST_STATUS = "AVAILABLE"
 DEFAULT_BATCH_SIZE = 65_536
 _HASH_CHUNK_SIZE = 1024 * 1024
 _OrderState = tuple[tuple[str, int], tuple[int, str], bool, bool]
+_CANONICAL_SHARD_KEY = re.compile(r"s(?P<number>\d+)-of-(?P<count>\d+)")
 
 
 def _utc_timestamp(value: object, label: str) -> datetime:
@@ -202,6 +205,62 @@ class ParquetMarketDataReader:
                 digest.update(chunk)
         return digest.hexdigest()
 
+    @staticmethod
+    def _object_can_contain(
+        metadata: Mapping[str, Any], instrument_ids: frozenset[str]
+    ) -> bool:
+        """Use the producer's stable UUID shard contract when it is declared.
+
+        Unknown legacy shard labels deliberately fall back to scanning. A canonical
+        ``sNN-of-N`` label is safe to prune because producers assign UUIDs with the
+        first eight bytes of SHA-256 modulo the declared shard count.
+        """
+        match = _CANONICAL_SHARD_KEY.fullmatch(str(metadata.get("shard_key", "")))
+        if match is None:
+            return True
+        shard_number = int(match.group("number"))
+        shard_count = int(match.group("count"))
+        if shard_count < 1 or shard_number >= shard_count:
+            return True
+        for instrument_id in instrument_ids:
+            try:
+                canonical = str(uuid.UUID(instrument_id))
+            except (ValueError, AttributeError):
+                return True
+            digest = hashlib.sha256(canonical.encode("utf-8")).digest()
+            if int.from_bytes(digest[:8], "big", signed=False) % shard_count == shard_number:
+                return True
+        return False
+
+    @staticmethod
+    def _candidate_row_groups(
+        parquet: pq.ParquetFile, instrument_ids: frozenset[str]
+    ) -> list[int]:
+        """Prune sorted producer row groups with their embedded UUID bounds."""
+        column_index = parquet.schema_arrow.get_field_index("instrument_id")
+        candidates: list[int] = []
+        for row_group_index in range(parquet.metadata.num_row_groups):
+            try:
+                statistics = parquet.metadata.row_group(row_group_index).column(
+                    column_index
+                ).statistics
+                if statistics is None or not statistics.has_min_max:
+                    candidates.append(row_group_index)
+                    continue
+                minimum = statistics.min
+                maximum = statistics.max
+                if isinstance(minimum, bytes):
+                    minimum = minimum.decode("utf-8")
+                if isinstance(maximum, bytes):
+                    maximum = maximum.decode("utf-8")
+                if any(str(minimum) <= value <= str(maximum) for value in instrument_ids):
+                    candidates.append(row_group_index)
+            except (IndexError, UnicodeDecodeError, ValueError):
+                # Missing or unusable statistics are an optimization miss, never a
+                # reason to omit possibly relevant immutable input.
+                candidates.append(row_group_index)
+        return candidates
+
     def _parquet_file(
         self,
         metadata: Mapping[str, Any],
@@ -295,8 +354,12 @@ class ParquetMarketDataReader:
         """
         self._validate_manifest(manifest, policy)
         schema: pa.Schema | None = None
-        parquets: list[pq.ParquetFile] = []
+        parquets: list[tuple[Mapping[str, Any], pq.ParquetFile]] = []
         for metadata in manifest["objects"]:
+            if instrument_ids is not None and not self._object_can_contain(
+                metadata, instrument_ids
+            ):
+                continue
             parquet = self._parquet_file(metadata, policy)
             object_schema = parquet.schema_arrow
             if schema is None:
@@ -306,19 +369,49 @@ class ParquetMarketDataReader:
             # Arrow fields, not unrelated file metadata, must match across the stream.
             elif not schema.equals(object_schema, check_metadata=False):
                 raise MarketDataValidationError("Parquet object schemas do not match")
-            parquets.append(parquet)
+            parquets.append((metadata, parquet))
 
         if schema is None:  # pragma: no cover - both manifest contracts require objects
             return
 
-        for parquet in parquets:
+        requested_values = (
+            pa.array(sorted(instrument_ids), type=pa.string())
+            if instrument_ids is not None
+            else None
+        )
+        for metadata, parquet in parquets:
             order_state: _OrderState | None = None
             try:
-                for batch in parquet.iter_batches(batch_size=self._batch_size):
-                    if instrument_ids is not None:
+                if instrument_ids is not None and not self._object_can_contain(
+                    metadata, instrument_ids
+                ):
+                    continue
+                candidate_row_groups = (
+                    self._candidate_row_groups(parquet, instrument_ids)
+                    if instrument_ids is not None
+                    else list(range(parquet.metadata.num_row_groups))
+                )
+                if not candidate_row_groups:
+                    continue
+                if requested_values is not None and not _CANONICAL_SHARD_KEY.fullmatch(
+                    str(metadata.get("shard_key", ""))
+                ) and not any(
+                    bool(pc.any(pc.is_in(batch.column(0), value_set=requested_values)).as_py())
+                    for batch in parquet.iter_batches(
+                        batch_size=self._batch_size,
+                        columns=["instrument_id"],
+                        row_groups=candidate_row_groups,
+                    )
+                ):
+                    continue
+                for batch in parquet.iter_batches(
+                    batch_size=self._batch_size,
+                    row_groups=candidate_row_groups,
+                ):
+                    if requested_values is not None:
                         mask = pc.is_in(
                             batch.column(batch.schema.get_field_index("instrument_id")),
-                            value_set=pa.array(sorted(instrument_ids), type=pa.string()),
+                            value_set=requested_values,
                         )
                         batch = batch.filter(mask)
                         if batch.num_rows == 0:

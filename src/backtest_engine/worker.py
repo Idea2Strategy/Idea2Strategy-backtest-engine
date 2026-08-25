@@ -18,6 +18,7 @@ reference implementation and the Postgres-backed one is BT-e's to supply.
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import importlib
 import json
@@ -487,6 +488,7 @@ class BacktestWorker:
             claim_token=claim.claim_token,
         )
         outcome = self._invoke(job, context, receipt, key, claim)
+        self._release_attempt_resources()
 
         if outcome.result is JobResult.SUCCEEDED:
             self._store.finish(key, ExecutionRecordStatus.SUCCEEDED, now=self._clock(), claim=claim)
@@ -522,6 +524,16 @@ class BacktestWorker:
 
         self._store.finish(key, ExecutionRecordStatus.FAILED, now=self._clock(), claim=claim)
         return self._dead_letter(message, receipt, outcome.reason_code or "PERMANENT_FAILURE", message_id, key)
+
+    @staticmethod
+    def _release_attempt_resources() -> None:
+        """Return large per-attempt Arrow buffers before polling the next job."""
+        gc.collect()
+        try:
+            pyarrow = importlib.import_module("pyarrow")
+            pyarrow.default_memory_pool().release_unused()
+        except (ImportError, AttributeError):  # pragma: no cover - optional runtime detail
+            return
 
     def _invoke(
         self,

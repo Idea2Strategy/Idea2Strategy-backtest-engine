@@ -78,6 +78,7 @@ from .basic_runtime import (
     BasicPlanCompatibilityError,
     BasicPlanReplay,
     BasicPlanRuntime,
+    CompactPlanEvaluation,
     PlanEvaluation,
     ReplaySkipReason,
     derive_data_requirements,
@@ -448,15 +449,52 @@ class ExecutionModelEngine:
             self._records.append(
                 order_result_record(self._run, expired, bar.starts_at, self._model.cash, self._positions())
             )
+        cash_after_fill = self._model.cash
+        positions_after_fill = {
+            item.instrument_id: item for item in self._positions()
+        }
         fills = self._model.process_bar(bar)
         for fill in fills:
+            current = positions_after_fill.get(fill.instrument_id)
+            current_quantity = current.quantity if current is not None else _ZERO
+            current_basis = current.cost_basis if current is not None else _ZERO
+            if fill.side is OrderSide.BUY:
+                next_quantity = quantize_quantity(
+                    current_quantity + fill.quantity,
+                    fractional_eligible=True,
+                    label="position.quantity",
+                )
+                next_basis = quantize_money(
+                    current_basis + fill.cost_basis, "position.cost_basis"
+                )
+                cash_after_fill = quantize_money(
+                    cash_after_fill - fill.gross_amount - fill.fee, "cash_after"
+                )
+            else:
+                next_quantity = quantize_quantity(
+                    current_quantity - fill.quantity,
+                    fractional_eligible=True,
+                    label="position.quantity",
+                )
+                next_basis = quantize_money(
+                    current_basis - fill.cost_basis, "position.cost_basis"
+                )
+                cash_after_fill = quantize_money(
+                    cash_after_fill + fill.gross_amount - fill.fee, "cash_after"
+                )
+            if next_quantity > _ZERO:
+                positions_after_fill[fill.instrument_id] = PositionAfter(
+                    fill.instrument_id, next_quantity, next_basis
+                )
+            else:
+                positions_after_fill.pop(fill.instrument_id, None)
             self._records.append(
                 fill_result_record(
                     self._run,
                     fill,
                     self._model.order(fill.order_id),
-                    self._model.cash,
-                    self._positions(),
+                    cash_after_fill,
+                    tuple(positions_after_fill[key] for key in sorted(positions_after_fill)),
                 )
             )
         after = self._model.position(event.instrument_id)
@@ -1303,6 +1341,22 @@ def _judgment_evaluations(run_snapshot_id: str, evaluations: Sequence[Any]) -> t
     """
     reduced: list[JudgmentEvaluation] = []
     for evaluation in evaluations:
+        if isinstance(evaluation, CompactPlanEvaluation):
+            reduced.append(
+                JudgmentEvaluation(
+                    evaluation_id=evaluation.evaluation_id,
+                    run_snapshot_id=run_snapshot_id,
+                    evaluated_at=evaluation.occurred_at,
+                    mode=StrategyMode.BASIC,
+                    trade_occurred=evaluation.trade_occurred,
+                    data_gap=evaluation.data_gap,
+                    basic_outcomes=tuple(
+                        ConditionOutcome(key, passed)
+                        for key, passed in evaluation.condition_outcomes
+                    ),
+                )
+            )
+            continue
         if not isinstance(evaluation, PlanEvaluation):  # pragma: no cover - defensive
             raise WiringError("replay evaluations must be basic_runtime.PlanEvaluation values")
         data_gap = evaluation.skip_reason is ReplaySkipReason.DATA_GAP_EVALUATION_SKIPPED
@@ -1549,8 +1603,6 @@ class OrchestratorJobHandler:
         self._wall_clock = wall_clock
         self._correlation_id = correlation_id
         self._publication_lag = publication_lag
-        self.last_outcome: ReplayOutcome | None = None
-        self.last_publisher: DurableResultPublisher | None = None
 
     # -- JobHandler --------------------------------------------------------
 
@@ -1622,7 +1674,6 @@ class OrchestratorJobHandler:
             object_store=self._store,
             storage_write_port=self._port,
         )
-        self.last_publisher = publisher
 
         coordinator = AttemptCoordinator(str(binding.run_id), self._attempt_policy, started_at)
         lease = coordinator.acquire(context.worker_id, started_at)
@@ -1641,7 +1692,6 @@ class OrchestratorJobHandler:
             publication_lag=self._publication_lag,
         )
         outcome = orchestrator.run(binding.job, coordinator=coordinator, lease=lease, monitor=self._monitor)
-        self.last_outcome = outcome
         return self._report(binding, outcome, coordinator, context)
 
     # -- binding -----------------------------------------------------------

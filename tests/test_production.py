@@ -18,6 +18,7 @@ from backtest_engine.production import (
     ConfigurationError,
     HttpResultSink,
     JwtAuthenticator,
+    MonotonicUtcClock,
     PostgresCompiledPlanSource,
     PostgresDatasetManifestSource,
     PostgresFeatureMaterializationSource,
@@ -48,6 +49,16 @@ def test_worker_correlation_id_is_normalized_to_the_result_event_uuid_format() -
         {"BACKTEST_WORKER_CORRELATION_ID": "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"},
         "BACKTEST_WORKER_CORRELATION_ID",
     ) == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+
+def test_worker_wall_clock_advances_from_monotonic_elapsed_time() -> None:
+    ticks = iter((100.0, 102.5, 102.0, 104.0))
+    anchor = datetime(2026, 8, 25, 13, 0, tzinfo=UTC)
+    clock = MonotonicUtcClock(lambda: anchor, lambda: next(ticks))
+
+    assert clock() == anchor.replace(second=2, microsecond=500000)
+    assert clock() == anchor.replace(second=2, microsecond=500000)
+    assert clock() == anchor.replace(second=4)
 
 
 class _HttpResultResponse:

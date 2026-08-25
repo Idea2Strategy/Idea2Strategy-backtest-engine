@@ -32,6 +32,7 @@ from backtest_engine.basic_runtime import (
     PlanLoadFailure,
     ReplaySkipReason,
     ReplayUnavailableError,
+    _plan_visible_event_limit,
     _ReplayExecutionState,
     bar_closed_event,
     derive_data_requirements,
@@ -217,6 +218,7 @@ def test_loads_and_executes_the_full_catalog_without_synthetic_features(
         ]
 
     plan = _runtime().load(_resealed(full_catalog))
+    assert _plan_visible_event_limit(plan) == 2
     bars = tuple(
         SeriesBar(
             instrument_id=FIRST, resolution=resolution,

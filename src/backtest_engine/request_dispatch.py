@@ -123,7 +123,15 @@ def _request_period(
                         str(request["expectedDatasetHash"]),
                     ),
                 ),
-                (),
+                tuple(
+                    sorted(
+                        PinnedFeatureMaterialization(
+                            uuid.UUID(str(item["featureMaterializationId"])),
+                            str(item["lockedResultHash"]),
+                        )
+                        for item in request["featureMaterializations"]
+                    )
+                ),
             )
         periods = request["periods"]
         if not isinstance(periods, list) or len(periods) != 1:

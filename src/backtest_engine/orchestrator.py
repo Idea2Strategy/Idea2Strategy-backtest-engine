@@ -35,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
@@ -110,6 +111,53 @@ BAR_CLOSED_EVENT_TYPE = "BAR_CLOSED"
 
 
 _LOG = logging.getLogger(__name__)
+
+
+class _BoundedVisibleEvents:
+    """Incremental look-ahead-safe view matching a live rolling bar cache."""
+
+    def __init__(
+        self,
+        events: tuple[MarketDataEvent, ...],
+        *,
+        per_series_limit: int | None,
+    ) -> None:
+        self._events = tuple(sorted(
+            events,
+            key=lambda event: (event.available_at, event.source_sequence, event.event_id),
+        ))
+        self._cursor = 0
+        self._per_series_limit = per_series_limit
+        self._series: dict[tuple[str, str, str], deque[MarketDataEvent]] = {}
+        self._other: list[MarketDataEvent] = []
+
+    def advance_to(self, instant: datetime) -> tuple[MarketDataEvent, ...]:
+        while (
+            self._cursor < len(self._events)
+            and self._events[self._cursor].available_at <= instant
+        ):
+            event = self._events[self._cursor]
+            self._cursor += 1
+            payload = event.payload
+            if event.event_type == BAR_CLOSED_EVENT_TYPE:
+                key = (
+                    event.instrument_id,
+                    str(payload.get("dataKind", "")),
+                    str(payload.get("resolution", "")),
+                )
+                series = self._series.get(key)
+                if series is None:
+                    series = deque(maxlen=self._per_series_limit)
+                    self._series[key] = series
+                series.append(event)
+            else:
+                self._other.append(event)
+        visible = [event for series in self._series.values() for event in series]
+        visible.extend(self._other)
+        return tuple(sorted(
+            visible,
+            key=lambda event: (event.available_at, event.source_sequence, event.event_id),
+        ))
 
 
 class OrchestratorError(RuntimeError):
@@ -780,6 +828,10 @@ class BacktestOrchestrator:
             events_at.setdefault(event.occurred_at, []).append(event)
         steps: list[ReplayStep] = []
         evaluations: list[Any] = []
+        visible_window = _BoundedVisibleEvents(
+            events,
+            per_series_limit=getattr(replay, "visible_event_limit", None),
+        )
         for sequence, instant in enumerate(sorted(events_at), start=1):
             try:
                 lease = coordinator.heartbeat(
@@ -814,11 +866,7 @@ class BacktestOrchestrator:
                 for event in fillable_events:
                     fill_count += self._engine.settle(event)
 
-            visible_events = tuple(
-                event
-                for event in events
-                if event.available_at <= instant and event.occurred_at <= instant
-            )
+            visible_events = visible_window.advance_to(instant)
             runtime_values_provider = getattr(self._engine, "runtime_values", None)
             runtime_values = (
                 runtime_values_provider(instant, tuple(events_at[instant]))
@@ -833,7 +881,12 @@ class BacktestOrchestrator:
                     retryable=False, status=ReplayStatus.FAILED,
                     availability=assessment.status, steps=tuple(steps),
                 )
-            evaluations.append(evaluation)
+            compact_evaluation = getattr(replay, "compact_evaluation", None)
+            evaluations.append(
+                compact_evaluation(evaluation)
+                if callable(compact_evaluation)
+                else evaluation
+            )
 
             candidates = tuple(evaluation.candidates) if evaluation else ()
             placed: tuple[str, ...] = ()

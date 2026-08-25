@@ -1173,9 +1173,7 @@ def _fill_ledger(
     fill_count = closing_count = winning_count = losing_count = 0
     realized_pnl = total_fees = total_slippage = ZERO
 
-    for record in ordered:
-        if record.kind is not ResultRecordKind.FILL:
-            continue
+    for record in _causal_fill_order(ordered):
         quantity = record.quantity
         gross_amount = record.gross_amount
         fee = record.fee
@@ -1278,6 +1276,76 @@ def _fill_ledger(
         ending_positions=tuple(
             sorted(book.values(), key=lambda item: item.instrument_id)
         ),
+    )
+
+
+def _causal_fill_order(
+    ordered: tuple[ResultRecord, ...],
+) -> tuple[ResultRecord, ...]:
+    """Restore the causal order of fills sharing one market-data instant.
+
+    Record ids are content-derived and therefore cannot encode the order in
+    which multiple orders consumed the same bar.  Their successive position
+    snapshots do encode that order, so follow that chain before rebuilding the
+    ledger.
+    """
+
+    fills = [item for item in ordered if item.kind is ResultRecordKind.FILL]
+    result: list[ResultRecord] = []
+    book: dict[str, PositionAfter] = {}
+    index = 0
+    while index < len(fills):
+        instant = fills[index].occurred_at
+        pending: list[ResultRecord] = []
+        while index < len(fills) and fills[index].occurred_at == instant:
+            pending.append(fills[index])
+            index += 1
+
+        while pending:
+            matched_index = next(
+                (
+                    candidate_index
+                    for candidate_index, candidate in enumerate(pending)
+                    if _matches_position_transition(book, candidate)
+                ),
+                None,
+            )
+            if matched_index is None:
+                # Preserve the deterministic record ordering so the canonical
+                # validation below reports its detailed contradiction.
+                result.extend(pending)
+                break
+            record = pending.pop(matched_index)
+            result.append(record)
+            book = {
+                item.instrument_id: item
+                for item in record.positions_after
+                if item.quantity > ZERO
+            }
+    return tuple(result)
+
+
+def _matches_position_transition(
+    book: dict[str, PositionAfter], record: ResultRecord
+) -> bool:
+    if record.quantity is None:
+        return False
+    after = {
+        item.instrument_id: item
+        for item in record.positions_after
+        if item.quantity > ZERO
+    }
+    before_quantity = book.get(
+        record.instrument_id, PositionAfter(record.instrument_id, ZERO, ZERO)
+    ).quantity
+    after_quantity = after.get(
+        record.instrument_id, PositionAfter(record.instrument_id, ZERO, ZERO)
+    ).quantity
+    if (after_quantity - before_quantity).copy_abs() != record.quantity:
+        return False
+    return all(
+        book.get(instrument_id) == after.get(instrument_id)
+        for instrument_id in (set(book) | set(after)) - {record.instrument_id}
     )
 
 

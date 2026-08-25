@@ -375,7 +375,7 @@ class TestTheVisibleWindowMatchesLive:
     """
 
     @staticmethod
-    def _closes(count: int) -> str:
+    def _values(count: int) -> dict[str, str]:
         events = tuple(
             bar_closed_event(
                 event_id=f"bar-{index:04d}",
@@ -389,14 +389,22 @@ class TestTheVisibleWindowMatchesLive:
             )
             for index in range(count)
         )
-        published = _published_values(
+        return _published_values(
             INSTRUMENT,
             {(INSTRUMENT, "30m"): list(events)},
             events[-1].occurred_at,
             runtime_values={},
             shared_values={},
         )
-        return published["closes.30m"]
+
+    @classmethod
+    def _closes(cls, count: int) -> str:
+        return cls._values(count)["closes.30m"]
+
+    def test_only_catalog_consumed_series_are_materialized(self) -> None:
+        assert set(self._values(2)) == {
+            "closes.30m", "volumes.30m", "bar.closed.30m"
+        }
 
     def test_a_short_history_is_shown_whole(self) -> None:
         assert len(self._closes(40).split(",")) == 40

@@ -28,6 +28,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+import backtest_engine.orchestrator as orchestrator_module
 from backtest_engine.attempt_coordinator import (
     AttemptCoordinator,
     AttemptPolicy,
@@ -89,6 +90,30 @@ BAR_INTERVAL = timedelta(minutes=15)
 # Wall-clock (attempt lease) time. Deliberately unrelated to the 2024 replay
 # clock: conflating the two is exactly the bug that separation prevents.
 WALL_T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def test_visible_event_window_keeps_only_live_runtime_bar_history() -> None:
+    events = tuple(
+        MarketDataEvent(
+            event_id=f"event-{index}",
+            instrument_id=AAPL,
+            occurred_at=datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc)
+            + timedelta(seconds=index),
+            available_at=datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc)
+            + timedelta(seconds=index),
+            source_sequence=index + 1,
+            event_type=BAR_CLOSED_EVENT_TYPE,
+            payload={"dataKind": "BAR", "resolution": "30m"},
+        )
+        for index in range(230)
+    )
+
+    window = orchestrator_module._BoundedVisibleEvents(events, per_series_limit=180)
+    visible = window.advance_to(events[-1].available_at)
+
+    assert len(visible) == 180
+    assert visible[0].event_id == "event-50"
+    assert visible[-1].event_id == "event-229"
 
 
 def _utc(hour: int, minute: int) -> datetime:
@@ -187,6 +212,10 @@ def test_daily_bars_close_on_the_official_session_and_signal_the_next_session() 
         clock=MarketEventClock(schedule, events),
         assessment=AvailabilityAssessment(AvailabilityStatus.AVAILABLE, (), ()),
     )
+    assert replay._session_index_by_date == {
+        session.trading_date_et: index for index, session in enumerate(schedule.sessions)
+    }
+    assert replay._last_schedule_session_date is None
 
     candidate = replay.run()[0].candidates[0]
     assert candidate.decided_at == first_session.closes_at
@@ -803,6 +832,9 @@ def test_completed_run_places_unsized_candidates_fills_them_and_publishes_once(
     assert published.replay_digest == outcome.replay_digest
     assert published.orchestrator_version == ORCHESTRATOR_VERSION
     assert len(published.evaluations) == 3
+    assert {type(item).__name__ for item in published.evaluations} == {
+        "CompactPlanEvaluation"
+    }
 
     assert coordinator.state is RunState.COMPLETED
     assert coordinator.result_manifest_id == RESULT_MANIFEST_ID

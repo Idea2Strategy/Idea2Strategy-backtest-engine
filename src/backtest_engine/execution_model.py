@@ -744,6 +744,7 @@ class BacktestExecutionModel:
             _non_negative(initial_cash, "initial_cash"), "initial_cash"
         )
         self._orders: dict[str, _OrderState] = {}
+        self._open_order_ids: set[str] = set()
         self._lots: dict[str, list[_Lot]] = {}
         self._fills: list[Fill] = []
         self._ledger: list[LedgerTransaction] = []
@@ -848,6 +849,7 @@ class BacktestExecutionModel:
             else None,
         )
         self._orders[request.order_id] = state
+        self._open_order_ids.add(request.order_id)
 
         eligibility = self._eligibility_reason(request)
         if eligibility is not None:
@@ -874,6 +876,7 @@ class BacktestExecutionModel:
             state.status = OrderStatus.CANCELLED
             state.reason_code = "EXPLICITLY_CANCELLED"
             self._release_reservation(state)
+            self._open_order_ids.discard(state.request.order_id)
         return self._snapshot(state)
 
     def advance_time(self, instant: datetime) -> tuple[BacktestOrder, ...]:
@@ -882,8 +885,8 @@ class BacktestExecutionModel:
             raise ExecutionModelValidationError("execution clock must not move backward")
         self._now = now
         expired: list[BacktestOrder] = []
-        for state in sorted(self._orders.values(), key=self._order_key):
-            if self._is_open(state) and now >= state.expires_at:
+        for state in sorted(self._open_states(), key=self._order_key):
+            if now >= state.expires_at:
                 state.status = OrderStatus.EXPIRED
                 state.reason_code = {
                     TimeInForce.DAY: "DAY_EXPIRED",
@@ -891,6 +894,7 @@ class BacktestExecutionModel:
                     TimeInForce.GTD: "GTD_EXPIRED",
                 }[state.request.time_in_force]
                 self._release_reservation(state)
+                self._open_order_ids.discard(state.request.order_id)
                 expired.append(self._snapshot(state))
         return tuple(expired)
 
@@ -921,9 +925,8 @@ class BacktestExecutionModel:
         states = sorted(
             (
                 state
-                for state in self._orders.values()
+                for state in self._open_states()
                 if state.request.instrument_id == bar.instrument_id
-                and self._is_open(state)
                 and state.request.eligible_at <= bar.starts_at
             ),
             key=self._order_key,
@@ -991,9 +994,8 @@ class BacktestExecutionModel:
             available = self.position(request.instrument_id).quantity - sum(
                 (
                     other.reserved_quantity
-                    for other in self._orders.values()
+                    for other in self._open_states()
                     if other is not state
-                    and self._is_open(other)
                     and other.request.instrument_id == request.instrument_id
                     and other.request.side is OrderSide.SELL
                 ),
@@ -1339,6 +1341,7 @@ class BacktestExecutionModel:
         if complete:
             state.status = OrderStatus.FILLED
             self._release_reservation(state)
+            self._open_order_ids.discard(state.request.order_id)
         else:
             state.status = OrderStatus.PARTIALLY_FILLED
             self._refresh_reservation(state)
@@ -1451,12 +1454,15 @@ class BacktestExecutionModel:
         except KeyError as exc:
             raise KeyError(f"unknown order_id: {normalised}") from exc
 
-    @staticmethod
-    def _reject(state: _OrderState, reason_code: str) -> None:
+    def _reject(self, state: _OrderState, reason_code: str) -> None:
         if reason_code not in REJECT_REASON_CODES:
             raise ExecutionModelValidationError(f"undeclared reject code: {reason_code}")
         state.status = OrderStatus.REJECTED
         state.reason_code = reason_code
+        self._open_order_ids.discard(state.request.order_id)
+
+    def _open_states(self) -> tuple[_OrderState, ...]:
+        return tuple(self._orders[order_id] for order_id in self._open_order_ids)
 
     @staticmethod
     def _is_open(state: _OrderState) -> bool:
@@ -1490,8 +1496,8 @@ class BacktestExecutionModel:
         return sum(
             (
                 state.reserved_cash
-                for state in self._orders.values()
-                if state is not excluding and self._is_open(state)
+                for state in self._open_states()
+                if state is not excluding
             ),
             ZERO,
         )
@@ -1500,8 +1506,8 @@ class BacktestExecutionModel:
         return sum(
             (
                 state.reserved_notional
-                for state in self._orders.values()
-                if state is not excluding and self._is_open(state)
+                for state in self._open_states()
+                if state is not excluding
             ),
             ZERO,
         )
@@ -1512,9 +1518,8 @@ class BacktestExecutionModel:
         return sum(
             (
                 state.reserved_notional
-                for state in self._orders.values()
+                for state in self._open_states()
                 if state is not excluding
-                and self._is_open(state)
                 and state.request.instrument_id == instrument_id
                 and state.request.side is OrderSide.BUY
             ),

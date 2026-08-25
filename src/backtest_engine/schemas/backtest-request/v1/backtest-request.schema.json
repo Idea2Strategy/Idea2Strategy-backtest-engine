@@ -45,7 +45,7 @@
         { "$ref": "#/$defs/common" },
         {
           "type": "object",
-          "required": ["metadata", "requestReason", "requestHash", "requestingAccountId", "botId", "runId", "lane", "aggregateSequence", "expectedSnapshotHash", "compiledPlanChecksum", "datasetManifestId", "expectedDatasetHash", "periodStart", "periodEnd", "instrumentCatalogVersion", "initialCashAmount", "assumptionsVersion", "executionPolicyVersion"],
+          "required": ["metadata", "requestReason", "requestHash", "requestingAccountId", "botId", "runId", "lane", "aggregateSequence", "expectedSnapshotHash", "compiledPlanChecksum", "datasetManifestId", "expectedDatasetHash", "periodStart", "periodEnd", "instrumentCatalogVersion", "featureMaterializations", "initialCashAmount", "assumptionsVersion", "executionPolicyVersion"],
           "properties": {
             "metadata": {
               "allOf": [
@@ -67,6 +67,7 @@
             "periodStart": { "type": "string", "format": "date" },
             "periodEnd": { "type": "string", "format": "date" },
             "instrumentCatalogVersion": { "type": "string", "minLength": 1 },
+            "featureMaterializations": { "type": "array", "items": { "$ref": "#/$defs/competitionFeature" } },
             "initialCashAmount": { "$ref": "#/$defs/positiveDecimal" },
             "assumptionsVersion": { "type": "string", "minLength": 1 },
             "executionPolicyVersion": { "type": "string", "minLength": 1 }

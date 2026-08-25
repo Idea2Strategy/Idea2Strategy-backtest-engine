@@ -810,7 +810,7 @@ def test_incompatible_development_windows_are_one_terminal_binding_failure(
     with pytest.raises(JobNotSatisfiable) as failure:
         handler.bind(envelope, _context())
     assert "dataset manifest period" in str(failure.value)
-    assert "2016-07-01 is outside the pinned XNYS coverage" in str(failure.value)
+    assert "execution policy development-official-backtest-2026-q3-v1 period" in str(failure.value)
 
     outcome = handler({}, _context())
 

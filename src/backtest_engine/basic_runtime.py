@@ -1353,6 +1353,22 @@ rule, and capping the input is what makes it reproducible anyway.
 """
 
 
+def _plan_visible_event_limit(plan: BasicCompiledPlan) -> int:
+    """Return the exact raw-bar window consumed by this compiled plan.
+
+    MACD intentionally receives the full live cache because its EMA depends on
+    all retained history. Every other catalog operation has an explicit finite
+    lookback, so rebuilding 180 values would add work without changing output.
+    """
+    steps = [step for flow in plan.flows for step in flow.condition_steps]
+    if any(step.operation == "MACD_CROSS" for step in steps):
+        return LIVE_SERIES_BARS
+    return min(
+        LIVE_SERIES_BARS,
+        max((_raw_operation_lookback(step) for step in steps), default=1),
+    )
+
+
 def _published_values(
     instrument_id: str,
     payloads: Mapping[tuple[str, str], list[MarketDataEvent]],
@@ -1369,20 +1385,7 @@ def _published_values(
         ordered = sorted(events, key=lambda item: item.occurred_at)[-LIVE_SERIES_BARS:]
         values[f"closes.{resolution}"] = ",".join(str(item.payload["bar"].close) for item in ordered)
         values[f"volumes.{resolution}"] = ",".join(str(item.payload["bar"].volume) for item in ordered)
-        values[f"opens.{resolution}"] = ",".join(
-            str(item.payload.get("open", item.payload["bar"].close)) for item in ordered
-        )
-        values[f"highs.{resolution}"] = ",".join(
-            str(item.payload.get("high", item.payload["bar"].close)) for item in ordered
-        )
-        values[f"lows.{resolution}"] = ",".join(
-            str(item.payload.get("low", item.payload["bar"].close)) for item in ordered
-        )
         values[f"bar.closed.{resolution}"] = str(ordered[-1].occurred_at == as_of).lower()
-        current_session = ordered[-1].payload.get("sessionDateEt")
-        session_events = [item for item in ordered if item.payload.get("sessionDateEt") == current_session]
-        if session_events:
-            values["session.open"] = str(session_events[0].payload.get("open", session_events[0].payload["bar"].close))
     return values
 
 
@@ -1440,6 +1443,17 @@ class PlanEvaluation:
     decisions: tuple[BasicInstrumentDecision, ...]
     candidates: tuple[OrderCandidate, ...]
     skip_reason: ReplaySkipReason | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CompactPlanEvaluation:
+    """Publication evidence without transient traces, prices, or candidates."""
+
+    evaluation_id: str
+    occurred_at: datetime
+    trade_occurred: bool
+    data_gap: bool
+    condition_outcomes: tuple[tuple[str, bool], ...]
 
 
 @dataclass(slots=True)
@@ -1510,6 +1524,10 @@ class BasicPlanReplay:
     what filter the input - and the returned sequence is sorted by instant.
     """
 
+    # The production orchestrator uses the same rolling history bound as the
+    # live signal state instead of rebuilding every prior bar at every instant.
+    visible_event_limit = LIVE_SERIES_BARS
+
     def __init__(
         self,
         *,
@@ -1529,6 +1547,13 @@ class BasicPlanReplay:
         self.feature_series = tuple(feature_series)
         self.require_pinned_features = require_pinned_features
         self.gate = ExecutionGate(clock.schedule, assessment)
+        if isinstance(plan, BasicCompiledPlan):
+            self.visible_event_limit = _plan_visible_event_limit(plan)
+        self._session_index_by_date = {
+            session.trading_date_et: index
+            for index, session in enumerate(clock.schedule.sessions)
+        }
+        self._last_schedule_session_date: date | None = None
         self._evaluations: tuple[PlanEvaluation, ...] | None = None
         self._execution_states: dict[tuple[str, str], _ReplayExecutionState] = {}
         self._position_identities: dict[str, str | None] = {}
@@ -1588,7 +1613,13 @@ class BasicPlanReplay:
             # create a same-session DAY order. Carry it to the next official
             # session so the next completed bar may fill it at that session's
             # open without using the signal bar's own prices.
-            candidate_session = self.clock.schedule.next_session_after(instant)
+            session_index = self._session_index_by_date[session.trading_date_et]
+            sessions = self.clock.schedule.sessions
+            candidate_session = (
+                sessions[session_index + 1]
+                if session_index + 1 < len(sessions)
+                else None
+            )
             eligible_at = None if candidate_session is None else candidate_session.opens_at
         if candidate_session is not None:
             candidates = self.runtime.order_candidates(
@@ -1670,25 +1701,63 @@ class BasicPlanReplay:
         """Evaluate one instant after the execution model exposed its current positions."""
         return self._evaluate_at(instant, visible_events, runtime_values)
 
+    @staticmethod
+    def compact_evaluation(evaluation: PlanEvaluation) -> CompactPlanEvaluation:
+        data_gap = evaluation.skip_reason is ReplaySkipReason.DATA_GAP_EVALUATION_SKIPPED
+        outcomes: list[tuple[str, bool]] = []
+        if not data_gap:
+            for decision in evaluation.decisions:
+                outcomes.extend(
+                    (
+                        f"{decision.flow_id}|{decision.instrument_id}|{trace.step_id}",
+                        trace.passed,
+                    )
+                    for trace in decision.trace
+                )
+                if decision.status is BasicDecisionStatus.INPUT_MISSING and not decision.trace:
+                    outcomes.append((
+                        f"{decision.flow_id}|{decision.instrument_id}|{decision.first_failure_step_id}",
+                        False,
+                    ))
+        return CompactPlanEvaluation(
+            evaluation_id=evaluation.evaluation_id,
+            occurred_at=evaluation.occurred_at,
+            trade_occurred=bool(evaluation.candidates),
+            data_gap=data_gap,
+            condition_outcomes=tuple(outcomes),
+        )
+
     def _schedule_values(self, instant: datetime, visible_events: tuple[MarketDataEvent, ...]) -> dict[str, str]:
         session = self.clock.schedule.session_at(instant)
         if session is None:
             return {}
         sessions = self.clock.schedule.sessions
-        index = sessions.index(session)
+        session_positions = getattr(self, "_session_index_by_date", None)
+        if session_positions is None:
+            session_positions = {
+                item.trading_date_et: position
+                for position, item in enumerate(sessions)
+            }
+            self._session_index_by_date = session_positions
+        index = session_positions[session.trading_date_et]
         previous = sessions[index - 1] if index else None
         following = sessions[index + 1] if index + 1 < len(sessions) else None
         # The session an event belongs to comes from the pinned schedule, not from a payload key.
         # Only the production orchestrator stamps ``sessionDateEt`` onto an event; every other
         # driver leaves it absent, and reading it there made *every* bar compare equal to None and
         # so look like the session's first -- which is the one value this flag must never take.
-        earlier_today = any(
-            event.occurred_at < instant
-            and self.clock.schedule.session_at(event.occurred_at) == session
-            for event in visible_events
-        )
         current = session.trading_date_et
-        new_trading_day = not earlier_today
+        if hasattr(self, "_last_schedule_session_date"):
+            new_trading_day = self._last_schedule_session_date != current
+            self._last_schedule_session_date = current
+        else:
+            # Direct conformance drivers call this method without constructing a
+            # replay; retain their stateless result while production stays O(1).
+            new_trading_day = not any(
+                event.occurred_at < instant
+                and self.clock.schedule.session_at(event.occurred_at) == session
+                for event in visible_events
+            )
         # Every "first/last trading day of the period" flag is a property of the day, so it is
         # true once per day -- on its first bar -- exactly as the live BasicMarketSignalState
         # publishes it. Reporting the day's property on every bar instead would make a 30m clock

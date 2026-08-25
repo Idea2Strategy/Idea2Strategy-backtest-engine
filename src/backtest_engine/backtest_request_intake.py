@@ -580,7 +580,7 @@ def validate_backtest_request(document: Mapping[str, Any]) -> dict[str, Any]:
             end = date.fromisoformat(str(instance["periodEnd"]))
             if end < start:
                 raise ContractValidationError("periodEnd must not precede periodStart")
-            request_material = "\n".join(
+            request_fields = [
                 str(instance[field])
                 for field in (
                     "requestingAccountId",
@@ -592,11 +592,21 @@ def validate_backtest_request(document: Mapping[str, Any]) -> dict[str, Any]:
                     "expectedSnapshotHash",
                     "compiledPlanChecksum",
                     "instrumentCatalogVersion",
-                    "initialCashAmount",
-                    "assumptionsVersion",
-                    "executionPolicyVersion",
                 )
-            )
+            ]
+            request_fields.append("".join(
+                f"{feature['featureMaterializationId']}:{feature['lockedResultHash']};"
+                for feature in sorted(
+                    instance["featureMaterializations"],
+                    key=lambda item: item["featureMaterializationId"],
+                )
+            ))
+            request_fields.extend(str(instance[field]) for field in (
+                "initialCashAmount",
+                "assumptionsVersion",
+                "executionPolicyVersion",
+            ))
+            request_material = "\n".join(request_fields)
             # The client idempotency key is deliberately not repeated in the
             # public envelope, so its one-way producer digest cannot be
             # recomputed. The canonical Outbox row is checked by the receipt

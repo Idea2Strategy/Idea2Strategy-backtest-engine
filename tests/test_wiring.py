@@ -49,7 +49,7 @@ from backtest_engine.orchestrator import (
     ReplayStatus,
     bar_events_from_table,
 )
-from backtest_engine.result_snapshot import ResultRecordKind, RunSnapshot
+from backtest_engine.result_snapshot import ResultRecordKind, ResultSnapshotBuilder, RunSnapshot
 from backtest_engine.wiring import (
     COST_MODEL_VERSION,
     EXECUTION_MODEL_VERSION,
@@ -652,6 +652,35 @@ def _holding_bars(engine: ExecutionModelEngine, index: int) -> str:
 
 def _settle(engine: ExecutionModelEngine, index: int) -> int:
     return engine.settle(_bar_event(index, resolution=STRATEGY_RESOLUTION))
+
+
+def test_same_bar_buy_and_sell_records_preserve_each_fill_position_transition() -> None:
+    """A bar can fill more than one open order; each record needs its own after-state."""
+    engine = _engine()
+    engine.place(_candidate(allocation=Fraction(1, 2)))
+    _settle(engine, 15)
+
+    engine.place(
+        _candidate(
+            allocation=Fraction(3, 1000),
+            decided_at=datetime(2024, 1, 2, 14, 46, tzinfo=UTC),
+        )
+    )
+    engine.place(
+        _candidate(
+            side="SELL",
+            allocation=None,
+            decided_at=datetime(2024, 1, 2, 14, 47, tzinfo=UTC),
+        )
+    )
+
+    assert _settle(engine, 17) == 2
+    fills = [record for record in engine.records if record.kind is ResultRecordKind.FILL]
+    assert len(fills) == 3
+    before_quantity = fills[0].positions_after[0].quantity
+    assert fills[1].positions_after[0].quantity > before_quantity
+    assert fills[2].positions_after[0].quantity < fills[1].positions_after[0].quantity
+    ResultSnapshotBuilder().build(_run_snapshot(), engine.records, COMPLETED_AT)
 
 
 def test_the_entry_bar_publishes_one_held_bar() -> None:
