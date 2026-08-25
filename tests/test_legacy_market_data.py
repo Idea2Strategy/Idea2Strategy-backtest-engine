@@ -143,6 +143,45 @@ def test_reader_consumes_legacy_parquet_without_weakening_the_canonical_path(
     assert result.num_rows == 2
 
 
+def test_composite_legacy_manifest_hashes_and_validates_multiple_source_years() -> None:
+    manifest = _one_shard_manifest(Path(FIXTURE))
+    composite_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    first = deepcopy(manifest["objects"][0])  # type: ignore[index]
+    second = deepcopy(first)
+    first.update(
+        object_key=str(first["object_key"])
+        .replace("year=2024", "year=2016")
+        .replace(str(manifest["manifest_id"]), "11111111-1111-4111-8111-111111111111"),
+        partition_start="2016-01-01",
+        partition_end="2017-01-01",
+        period_start="2016-01-01T00:00:00Z",
+        period_end="2017-01-01T00:00:00Z",
+    )
+    second.update(
+        object_key=str(second["object_key"])
+        .replace("year=2024", "year=2017")
+        .replace(str(manifest["manifest_id"]), "22222222-2222-4222-8222-222222222222"),
+        partition_start="2017-01-01",
+        partition_end="2018-01-01",
+        period_start="2017-01-01T00:00:00Z",
+        period_end="2018-01-01T00:00:00Z",
+        storage_object_id="33333333-3333-4333-8333-333333333333",
+    )
+    manifest.update(
+        manifest_id=composite_id,
+        dataset_id=composite_id,
+        composite=True,
+        period_start="2016-01-01T00:00:00Z",
+        period_end="2018-01-01T00:00:00Z",
+        objects=[first, second],
+    )
+    manifest["dataset_hash"] = legacy_dataset_hash(manifest)
+
+    validate_legacy_market_loader_manifest(manifest)
+
+    assert len(str(manifest["dataset_hash"])) == 64
+
+
 def test_canonical_manifest_cannot_claim_the_legacy_object_kind(tmp_path: Path) -> None:
     fixture = write_small_market_bars(tmp_path / "market-bars.parquet")
     manifest = _one_shard_manifest(fixture.path)

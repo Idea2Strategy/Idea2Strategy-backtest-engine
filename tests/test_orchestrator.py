@@ -541,6 +541,30 @@ def test_orchestrator_uses_bounded_parquet_batches_instead_of_materialized_read(
     assert outcome.status is ReplayStatus.COMPLETED
 
 
+def test_orchestrator_limits_market_rows_to_requirement_instruments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = ParquetMarketDataReader.iter_batches
+    requested: list[frozenset[str] | None] = []
+
+    def recording_iter_batches(
+        reader: ParquetMarketDataReader,
+        manifest: Mapping[str, Any],
+        policy: Any,
+        *,
+        instrument_ids: frozenset[str] | None = None,
+    ) -> Any:
+        requested.append(instrument_ids)
+        return original(reader, manifest, policy, instrument_ids=instrument_ids)
+
+    monkeypatch.setattr(ParquetMarketDataReader, "iter_batches", recording_iter_batches)
+
+    outcome, _, _ = _run(tmp_path)
+
+    assert outcome.status is ReplayStatus.COMPLETED
+    assert requested == [frozenset({AAPL, MSFT})]
+
+
 def test_orchestrator_reads_every_pinned_resolution_into_one_replay_clock() -> None:
     rows_15m = pa.Table.from_pylist(
         [_bar_row(_utc(14, 30), date(2024, 1, 2)),
@@ -557,7 +581,14 @@ def test_orchestrator_reads_every_pinned_resolution_into_one_replay_clock() -> N
         def __init__(self) -> None:
             self.seen: list[str] = []
 
-        def iter_batches(self, manifest: Mapping[str, Any], _policy: Any) -> Any:
+        def iter_batches(
+            self,
+            manifest: Mapping[str, Any],
+            _policy: Any,
+            *,
+            instrument_ids: frozenset[str] | None = None,
+        ) -> Any:
+            assert instrument_ids == frozenset({AAPL})
             resolution = str(manifest["resolution"])
             self.seen.append(resolution)
             return (rows_15m if resolution == "15m" else rows_30m).to_batches()

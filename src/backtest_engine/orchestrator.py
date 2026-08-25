@@ -161,7 +161,11 @@ class MarketDataReader(Protocol):
     """Satisfied by :class:`backtest_engine.market_data.ParquetMarketDataReader`."""
 
     def iter_batches(
-        self, manifest: Mapping[str, Any], policy: ExecutionPolicy
+        self,
+        manifest: Mapping[str, Any],
+        policy: ExecutionPolicy,
+        *,
+        instrument_ids: frozenset[str] | None = None,
     ) -> Iterable[Any]: ...
 
     def read(self, manifest: Mapping[str, Any], policy: ExecutionPolicy) -> Any: ...
@@ -677,6 +681,9 @@ class BacktestOrchestrator:
         monitor: ResourceMonitor,
     ) -> ReplayOutcome:
         schedule = self._schedule(job.execution_policy)
+        required_instrument_ids = frozenset(
+            requirement.instrument_id for requirement in job.requirements
+        )
         try:
             combined_events: list[MarketDataEvent] = []
             for manifest in job.manifests:
@@ -688,7 +695,11 @@ class BacktestOrchestrator:
                         "every pinned dataset manifest must declare its resolution"
                     )
                 manifest_events = bar_events_from_batches(
-                    self._reader.iter_batches(manifest, job.execution_policy),
+                    self._reader.iter_batches(
+                        manifest,
+                        job.execution_policy,
+                        instrument_ids=required_instrument_ids,
+                    ),
                     data_kind=job.data_kind,
                     resolution=resolution,
                     publication_lag=self._publication_lag,

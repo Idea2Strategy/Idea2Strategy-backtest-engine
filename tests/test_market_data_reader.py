@@ -116,6 +116,36 @@ def test_reader_streams_hashing_and_parquet_batches_without_whole_file_helpers(
     ]
 
 
+def test_reader_filters_verified_batches_to_requested_plan_instruments(tmp_path: Path) -> None:
+    fixture = write_small_market_bars(tmp_path / "market-bars.parquet")
+    source = pq.read_table(fixture.path)
+    other_id = "22222222-2222-4222-8222-222222222222"
+    other = source.set_column(
+        source.schema.get_field_index("instrument_id"),
+        source.schema.field("instrument_id"),
+        pa.array([other_id] * source.num_rows, type=pa.string()),
+    )
+    combined = pa.concat_tables([source, other])
+    pq.write_table(combined, fixture.path, compression="zstd", version="2.6")
+    manifest = _manifest_for(fixture.path)
+    manifest["objects"][0]["row_count"] = combined.num_rows  # type: ignore[index]
+    manifest["dataset_hash"] = canonical_dataset_hash(manifest["objects"])  # type: ignore[arg-type]
+    requested_id = source["instrument_id"][0].as_py()
+
+    batches = list(
+        ParquetMarketDataReader(tmp_path, batch_size=3).iter_batches(
+            manifest,
+            D17_EXECUTION_POLICY_FIXTURE,
+            instrument_ids=frozenset({requested_id}),
+        )
+    )
+
+    assert sum(batch.num_rows for batch in batches) == source.num_rows
+    assert {row["instrument_id"] for batch in batches for row in batch.to_pylist()} == {
+        requested_id
+    }
+
+
 def test_reader_accepts_eight_shard_instrument_major_data_and_clock_orders_events(
     tmp_path: Path,
 ) -> None:

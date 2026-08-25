@@ -167,7 +167,9 @@ def _unavailable_manifest(message: str) -> JobNotSatisfiable:
     return JobNotSatisfiable(message, reason_code="REQUIRED_INPUT_UNAVAILABLE")
 
 
-def _dataset_id(object_keys: list[str], manifest_id: uuid.UUID) -> str:
+def _dataset_id(
+    object_keys: list[str], manifest_id: uuid.UUID, *, is_composite: bool = False
+) -> str:
     bindings: list[tuple[str, str]] = []
     for key in object_keys:
         key_bindings = [
@@ -184,6 +186,19 @@ def _dataset_id(object_keys: list[str], manifest_id: uuid.UUID) -> str:
 
     conventions = {name for name, _value in bindings}
     values = {value for _name, value in bindings}
+    if is_composite:
+        if conventions != {"manifest_id"}:
+            raise _unavailable_manifest(
+                "composite legacy manifests require source manifest_id bindings"
+            )
+        try:
+            for value in values:
+                uuid.UUID(value)
+        except ValueError as exc:
+            raise _unavailable_manifest(
+                "composite dataset object key contains an invalid source manifest UUID"
+            ) from exc
+        return str(manifest_id)
     if len(conventions) != 1 or len(values) != 1:
         raise _unavailable_manifest(
             "dataset manifest object keys must use one binding convention and one UUID"
@@ -216,7 +231,12 @@ class PostgresDatasetManifestSource:
                    manifest.dataset_hash, manifest.schema_version,
                    manifest.period_start, manifest.period_end, manifest.available_at,
                    provider.code AS provider_code, feed.code AS feed_code,
-                   manifest.data_layer, feed.resolution AS feed_resolution
+                   manifest.data_layer, feed.resolution AS feed_resolution,
+                   EXISTS (
+                       SELECT 1 FROM market_data.dataset_lineage lineage
+                        WHERE lineage.derived_manifest_id = manifest.id
+                          AND lineage.relation_type = 'COMPOSED_FROM'
+                   ) AS is_composite
               FROM market_data.dataset_manifests manifest
               JOIN market_data.feeds feed ON feed.id = manifest.feed_id
               JOIN market_data.providers provider ON provider.id = feed.provider_id
@@ -294,11 +314,17 @@ class PostgresDatasetManifestSource:
             raise _unavailable_manifest(
                 f"dataset manifest {manifest_id} has unsupported production resolution {raw_resolution}"
             )
+        is_composite = bool(row.get("is_composite", False))
         return {
             "contract_id": "com06.dataset-manifest",
             "schema_version": 1,
             "manifest_id": str(row["id"]),
-            "dataset_id": _dataset_id([item["object_key"] for item in objects], manifest_id),
+            "dataset_id": _dataset_id(
+                [item["object_key"] for item in objects],
+                manifest_id,
+                is_composite=is_composite,
+            ),
+            "composite": is_composite,
             "revision": int(row["revision_number"]),
             "status": str(row["status"]),
             "dataset_hash": str(row["dataset_hash"]),
@@ -760,9 +786,19 @@ class S3ParquetMarketDataReader:
                 raise ConfigurationError(f"downloaded market-data object checksum does not match: {key}")
             temporary.replace(target)
 
-    def iter_batches(self, manifest: Mapping[str, Any], policy: ExecutionPolicy) -> Any:
+    def iter_batches(
+        self,
+        manifest: Mapping[str, Any],
+        policy: ExecutionPolicy,
+        *,
+        instrument_ids: frozenset[str] | None = None,
+    ) -> Any:
         self.materialize(manifest)
-        return self._reader.iter_batches(manifest, policy)
+        return self._reader.iter_batches(
+            manifest,
+            policy,
+            instrument_ids=instrument_ids,
+        )
 
     def read(self, manifest: Mapping[str, Any], policy: ExecutionPolicy) -> Any:
         self.materialize(manifest)

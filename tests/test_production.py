@@ -262,6 +262,7 @@ def _dataset_manifest_source(
     object_keys: list[str],
     *,
     object_overrides: dict[str, object] | None = None,
+    is_composite: bool = False,
 ) -> PostgresDatasetManifestSource:
     manifest = {
         "id": manifest_id,
@@ -276,6 +277,7 @@ def _dataset_manifest_source(
         "feed_code": "ALPACA_SIP_ALL_30M",
         "data_layer": "ADJUSTED",
         "feed_resolution": "30m",
+        "is_composite": is_composite,
     }
     objects = [
         {
@@ -357,6 +359,30 @@ def test_dataset_manifest_source_preserves_the_canonical_logical_dataset_binding
 
     assert resolved is not None
     assert resolved["dataset_id"] == str(dataset_id)
+
+
+def test_dataset_manifest_source_accepts_explicit_composite_legacy_lineage() -> None:
+    composite_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    source_ids = (
+        UUID("11111111-1111-4111-8111-111111111111"),
+        UUID("22222222-2222-4222-8222-222222222222"),
+    )
+    object_keys = [
+        "historical/provider=alpaca/feed=sip/adjustment=all/session=regular/"
+        f"resolution=30m/revision=00000001/year={2016 + index}/shard=00-of-01/"
+        f"manifest_id={source_id}/part-00001.parquet"
+        for index, source_id in enumerate(source_ids)
+    ]
+
+    resolved = _dataset_manifest_source(
+        composite_id,
+        object_keys,
+        is_composite=True,
+    ).by_id(composite_id)
+
+    assert resolved is not None
+    assert resolved["dataset_id"] == str(composite_id)
+    assert resolved["composite"] is True
 
 
 @pytest.mark.parametrize(

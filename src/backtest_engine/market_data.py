@@ -26,6 +26,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from .contracts import ContractValidationError, validate_dataset_manifest
@@ -281,6 +282,8 @@ class ParquetMarketDataReader:
         self,
         manifest: Mapping[str, Any],
         policy: ExecutionPolicy,
+        *,
+        instrument_ids: frozenset[str] | None = None,
     ) -> Iterator[pa.RecordBatch]:
         """Yield verified bounded batches without loading an object as one byte string.
 
@@ -312,6 +315,14 @@ class ParquetMarketDataReader:
             order_state: _OrderState | None = None
             try:
                 for batch in parquet.iter_batches(batch_size=self._batch_size):
+                    if instrument_ids is not None:
+                        mask = pc.is_in(
+                            batch.column(batch.schema.get_field_index("instrument_id")),
+                            value_set=pa.array(sorted(instrument_ids), type=pa.string()),
+                        )
+                        batch = batch.filter(mask)
+                        if batch.num_rows == 0:
+                            continue
                     order_state = self._verify_batch_rows(batch, policy, order_state)
                     yield batch
             except MarketDataValidationError:

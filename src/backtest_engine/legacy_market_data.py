@@ -17,6 +17,7 @@ import re
 import uuid
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
+from itertools import pairwise
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
@@ -87,6 +88,7 @@ def is_legacy_market_loader_manifest(manifest: Mapping[str, Any]) -> bool:
 
 def _legacy_objects(manifest: Mapping[str, Any]) -> list[dict[str, object]]:
     manifest_id = _uuid(manifest.get("manifest_id"), "manifest_id")
+    composite = manifest.get("composite") is True
     revision = manifest.get("revision")
     if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
         raise LegacyMarketDataError("revision must be a positive integer")
@@ -102,8 +104,9 @@ def _legacy_objects(manifest: Mapping[str, Any]) -> list[dict[str, object]]:
         raise LegacyMarketDataError("objects must be a non-empty array")
 
     hashed: list[dict[str, object]] = []
-    seen: set[tuple[int, int]] = set()
+    seen: set[tuple[int, int, int]] = set()
     shard_counts: set[int] = set()
+    covered_partitions: set[tuple[date, date]] = set()
     for index, raw in enumerate(raw_objects):
         item = _mapping(raw, f"objects[{index}]")
         _uuid(item.get("storage_object_id"), f"objects[{index}].storage_object_id")
@@ -111,13 +114,28 @@ def _legacy_objects(manifest: Mapping[str, Any]) -> list[dict[str, object]]:
         match = _KEY.fullmatch(key)
         if match is None:
             raise LegacyMarketDataError(f"objects[{index}].object_key is not a legacy loader key")
-        if match["manifest_id"] != manifest_id:
+        source_manifest_id = _uuid(match["manifest_id"], f"objects[{index}].source_manifest_id")
+        if not composite and source_manifest_id != manifest_id:
             raise LegacyMarketDataError(f"objects[{index}].object_key binds another manifest")
         if int(match["revision"]) != revision:
             raise LegacyMarketDataError(f"objects[{index}].object_key revision does not match")
         if match["resolution"] != resolution:
             raise LegacyMarketDataError(f"objects[{index}].object_key resolution does not match")
-        if int(match["year"]) != period_start.year:
+        if composite:
+            try:
+                object_start = date.fromisoformat(
+                    _text(item.get("partition_start"), f"objects[{index}].partition_start")
+                )
+                object_end = date.fromisoformat(
+                    _text(item.get("partition_end"), f"objects[{index}].partition_end")
+                )
+            except ValueError as exc:
+                raise LegacyMarketDataError(
+                    f"objects[{index}] has an invalid partition boundary"
+                ) from exc
+        else:
+            object_start, object_end = period_start, period_end
+        if int(match["year"]) != object_start.year:
             raise LegacyMarketDataError(f"objects[{index}].object_key year does not match")
 
         shard = int(match["shard"])
@@ -125,10 +143,12 @@ def _legacy_objects(manifest: Mapping[str, Any]) -> list[dict[str, object]]:
         part = int(match["part"])
         if shard_count < 1 or shard >= shard_count or part < 1:
             raise LegacyMarketDataError(f"objects[{index}].object_key shard/part is invalid")
-        if (shard, part) in seen:
+        identity = (object_start.year, shard, part)
+        if identity in seen:
             raise LegacyMarketDataError("legacy manifest contains a duplicate shard/part")
-        seen.add((shard, part))
+        seen.add(identity)
         shard_counts.add(shard_count)
+        covered_partitions.add((object_start, object_end))
         if item.get("shard_key") != f"s{shard:02d}-of-{shard_count}":
             raise LegacyMarketDataError(f"objects[{index}].shard_key does not match object_key")
         if item.get("part_number") != part:
@@ -146,14 +166,16 @@ def _legacy_objects(manifest: Mapping[str, Any]) -> list[dict[str, object]]:
             raise LegacyMarketDataError(f"objects[{index}].partition_granularity must be YEAR")
         if item.get("schema_version") != LEGACY_MARKET_SCHEMA_ID:
             raise LegacyMarketDataError(f"objects[{index}].schema_version does not match")
-        if item.get("partition_start") != period_start.isoformat():
+        if item.get("partition_start") != object_start.isoformat():
             raise LegacyMarketDataError(f"objects[{index}].partition_start does not match")
-        if item.get("partition_end") != period_end.isoformat():
+        if item.get("partition_end") != object_end.isoformat():
             raise LegacyMarketDataError(f"objects[{index}].partition_end does not match")
-        if _period_date(item.get("period_start"), f"objects[{index}].period_start") != period_start:
+        if _period_date(item.get("period_start"), f"objects[{index}].period_start") != object_start:
             raise LegacyMarketDataError(f"objects[{index}].period_start does not match")
-        if _period_date(item.get("period_end"), f"objects[{index}].period_end") != period_end:
+        if _period_date(item.get("period_end"), f"objects[{index}].period_end") != object_end:
             raise LegacyMarketDataError(f"objects[{index}].period_end does not match")
+        if not period_start <= object_start < object_end <= period_end:
+            raise LegacyMarketDataError(f"objects[{index}] partition is outside the manifest period")
 
         storage_fields = (
             item.get("storage_provider"),
@@ -166,25 +188,46 @@ def _legacy_objects(manifest: Mapping[str, Any]) -> list[dict[str, object]]:
             _text(item.get("bucket_name"), f"objects[{index}].bucket_name")
             _text(item.get("provider_version_id"), f"objects[{index}].provider_version_id")
 
-        hashed.append(
-            {
+        hashed_item: dict[str, object] = {
                 "content_sha256": content_hash,
                 "row_count": row_count,
-                "period_start": period_start.isoformat(),
-                "period_end": period_end.isoformat(),
+                "period_start": object_start.isoformat(),
+                "period_end": object_end.isoformat(),
                 "shard": shard,
                 "part": part,
             }
-        )
+        if composite:
+            hashed_item["source_manifest_id"] = source_manifest_id
+        hashed.append(hashed_item)
 
     if len(shard_counts) != 1:
         raise LegacyMarketDataError("legacy manifest objects disagree on shard count")
     shard_count = shard_counts.pop()
-    if seen != {(shard, 1) for shard in range(shard_count)}:
-        raise LegacyMarketDataError("legacy manifest must contain exactly one part for every shard")
+    expected = {
+        (partition_start.year, shard, 1)
+        for partition_start, _partition_end in covered_partitions
+        for shard in range(shard_count)
+    }
+    if seen != expected:
+        raise LegacyMarketDataError(
+            "legacy manifest must contain exactly one part for every shard and partition"
+        )
+    if composite:
+        ordered_partitions = sorted(covered_partitions)
+        if (
+            not ordered_partitions
+            or ordered_partitions[0][0] != period_start
+            or ordered_partitions[-1][1] != period_end
+            or any(left[1] != right[0] for left, right in pairwise(ordered_partitions))
+        ):
+            raise LegacyMarketDataError("composite legacy partitions must cover the manifest contiguously")
     return sorted(
         hashed,
-        key=lambda item: (cast(int, item["shard"]), cast(int, item["part"])),
+        key=lambda item: (
+            cast(str, item["period_start"]),
+            cast(int, item["shard"]),
+            cast(int, item["part"]),
+        ),
     )
 
 
@@ -203,6 +246,8 @@ def legacy_dataset_hash(manifest: Mapping[str, Any]) -> str:
         "processing_version": LEGACY_PROCESSING_VERSION,
         "objects": _legacy_objects(manifest),
     }
+    if manifest.get("composite") is True:
+        payload["publication_kind"] = "COMPOSITE_FROM_IMMUTABLE_MANIFESTS"
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
