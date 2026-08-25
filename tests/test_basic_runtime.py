@@ -148,6 +148,7 @@ def test_loads_bs_published_plan_unmodified() -> None:
     ]
     assert plan.terminal_step.operation == "EMIT_ORDER_CANDIDATE"
     assert (plan.side, plan.order_type, plan.allocation) == ("BUY", "MARKET", "EQUAL")
+    assert _plan_visible_event_limit(plan) == 15
 
     assert len(plan.flows) == 1
     flow = plan.flows[0]

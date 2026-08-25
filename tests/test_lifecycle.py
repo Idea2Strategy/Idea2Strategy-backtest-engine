@@ -197,6 +197,7 @@ def test_the_published_job_carries_the_identity_the_worker_needs(
     assert message["idempotencyKey"] == B_IDEMPOTENCY_KEY
     assert message["inputBundleFingerprint"] == accepted.run.run.configuration_hash
     assert message["inputBundleFingerprint"].startswith("sha256:")
+    assert message["featureMaterializations"] == official_request["featureMaterializations"]
 
 
 def test_redelivery_does_not_dispatch_a_second_job(

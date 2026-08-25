@@ -222,6 +222,10 @@ def build_stack(
         else official_backtest_request(
             plan=plan,
             expected_dataset_hash=f"sha256:{market_data.manifest['dataset_hash']}",
+            # This traversal pins the independently hand-checked RSI arithmetic
+            # from market bars. Verified materialized-feature consumption has its
+            # own object-boundary suite in test_feature_outputs.py.
+            include_feature_materializations=False,
         )
     )
 

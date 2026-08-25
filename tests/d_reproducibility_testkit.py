@@ -320,6 +320,7 @@ def official_backtest_request(
     plan: Mapping[str, Any] | None = None,
     occurred_at: str = "2024-01-03T01:01:00Z",
     expected_dataset_hash: str | None = None,
+    include_feature_materializations: bool = True,
 ) -> dict[str, Any]:
     """B's ``OFFICIAL_BACKTEST_REQUESTED``, re-addressed to the seeded bot.
 
@@ -367,7 +368,7 @@ def official_backtest_request(
                 "featureMaterializationId": FEATURE_MATERIALIZATION_ID,
                 "lockedResultHash": FEATURE_RESULT_HASH,
             }
-        ],
+        ] if include_feature_materializations else [],
     }
     request["metadata"]["idempotencyKey"] = compute_message_idempotency_key(
         contract_version=STRATEGY_BOT_CONTRACT_VERSION,

@@ -1363,9 +1363,16 @@ def _plan_visible_event_limit(plan: BasicCompiledPlan) -> int:
     steps = [step for flow in plan.flows for step in flow.condition_steps]
     if any(step.operation == "MACD_CROSS" for step in steps):
         return LIVE_SERIES_BARS
+    feature_lookback = max(
+        (feature.warmup_bars for feature in plan.required_features),
+        default=1,
+    )
     return min(
         LIVE_SERIES_BARS,
-        max((_raw_operation_lookback(step) for step in steps), default=1),
+        max(
+            feature_lookback,
+            max((_raw_operation_lookback(step) for step in steps), default=1),
+        ),
     )
 
 

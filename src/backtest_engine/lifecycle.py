@@ -853,6 +853,9 @@ class BacktestLifecycleService:
             "compiledPlanChecksum": checksum,
             "datasetManifestId": str(manifest_id),
             "expectedSnapshotHash": request["expectedSnapshotHash"],
+            "featureMaterializations": copy.deepcopy(
+                list(request.get("featureMaterializations", ()))
+            ),
         }
         return row, pins, message
 
