@@ -10,7 +10,7 @@ INSERT INTO strategy.element_catalog_versions (
     'basic-semantic/v1',
     'basic-elements:2026-08-25',
     'alpaca-sip/v1',
-    'sha256:' || encode(digest('basic-elements:2026-08-25', 'sha256'), 'hex'),
+    'sha256:' || encode(public.digest('basic-elements:2026-08-25', 'sha256'), 'hex'),
     '2026-08-25 00:00:00+00',
     NULL
 );
@@ -67,7 +67,7 @@ WITH copied AS (
         input_port_schema,
         output_port_schema,
         execution_contract,
-        'sha256:' || encode(digest(
+        'sha256:' || encode(public.digest(
             element_code || ':' || parameter_schema::text || ':' || execution_contract::text,
             'sha256'), 'hex') AS definition_hash
     FROM copied
