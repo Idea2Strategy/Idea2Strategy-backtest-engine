@@ -132,6 +132,7 @@ REJECT_REASON_CODES = frozenset(
         "FRACTIONAL_REQUIRES_MARKET_DAY",
         "GROSS_EXPOSURE_EXCEEDED",
         "INSTRUMENT_EXPOSURE_EXCEEDED",
+        "MAX_INSTRUMENT_POSITION_PERCENT",
         "INSUFFICIENT_AVAILABLE_CASH",
         "NOTIONAL_REQUIRES_LONG_EXPOSURE",
         "ORDER_HORIZON_EXCEEDED",
@@ -394,6 +395,7 @@ class OrderRequest:
     limit_price: Decimal | None = None
     stop_price: Decimal | None = None
     trail_percent: Decimal | None = None
+    max_instrument_position_notional: Decimal | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "order_id", _uuid(self.order_id, "order_id"))
@@ -431,6 +433,18 @@ class OrderRequest:
         self._validate_requested_measure()
         self._validate_parameters()
         self._validate_expiry()
+        if self.max_instrument_position_notional is not None:
+            object.__setattr__(
+                self,
+                "max_instrument_position_notional",
+                quantize_money(
+                    _positive(
+                        self.max_instrument_position_notional,
+                        "max_instrument_position_notional",
+                    ),
+                    "max_instrument_position_notional",
+                ),
+            )
 
     def _validate_requested_measure(self) -> None:
         if (self.quantity is None) == (self.notional_amount is None):
@@ -992,6 +1006,20 @@ class BacktestExecutionModel:
             return
 
         estimated_notional, estimated_cash = self._estimated_commitment(state)
+        if request.max_instrument_position_notional is not None:
+            estimated_price = self._estimated_price(
+                OrderSide.BUY, request.reference_price
+            )
+            marked_position = quantize_money(
+                self.position(request.instrument_id).quantity * estimated_price,
+                "marked_position",
+            )
+            reserved = self._instrument_reserved_notional(
+                request.instrument_id, excluding=state
+            )
+            if marked_position + reserved >= request.max_instrument_position_notional:
+                self._reject(state, "MAX_INSTRUMENT_POSITION_PERCENT")
+                return
         available_cash = self.buying_power - self._reserved_cash(excluding=state)
         if estimated_cash > available_cash:
             self._reject(state, "INSUFFICIENT_AVAILABLE_CASH")
@@ -1187,6 +1215,20 @@ class BacktestExecutionModel:
                 )
                 / price
             )
+            if request.max_instrument_position_notional is not None:
+                marked_position = quantize_money(
+                    self.position(request.instrument_id).quantity * price,
+                    "marked_position",
+                )
+                remaining_cap = max(
+                    request.max_instrument_position_notional
+                    - marked_position
+                    - self._instrument_reserved_notional(
+                        request.instrument_id, excluding=state
+                    ),
+                    ZERO,
+                )
+                caps.append(remaining_cap / price)
             caps.append(
                 max(
                     self._risk_limits.max_instrument_exposure

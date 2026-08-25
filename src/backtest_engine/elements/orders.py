@@ -109,6 +109,7 @@ class OrderCandidate:
     session_date_et: date
     session_closes_at: datetime
     budget_cap_bps: int
+    max_position_percent: Decimal = Decimal("100")
     order_percent: Decimal = Decimal("100")
     execution_mode: str = "1회만"
     wait_mode: str = "조건 재충족"
@@ -190,6 +191,10 @@ class OrderCandidate:
             )
         if not Decimal(0) < self.order_percent <= Decimal(100):
             raise ElementEvaluationError("order_percent must lie in (0, 100]")
+        if not Decimal(0) < self.max_position_percent <= Decimal(100):
+            raise ElementEvaluationError(
+                "max_position_percent must lie in (0, 100]"
+            )
         if self.execution_mode not in {
             "1회만",
             "주기마다",
@@ -248,6 +253,14 @@ def emit_order_candidate(
     wait_mode = step.arguments.get("waitMode", "조건 재충족")
     wait_interval = int(step.arguments.get("waitInterval", "1"))
     max_executions = int(step.arguments.get("maxExecutions", "1"))
+    try:
+        max_position_percent = Decimal(
+            step.arguments.get("maxPositionPercent", "100")
+        )
+    except Exception as exc:
+        raise ElementEvaluationError(
+            "maxPositionPercent must be a decimal"
+        ) from exc
 
     if allocation_mode not in SUPPORTED_ALLOCATION_MODES:
         raise _reject_argument(
@@ -290,6 +303,7 @@ def emit_order_candidate(
         session_date_et=session_date_et,
         session_closes_at=session_closes_at,
         budget_cap_bps=budget_cap_bps,
+        max_position_percent=max_position_percent,
         order_percent=order_percent,
         execution_mode=execution_mode,
         wait_mode=wait_mode,

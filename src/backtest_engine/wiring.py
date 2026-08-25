@@ -429,6 +429,11 @@ class ExecutionModelEngine:
             eligible_at=candidate.eligible_at,
             day_expires_at=candidate.session_closes_at,
             reference_price=candidate.reference_price,
+            max_instrument_position_notional=apply_rate(
+                self._run.initial_cash,
+                Decimal(candidate.max_position_percent) / Decimal(100),
+                "max_instrument_position_notional",
+            ),
         )
         order = self._model.submit(request)
         self._records.append(

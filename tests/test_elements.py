@@ -326,6 +326,7 @@ def test_the_published_catalog_version_is_the_one_b_emits() -> None:
         "basic-elements:2026-07-31",
         "basic-elements:2026-08-07",
         "basic-elements:2026-08-08",
+        "basic-elements:2026-08-25",
     )
     catalog = element_catalog(CATALOG_VERSION)
     assert catalog.version == CATALOG_VERSION
