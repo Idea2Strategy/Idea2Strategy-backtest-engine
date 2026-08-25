@@ -955,11 +955,71 @@ _BASIC_ELEMENTS_2026_08_08 = ElementCatalog(
 )
 
 
+def _v2_specs() -> Mapping[str, ElementSpec]:
+    specs = dict(_BASIC_ELEMENTS_2026_08_08.specs)
+    specs["HOLDING_PERIOD"] = _production_spec(
+        "HOLDING_PERIOD",
+        ("unit", "amount", "resolution"),
+        enumerations={
+            "unit": ("SESSION_CLOSE", "BAR", "TRADING_DAY"),
+            "resolution": _PRODUCTION_RESOLUTIONS,
+        },
+        decimals=("amount",),
+    )
+    specs["EMIT_ORDER_CANDIDATE"] = ElementSpec(
+        operation="EMIT_ORDER_CANDIDATE",
+        required_arguments=(
+            "allocation",
+            "orderType",
+            "timeInForce",
+            "side",
+            "orderPercent",
+            "maxPositionPercent",
+            "executionMode",
+            "waitMode",
+            "waitInterval",
+            "maxExecutions",
+        ),
+        enumerations=MappingProxyType(
+            {
+                "allocation": _TERMINAL_ALLOCATIONS,
+                "orderType": _TERMINAL_ORDER_TYPES,
+                "timeInForce": ("DAY",),
+                "side": _TERMINAL_SIDES,
+                "executionMode": _EXECUTION_MODES,
+                "waitMode": _WAIT_MODES,
+            }
+        ),
+        decimal_arguments=(
+            "orderPercent",
+            "maxPositionPercent",
+            "waitInterval",
+            "maxExecutions",
+        ),
+        feature_arguments=(),
+        terminal=True,
+        produces_value=False,
+        consumes_value=False,
+        evaluator=_evaluate_terminal,
+    )
+    return MappingProxyType(specs)
+
+
+_BASIC_ELEMENTS_2026_08_25 = ElementCatalog(
+    version="basic-elements:2026-08-25",
+    specs=_v2_specs(),
+    feature_versions=_BASIC_ELEMENTS_2026_08_08.feature_versions,
+    canonical_feature_ids=_BASIC_ELEMENTS_2026_08_08.canonical_feature_ids,
+    canonical_feature_resolutions=_BASIC_ELEMENTS_2026_08_08.canonical_feature_resolutions,
+)
+
+
 ELEMENT_CATALOGS: Mapping[str, ElementCatalog] = MappingProxyType(
     {
         _BASIC_ELEMENTS_2026_07_31.version: _BASIC_ELEMENTS_2026_07_31,
         _BASIC_ELEMENTS_2026_08_07.version: _BASIC_ELEMENTS_2026_08_07,
         _BASIC_ELEMENTS_2026_08_08.version: _BASIC_ELEMENTS_2026_08_08,
+        _BASIC_ELEMENTS_2026_08_25.version: _BASIC_ELEMENTS_2026_08_25,
     }
 )
 

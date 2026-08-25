@@ -122,15 +122,17 @@ def _engine(
 
 def _candidate(
     *,
+    instrument_id: str = INSTRUMENT_ID,
     side: str = "BUY",
     allocation: Fraction | None = Fraction(1, 1),
     budget_cap_bps: int = 10000,
+    max_position_percent: Decimal = Decimal("100"),
     reference_price: Decimal = Decimal("100.00000000"),
     decided_at: datetime = datetime(2024, 1, 2, 14, 45, tzinfo=UTC),
 ) -> OrderCandidate:
     return OrderCandidate(
         evaluation_id=f"eval-{decided_at.isoformat()}-{side}",
-        instrument_id=INSTRUMENT_ID,
+        instrument_id=instrument_id,
         partition_key="partition-1",
         flow_id="flow-1",
         side=side,
@@ -142,6 +144,7 @@ def _candidate(
         session_date_et=date(2024, 1, 2),
         session_closes_at=SESSION_CLOSE,
         budget_cap_bps=budget_cap_bps,
+        max_position_percent=max_position_percent,
     )
 
 
@@ -305,6 +308,54 @@ def test_a_refused_order_is_still_recorded_as_evidence() -> None:
     assert engine.declined_candidates == ()
 
 
+def test_per_instrument_cap_counts_filled_and_reserved_buy_exposure() -> None:
+    engine = _engine()
+    first = _candidate(
+        budget_cap_bps=2500,
+        max_position_percent=Decimal("40"),
+    )
+    assert engine.place(first) is not None
+    assert engine.settle(_bar_event(15)) == 1
+
+    second = _candidate(
+        budget_cap_bps=2500,
+        max_position_percent=Decimal("40"),
+        decided_at=datetime(2024, 1, 2, 14, 47, tzinfo=UTC),
+    )
+    assert engine.place(second) is not None
+
+    third = _candidate(
+        budget_cap_bps=2500,
+        max_position_percent=Decimal("40"),
+        decided_at=datetime(2024, 1, 2, 14, 48, tzinfo=UTC),
+    )
+    assert engine.place(third) is None
+    assert engine.records[-1].kind is ResultRecordKind.REJECTION
+    assert engine.records[-1].reason_code == "MAX_INSTRUMENT_POSITION_PERCENT"
+
+    assert engine.settle(_bar_event(17)) >= 1
+    position = engine.summary().positions[INSTRUMENT_ID]
+    latest_fill_price = engine.records[-1].price
+    assert latest_fill_price is not None
+    assert position * latest_fill_price <= Decimal("40000.00000000")
+
+
+def test_position_caps_are_isolated_between_instruments() -> None:
+    engine = _engine()
+    other_instrument = "00000000-0000-4000-8000-000000000302"
+
+    assert engine.place(_candidate(
+        budget_cap_bps=2000,
+        max_position_percent=Decimal("20"),
+    )) is not None
+    assert engine.place(_candidate(
+        instrument_id=other_instrument,
+        budget_cap_bps=2000,
+        max_position_percent=Decimal("20"),
+        decided_at=datetime(2024, 1, 2, 14, 47, tzinfo=UTC),
+    )) is not None
+
+
 def test_a_sell_candidate_is_sized_from_the_held_position() -> None:
     """A disposal carries no allocation; its size is what the run actually holds."""
     engine = _engine()
@@ -315,6 +366,7 @@ def test_a_sell_candidate_is_sized_from_the_held_position() -> None:
     sell = _candidate(
         side="SELL",
         allocation=None,
+        max_position_percent=Decimal("1"),
         decided_at=datetime(2024, 1, 2, 14, 47, tzinfo=UTC),
     )
     order_id = engine.place(sell)

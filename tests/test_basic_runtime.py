@@ -244,6 +244,65 @@ def test_loads_and_executes_the_full_catalog_without_synthetic_features(
     assert result.decisions[0].reference_price == Decimal("101.00000000")
 
 
+def test_v2_catalog_position_cap_survives_plan_loading_and_candidate_emission() -> None:
+    def v2_catalog(document: dict[str, Any]) -> None:
+        document["elementCatalogVersion"] = "basic-elements:2026-08-25"
+        document["requiredFeatures"] = []
+        document["steps"] = [
+            {"sequence": 1, "operation": "PRICE_COMPARE", "arguments": {
+                "resolution": "30m", "operator": "GT", "reference": "PREVIOUS_CLOSE",
+            }},
+            {"sequence": 2, "operation": "EMIT_ORDER_CANDIDATE", "arguments": {
+                "allocation": "EQUAL", "orderType": "MARKET", "timeInForce": "DAY",
+                "side": "BUY", "orderPercent": "25", "maxPositionPercent": "40",
+                "executionMode": "1회만", "waitMode": "조건 재충족",
+                "waitInterval": "1", "maxExecutions": "1",
+            }},
+        ]
+
+    plan = _runtime().load(_resealed(v2_catalog))
+    evaluation_at = OPEN + timedelta(hours=1)
+    bars = tuple(
+        SeriesBar(
+            instrument_id=FIRST,
+            resolution="30m",
+            starts_at=OPEN + timedelta(minutes=30 * index),
+            ends_at=OPEN + timedelta(minutes=30 * (index + 1)),
+            close=Decimal(value),
+            volume=Decimal("1000"),
+        )
+        for index, value in enumerate(("100", "101"))
+    )
+    result = _runtime().execute(
+        plan,
+        {FIRST: InstrumentInput(
+            instrument_id=FIRST,
+            series=(InstrumentSeries(
+                instrument_id=FIRST,
+                data_kind="ADJUSTED_BAR",
+                resolution="30m",
+                bars=bars,
+            ),),
+            values={
+                "bar.closed.30m": "true",
+                "closes.30m": "100,101",
+                "volumes.30m": "1000,1000",
+            },
+        )},
+        as_of=evaluation_at,
+    )
+    candidate = _runtime().order_candidates(
+        plan,
+        result,
+        evaluation_id="evaluation-v2",
+        session_date_et=SESSION_DATE,
+        session_closes_at=evaluation_at + timedelta(hours=1),
+    )[0]
+
+    assert candidate.order_percent == Decimal("25")
+    assert candidate.max_position_percent == Decimal("40")
+
+
 @pytest.mark.parametrize(
     ("resolution", "wire_resolution", "feature_id"),
     [

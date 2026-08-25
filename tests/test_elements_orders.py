@@ -39,6 +39,23 @@ BUY_STEP = PlanStep(
     arguments={"allocation": "EQUAL", "orderType": "MARKET", "side": "BUY"},
 )
 
+V2_BUY_STEP = PlanStep(
+    sequence=3,
+    operation="EMIT_ORDER_CANDIDATE",
+    arguments={
+        "allocation": "EQUAL",
+        "orderType": "MARKET",
+        "timeInForce": "DAY",
+        "side": "BUY",
+        "orderPercent": "25",
+        "maxPositionPercent": "40",
+        "executionMode": "1회만",
+        "waitMode": "조건 재충족",
+        "waitInterval": "1",
+        "maxExecutions": "1",
+    },
+)
+
 
 def _emit(**overrides: Any) -> OrderCandidate:
     arguments: dict[str, Any] = {
@@ -87,6 +104,25 @@ def test_emits_every_field_the_execution_layer_needs() -> None:
     assert candidate.session_date_et == date(2025, 11, 28)
     assert candidate.session_closes_at == CLOSES_AT
     assert candidate.budget_cap_bps == 10000
+    assert candidate.max_position_percent == Decimal("100")
+
+
+def test_v2_terminal_requires_and_emits_the_per_instrument_position_cap() -> None:
+    candidate = _emit(step=V2_BUY_STEP)
+
+    assert candidate.max_position_percent == Decimal("40")
+
+
+@pytest.mark.parametrize("cap", ["0", "100.1", "-1", "many"])
+def test_v2_terminal_refuses_an_invalid_per_instrument_position_cap(cap: str) -> None:
+    step = PlanStep(
+        sequence=V2_BUY_STEP.sequence,
+        operation=V2_BUY_STEP.operation,
+        arguments={**V2_BUY_STEP.arguments, "maxPositionPercent": cap},
+    )
+
+    with pytest.raises((ElementCompatibilityError, ElementEvaluationError)):
+        _emit(step=step)
 
 
 def test_the_side_comes_from_the_step_and_a_sell_carries_no_allocation() -> None:
