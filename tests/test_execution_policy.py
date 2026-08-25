@@ -223,6 +223,20 @@ def test_policy_accepts_a_complete_et_calendar_month() -> None:
         _ = policy.quarter_count
 
 
+def test_policy_accepts_the_fixed_maximum_local_data_window() -> None:
+    policy = _policy(
+        "2026-Q3",
+        "official-backtest-policy-max-range-v1",
+        datetime(2016, 1, 1, 5, 0, tzinfo=timezone.utc),
+        datetime(2026, 7, 30, 4, 0, tzinfo=timezone.utc),
+    )
+
+    assert policy.period_start == datetime(2016, 1, 1, 5, 0, tzinfo=timezone.utc)
+    assert policy.period_end == datetime(2026, 7, 30, 4, 0, tzinfo=timezone.utc)
+    with pytest.raises(ValueError, match="not aligned to ET quarter"):
+        _ = policy.quarter_count
+
+
 def test_policy_rejects_a_reversed_period() -> None:
     with pytest.raises(ValueError, match="increasing"):
         _policy(

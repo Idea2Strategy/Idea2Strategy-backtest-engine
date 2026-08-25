@@ -34,11 +34,11 @@ def _day(value: str) -> date:
 def test_calendar_version_is_pinned_and_fits_the_canonical_column() -> None:
     # market_data.trading_sessions.calendar_version is varchar(40) and the
     # unique key is (exchange_mic, session_date, calendar_version).
-    assert XNYS_CALENDAR_VERSION == "xnys-2024-2026:1.0.0"
+    assert XNYS_CALENDAR_VERSION == "xnys-2016-2026:1.0.0"
     assert XNYS_CALENDAR.calendar_version == XNYS_CALENDAR_VERSION
     assert len(XNYS_CALENDAR.calendar_version) <= 40
     assert XNYS_CALENDAR.exchange_mic == "XNYS"
-    assert XNYS_CALENDAR.covered_from == _day("2024-01-01")
+    assert XNYS_CALENDAR.covered_from == _day("2016-01-01")
     assert XNYS_CALENDAR.covered_through == _day("2026-12-31")
 
 
@@ -90,6 +90,14 @@ def test_closed_dates_have_no_boundaries(session_date: str) -> None:
     assert record.opens_at is None
     assert record.closes_at is None
     assert record.to_official_session() is None
+
+
+def test_maximum_range_calendar_pins_pre_2024_one_off_closure() -> None:
+    record = XNYS_CALENDAR.session_on(_day("2018-12-05"))
+
+    assert record.session_type is SessionType.CLOSED
+    assert record.opens_at is None
+    assert record.closes_at is None
 
 
 def test_thursday_before_a_saturday_independence_day_is_a_full_session() -> None:
@@ -176,7 +184,7 @@ def test_records_are_canonical_trading_session_rows() -> None:
         "opens_at": _utc("2025-11-28T14:30:00Z"),
         "closes_at": _utc("2025-11-28T18:00:00Z"),
         "session_type": "EARLY_CLOSE",
-        "calendar_version": "xnys-2024-2026:1.0.0",
+        "calendar_version": "xnys-2016-2026:1.0.0",
     }
 
 
@@ -185,16 +193,16 @@ def test_unique_key_columns_are_unique_across_the_pinned_range() -> None:
     keys = {(item.exchange_mic, item.session_date, item.calendar_version) for item in records}
 
     assert len(keys) == len(records)
-    assert len(records) == 366 + 365 + 365
+    assert len(records) == 4018
 
 
 def test_dates_outside_the_pinned_coverage_fail_closed() -> None:
-    with pytest.raises(CalendarCoverageError, match="2023-12-29"):
-        XNYS_CALENDAR.session_on(_day("2023-12-29"))
+    with pytest.raises(CalendarCoverageError, match="2015-12-31"):
+        XNYS_CALENDAR.session_on(_day("2015-12-31"))
     with pytest.raises(CalendarCoverageError, match="2027-01-04"):
         XNYS_CALENDAR.session_on(_day("2027-01-04"))
     with pytest.raises(CalendarCoverageError, match="coverage"):
-        XNYS_CALENDAR.records(_day("2023-12-01"), _day("2024-01-05"))
+        XNYS_CALENDAR.records(_day("2015-12-01"), _day("2016-01-05"))
 
 
 def test_schedule_feeds_the_event_clock_with_matching_coverage() -> None:
