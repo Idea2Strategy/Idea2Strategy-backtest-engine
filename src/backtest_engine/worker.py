@@ -173,7 +173,9 @@ class ExecutionKeyStore(Protocol):
         lease_duration: timedelta | None = None,
     ) -> ExecutionClaim: ...
 
-    def heartbeat(self, key: str, claim: ExecutionClaim, *, lease_duration: timedelta) -> None: ...
+    def heartbeat(
+        self, key: str, claim: ExecutionClaim, *, lease_duration: timedelta
+    ) -> str | None: ...
 
     def release(
         self,
@@ -191,7 +193,16 @@ class ExecutionKeyStore(Protocol):
         *,
         now: datetime,
         claim: ExecutionClaim | None = None,
+        reason_code: str | None = None,
+        run_id: str | None = None,
+        run_failure_code: str | None = None,
     ) -> None: ...
+
+    def record_run_failure(
+        self, key: str, run_id: str, failure_code: str, *, now: datetime
+    ) -> ExecutionRecordStatus: ...
+
+    def recover_stale(self, *, max_attempts: int, queued_timeout: timedelta) -> Any: ...
 
     def status(self, key: str) -> ExecutionRecordStatus | None: ...
 
@@ -214,6 +225,7 @@ class InMemoryExecutionKeyStore:
         #: than a second attempt 1. ``backtest.run_attempts`` keys on
         #: ``(run_id, attempt_number)``, so reusing 1 would collide.
         self._released_attempts: dict[str, int] = {}
+        self._run_failures: dict[str, str] = {}
         self._lock = threading.Lock()
 
     def claim(
@@ -241,7 +253,9 @@ class InMemoryExecutionKeyStore:
                 existing_status=record.status,
             )
 
-    def heartbeat(self, key: str, claim: ExecutionClaim, *, lease_duration: timedelta) -> None:
+    def heartbeat(
+        self, key: str, claim: ExecutionClaim, *, lease_duration: timedelta
+    ) -> str | None:
         return None
 
     def release(
@@ -265,6 +279,9 @@ class InMemoryExecutionKeyStore:
         *,
         now: datetime,
         claim: ExecutionClaim | None = None,
+        reason_code: str | None = None,
+        run_id: str | None = None,
+        run_failure_code: str | None = None,
     ) -> None:
         if status is ExecutionRecordStatus.IN_PROGRESS:
             raise ValueError("finish requires a terminal status")
@@ -274,6 +291,28 @@ class InMemoryExecutionKeyStore:
                 raise KeyError(f"no execution record for {key}")
             record.status = status
             record.updated_at = now
+            if status is ExecutionRecordStatus.FAILED and run_id is not None:
+                self._run_failures[run_id] = run_failure_code or reason_code or "EXECUTION_FAILED"
+
+    def record_run_failure(
+        self, key: str, run_id: str, failure_code: str, *, now: datetime
+    ) -> ExecutionRecordStatus:
+        del now
+        with self._lock:
+            record = self._records.get(key)
+            if record is not None:
+                if record.status is ExecutionRecordStatus.IN_PROGRESS:
+                    return ExecutionRecordStatus.IN_PROGRESS
+                return record.status
+            self._run_failures.setdefault(run_id, failure_code)
+            return ExecutionRecordStatus.FAILED
+
+    def run_terminal_failure(self, run_id: str) -> str | None:
+        with self._lock:
+            return self._run_failures.get(run_id)
+
+    def recover_stale(self, *, max_attempts: int, queued_timeout: timedelta) -> None:
+        del max_attempts, queued_timeout
 
     def status(self, key: str) -> ExecutionRecordStatus | None:
         with self._lock:
@@ -302,6 +341,21 @@ class JobContext:
     worker_id: str
     attempt_id: str | None = None
     claim_token: str | None = None
+    cancellation_reason: Callable[[], str | None] | None = None
+
+
+class _CancellationSignal:
+    def __init__(self) -> None:
+        self._reason: str | None = None
+        self._lock = threading.Lock()
+
+    def request(self, reason: str) -> None:
+        with self._lock:
+            self._reason = reason
+
+    def reason(self) -> str | None:
+        with self._lock:
+            return self._reason
 
 
 @dataclass(frozen=True, slots=True)
@@ -453,11 +507,6 @@ class BacktestWorker:
         receipt = str(message["ReceiptHandle"])
         receive_count = int(message.get("Attributes", {}).get("ApproximateReceiveCount", "1"))
 
-        if receive_count > self._config.max_receive_count:
-            # Explicit routing, not a redrive policy: the reason travels with
-            # the message so the DLQ is triageable.
-            return self._dead_letter(message, receipt, "MAX_RECEIVE_COUNT_EXCEEDED", message_id, None)
-
         try:
             job = json.loads(str(message.get("Body", "")))
             if not isinstance(job, Mapping):
@@ -467,6 +516,26 @@ class BacktestWorker:
             key = worker_execution_key_for(run_id, idempotency_key)
         except Exception:
             return self._dead_letter(message, receipt, "MESSAGE_NOT_PARSEABLE", message_id, None)
+
+        if receive_count > self._config.max_receive_count:
+            # Parse first so an addressable legacy message that already crossed
+            # the limit repairs its durable run instead of disappearing into DLQ.
+            existing = self._store.record_run_failure(
+                key, run_id, "MAX_ATTEMPTS_EXHAUSTED", now=self._clock()
+            )
+            if existing is ExecutionRecordStatus.IN_PROGRESS:
+                return HandledMessage(
+                    message_id, MessageDisposition.RETURNED, "EXECUTION_KEY_HELD", key
+                )
+            if existing in (ExecutionRecordStatus.SUCCEEDED, ExecutionRecordStatus.CANCELLED):
+                self._delete(receipt)
+                return HandledMessage(
+                    message_id, MessageDisposition.DELETED,
+                    f"DUPLICATE_ALREADY_{existing.value}", key,
+                )
+            return self._dead_letter(
+                message, receipt, "MAX_ATTEMPTS_EXHAUSTED", message_id, key
+            )
 
         claim = self._store.claim(
             key,
@@ -478,6 +547,7 @@ class BacktestWorker:
         if not claim.acquired:
             return self._on_duplicate(message, receipt, claim, message_id, key)
 
+        cancellation = _CancellationSignal()
         context = JobContext(
             worker_execution_key=key,
             attempt_number=claim.attempt_number,
@@ -486,8 +556,9 @@ class BacktestWorker:
             worker_id=self._config.worker_id,
             attempt_id=claim.attempt_id,
             claim_token=claim.claim_token,
+            cancellation_reason=cancellation.reason,
         )
-        outcome = self._invoke(job, context, receipt, key, claim)
+        outcome = self._invoke(job, context, receipt, key, claim, cancellation)
         self._release_attempt_resources()
 
         if outcome.result is JobResult.SUCCEEDED:
@@ -496,7 +567,14 @@ class BacktestWorker:
             return HandledMessage(message_id, MessageDisposition.DELETED, None, key)
 
         if outcome.result is JobResult.CANCELLED:
-            self._store.finish(key, ExecutionRecordStatus.CANCELLED, now=self._clock(), claim=claim)
+            self._store.finish(
+                key,
+                ExecutionRecordStatus.CANCELLED,
+                now=self._clock(),
+                claim=claim,
+                reason_code=outcome.reason_code,
+                run_id=run_id,
+            )
             self._delete(receipt)
             return HandledMessage(message_id, MessageDisposition.DELETED, outcome.reason_code, key)
 
@@ -513,6 +591,20 @@ class BacktestWorker:
                 reason_code,
                 message_id,
             )
+            if receive_count >= self._config.max_receive_count:
+                terminal_reason = f"MAX_ATTEMPTS_EXHAUSTED:{reason_code}"
+                self._store.finish(
+                    key,
+                    ExecutionRecordStatus.FAILED,
+                    now=self._clock(),
+                    claim=claim,
+                    reason_code=reason_code,
+                    run_id=run_id,
+                    run_failure_code="MAX_ATTEMPTS_EXHAUSTED",
+                )
+                return self._dead_letter(
+                    message, receipt, terminal_reason, message_id, key
+                )
             self._store.release(
                 key,
                 now=self._clock(),
@@ -522,7 +614,15 @@ class BacktestWorker:
             self._return_to_queue(receipt)
             return HandledMessage(message_id, MessageDisposition.RETURNED, reason_code, key)
 
-        self._store.finish(key, ExecutionRecordStatus.FAILED, now=self._clock(), claim=claim)
+        self._store.finish(
+            key,
+            ExecutionRecordStatus.FAILED,
+            now=self._clock(),
+            claim=claim,
+            reason_code=outcome.reason_code,
+            run_id=run_id,
+            run_failure_code=outcome.reason_code,
+        )
         return self._dead_letter(message, receipt, outcome.reason_code or "PERMANENT_FAILURE", message_id, key)
 
     @staticmethod
@@ -542,10 +642,16 @@ class BacktestWorker:
         receipt: str,
         key: str,
         claim: ExecutionClaim,
+        cancellation: _CancellationSignal,
     ) -> JobOutcome:
         """Run the handler with a visibility heartbeat alongside it."""
         done = threading.Event()
-        beat = threading.Thread(target=self._beat, args=(receipt, done, key, claim), daemon=True, name="bt4-heartbeat")
+        beat = threading.Thread(
+            target=self._beat,
+            args=(receipt, done, key, claim, cancellation),
+            daemon=True,
+            name="bt4-heartbeat",
+        )
         beat.start()
         try:
             return self._handler(job, context)
@@ -562,21 +668,50 @@ class BacktestWorker:
             done.set()
             beat.join(timeout=self._config.visibility_timeout.total_seconds())
 
-    def _beat(self, receipt: str, done: threading.Event, key: str, claim: ExecutionClaim) -> None:
+    def _beat(
+        self,
+        receipt: str,
+        done: threading.Event,
+        key: str,
+        claim: ExecutionClaim,
+        cancellation: _CancellationSignal,
+    ) -> None:
         interval = self._config.heartbeat_interval.total_seconds()
         timeout = int(self._config.visibility_timeout.total_seconds())
         while not done.wait(interval):
+            reason: str | None = None
+            for retry in range(3):
+                try:
+                    reason = self._store.heartbeat(
+                        key, claim, lease_duration=self._config.visibility_timeout
+                    )
+                    break
+                except Exception:
+                    if retry == 2:
+                        _LOGGER.exception(
+                            "durable backtest heartbeat failed after retries key=%s", key
+                        )
+                        cancellation.request("WORKER_HEARTBEAT_UNAVAILABLE")
+                        return
+                    if done.wait(min(1.0, max(0.05, interval / 10) * (retry + 1))):
+                        return
+            if reason is not None:
+                cancellation.request(reason)
             try:
-                self._store.heartbeat(key, claim, lease_duration=self._config.visibility_timeout)
                 self._client.change_message_visibility(
                     QueueUrl=self._config.queue_url,
                     ReceiptHandle=receipt,
                     VisibilityTimeout=timeout,
                 )
             except Exception:
-                # The message has already been deleted or its receipt expired;
-                # the outer call is authoritative either way.
-                return
+                # Durable fencing remains authoritative even if this receipt is
+                # stale. Keep heartbeating Postgres so a redelivery cannot start
+                # a second execution while the original handler is healthy.
+                _LOGGER.warning(
+                    "SQS visibility heartbeat failed; durable lease remains active key=%s",
+                    key,
+                    exc_info=True,
+                )
             self._heartbeat_count += 1
 
     def _on_duplicate(
@@ -1036,6 +1171,26 @@ def _runtime_sqs_client(environ: Mapping[str, str]) -> Any:
     )
 
 
+def _stale_recovery_loop(
+    store: ExecutionKeyStore,
+    stop: threading.Event,
+    *,
+    interval: timedelta,
+    max_attempts: int,
+    queued_timeout: timedelta,
+) -> None:
+    while not stop.is_set():
+        try:
+            report = store.recover_stale(
+                max_attempts=max_attempts, queued_timeout=queued_timeout
+            )
+            if report is not None:
+                _LOGGER.info("backtest stale recovery completed report=%s", report)
+        except Exception:
+            _LOGGER.exception("backtest stale recovery pass failed")
+        stop.wait(interval.total_seconds())
+
+
 def run() -> None:
     log_level = _configure_logging(os.environ)
     lane_mode = any(os.environ.get(f"BACKTEST_{lane.value.upper()}_QUEUE_URL") for lane in BacktestLane)
@@ -1055,6 +1210,29 @@ def run() -> None:
     # cross-process duplicate-worker control this whole module exists to provide, and
     # two workers would execute the same message twice.
     store: ExecutionKeyStore = load_factory(os.environ["BACKTEST_EXECUTION_KEY_STORE"], "BACKTEST_EXECUTION_KEY_STORE")
+
+    recovery_interval = timedelta(
+        seconds=int(os.environ.get("BACKTEST_RECOVERY_INTERVAL_SECONDS", "60"))
+    )
+    queued_timeout = timedelta(
+        seconds=int(os.environ.get("BACKTEST_QUEUED_TIMEOUT_SECONDS", "900"))
+    )
+    max_attempts = int(os.environ.get("BACKTEST_MAX_RECEIVE_COUNT", "5"))
+    if recovery_interval <= timedelta(0) or queued_timeout <= timedelta(0):
+        raise WorkerConfigurationError("backtest recovery intervals must be positive")
+    recovery_stop = threading.Event()
+    recovery_thread = threading.Thread(
+        target=_stale_recovery_loop,
+        args=(store, recovery_stop),
+        kwargs={
+            "interval": recovery_interval,
+            "max_attempts": max_attempts,
+            "queued_timeout": queued_timeout,
+        },
+        daemon=True,
+        name="backtest-stale-recovery",
+    )
+    recovery_thread.start()
 
     client = _runtime_sqs_client(os.environ)
     request_intake_stop = threading.Event()
@@ -1155,12 +1333,14 @@ def run() -> None:
         finally:
             request_intake_stop.set()
             scale_down_stop.set()
+            recovery_stop.set()
             if scale_down_thread is not None:
                 scale_down_thread.join(timeout=5)
             if scale_down_engine is not None:
                 scale_down_engine.dispose()
             for thread in request_threads:
                 thread.join(timeout=6)
+            recovery_thread.join(timeout=5)
         return
 
     worker = BacktestWorker(client=client, config=config, handler=handler, store=store)
@@ -1174,5 +1354,7 @@ def run() -> None:
         worker.run()
     finally:
         request_intake_stop.set()
+        recovery_stop.set()
         for thread in request_threads:
             thread.join(timeout=6)
+        recovery_thread.join(timeout=5)

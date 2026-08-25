@@ -294,6 +294,133 @@ class RecordingHandler:
         return self._outcome
 
 
+class RecordingQueue:
+    def __init__(self) -> None:
+        self.sent: list[dict[str, object]] = []
+        self.deleted: list[dict[str, object]] = []
+        self.visibility: list[dict[str, object]] = []
+
+    def receive_message(self, **_kwargs: object) -> dict[str, object]:
+        return {"Messages": []}
+
+    def send_message(self, **kwargs: object) -> None:
+        self.sent.append(kwargs)
+
+    def delete_message(self, **kwargs: object) -> None:
+        self.deleted.append(kwargs)
+
+    def change_message_visibility(self, **kwargs: object) -> None:
+        self.visibility.append(kwargs)
+
+
+def _delivery(receive_count: int) -> dict[str, object]:
+    return {
+        "MessageId": f"message-{receive_count}",
+        "ReceiptHandle": f"receipt-{receive_count}",
+        "Body": _body(),
+        "Attributes": {"ApproximateReceiveCount": str(receive_count)},
+    }
+
+
+def test_final_retry_is_failed_and_dead_lettered_without_a_sixth_delivery() -> None:
+    queue = RecordingQueue()
+    handler = RecordingHandler(JobOutcome(JobResult.RETRY, reason_code="WORKER_TIMEOUT"))
+    store = InMemoryExecutionKeyStore()
+    worker = BacktestWorker(
+        client=queue, config=_config(max_receive_count=5), handler=handler, store=store
+    )
+
+    handled = worker.handle_message(_delivery(5))
+
+    key = worker_execution_key_for(RUN_ID, "OFFICIAL_BACKTEST:bt4")
+    assert handled.disposition is MessageDisposition.DEAD_LETTERED
+    assert handled.reason_code == "MAX_ATTEMPTS_EXHAUSTED:WORKER_TIMEOUT"
+    assert store.status(key) is ExecutionRecordStatus.FAILED
+    assert store.run_terminal_failure(RUN_ID) == "MAX_ATTEMPTS_EXHAUSTED"
+    assert len(handler.jobs) == 1
+    assert queue.visibility == []
+    assert queue.sent[0]["MessageAttributes"]["DeadLetterReason"]["StringValue"] == (
+        "MAX_ATTEMPTS_EXHAUSTED:WORKER_TIMEOUT"
+    )
+
+
+def test_addressable_over_limit_delivery_repairs_run_before_dlq_without_execution() -> None:
+    queue = RecordingQueue()
+    handler = RecordingHandler()
+    store = InMemoryExecutionKeyStore()
+    worker = BacktestWorker(
+        client=queue, config=_config(max_receive_count=5), handler=handler, store=store
+    )
+
+    handled = worker.handle_message(_delivery(6))
+
+    assert handled.disposition is MessageDisposition.DEAD_LETTERED
+    assert handled.reason_code == "MAX_ATTEMPTS_EXHAUSTED"
+    assert store.run_terminal_failure(RUN_ID) == "MAX_ATTEMPTS_EXHAUSTED"
+    assert handler.jobs == []
+
+
+def test_over_limit_duplicate_never_fails_an_active_heartbeating_attempt() -> None:
+    queue = RecordingQueue()
+    handler = RecordingHandler()
+    store = InMemoryExecutionKeyStore()
+    key = worker_execution_key_for(RUN_ID, "OFFICIAL_BACKTEST:bt4")
+    active = store.claim(
+        key, run_id=RUN_ID, owner="original-worker", now=datetime.now(timezone.utc),
+        lease_duration=timedelta(seconds=30),
+    )
+    assert active.acquired
+    worker = BacktestWorker(
+        client=queue, config=_config(max_receive_count=5), handler=handler, store=store
+    )
+
+    handled = worker.handle_message(_delivery(6))
+
+    assert handled.disposition is MessageDisposition.RETURNED
+    assert handled.reason_code == "EXECUTION_KEY_HELD"
+    assert store.status(key) is ExecutionRecordStatus.IN_PROGRESS
+    assert store.run_terminal_failure(RUN_ID) is None
+    assert handler.jobs == []
+    assert queue.sent == []
+    assert queue.deleted == []
+
+
+def test_transient_durable_heartbeat_error_is_retried_without_abandoning_handler() -> None:
+    class TransientHeartbeatStore(InMemoryExecutionKeyStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def heartbeat(self, key, claim, *, lease_duration):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            if self.calls == 1:
+                raise OSError("temporary database interruption")
+            return super().heartbeat(key, claim, lease_duration=lease_duration)
+
+    queue = RecordingQueue()
+    store = TransientHeartbeatStore()
+
+    def slow_success(_job: Mapping[str, Any], _context: JobContext) -> JobOutcome:
+        time.sleep(0.2)
+        return JobOutcome(JobResult.SUCCEEDED, result_hash="a" * 64)
+
+    worker = BacktestWorker(
+        client=queue,
+        config=_config(
+            visibility_timeout=timedelta(seconds=1),
+            heartbeat_interval=timedelta(milliseconds=50),
+        ),
+        handler=slow_success,
+        store=store,
+    )
+
+    handled = worker.handle_message(_delivery(1))
+
+    assert handled.disposition is MessageDisposition.DELETED
+    assert store.calls >= 2
+    assert len(queue.deleted) == 1
+
+
 def _worker(
     sqs: Any,
     queues: tuple[str, str],
@@ -417,7 +544,7 @@ def test_retryable_failure_returns_the_message_for_immediate_redelivery(
 
 
 @pytest.mark.docker
-def test_message_past_max_receive_count_is_routed_to_the_dead_letter_queue(
+def test_final_allowed_receive_is_failed_and_routed_to_the_dead_letter_queue(
     sqs: Any, queues: tuple[str, str]
 ) -> None:
     main, dlq = queues
@@ -425,12 +552,9 @@ def test_message_past_max_receive_count_is_routed_to_the_dead_letter_queue(
     handler = RecordingHandler(JobOutcome(JobResult.RETRY, reason_code="TRANSIENT"))
     worker = _worker(sqs, queues, handler, max_receive_count=2)
 
-    dispositions = [
-        item.disposition for _ in range(3) for item in worker.poll_once()
-    ]
+    dispositions = [item.disposition for _ in range(2) for item in worker.poll_once()]
 
     assert dispositions == [
-        MessageDisposition.RETURNED,
         MessageDisposition.RETURNED,
         MessageDisposition.DEAD_LETTERED,
     ]
@@ -439,7 +563,7 @@ def test_message_past_max_receive_count_is_routed_to_the_dead_letter_queue(
     assert _visible(sqs, dlq) == 1
     dead = sqs.receive_message(QueueUrl=dlq, MaxNumberOfMessages=1, MessageAttributeNames=["All"])
     attributes = dead["Messages"][0]["MessageAttributes"]
-    assert attributes["DeadLetterReason"]["StringValue"] == "MAX_RECEIVE_COUNT_EXCEEDED"
+    assert attributes["DeadLetterReason"]["StringValue"] == "MAX_ATTEMPTS_EXHAUSTED:TRANSIENT"
 
 
 @pytest.mark.docker

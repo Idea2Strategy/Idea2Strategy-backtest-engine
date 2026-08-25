@@ -235,6 +235,110 @@ def test_finish_refuses_a_non_terminal_status(store: PersistenceExecutionKeyStor
         store.finish(key, ExecutionRecordStatus.IN_PROGRESS, now=T0)
 
 
+def test_terminal_failure_closes_attempt_and_run_in_one_persistence_operation(
+    store: PersistenceExecutionKeyStore, run_id: uuid.UUID, admin_engine: Engine
+) -> None:
+    key = worker_execution_key_for(str(run_id), "OFFICIAL_BACKTEST:exhausted")
+    claim = store.claim(key, run_id=str(run_id), owner="worker-a", now=T0, lease_duration=LEASE)
+
+    store.finish(
+        key,
+        ExecutionRecordStatus.FAILED,
+        now=T0 + timedelta(seconds=2),
+        claim=claim,
+        reason_code="WORKER_TIMEOUT",
+        run_id=str(run_id),
+        run_failure_code="MAX_ATTEMPTS_EXHAUSTED",
+    )
+
+    with admin_engine.connect() as connection:
+        run = connection.execute(
+            text("SELECT status, failure_code, retryable FROM backtest.runs WHERE id = :id"),
+            {"id": run_id},
+        ).mappings().one()
+        attempt = connection.execute(
+            text(
+                "SELECT status, failure_code, terminal_reason_code "
+                "FROM backtest.run_attempts WHERE id = CAST(:id AS uuid)"
+            ),
+            {"id": claim.attempt_id},
+        ).mappings().one()
+
+    assert dict(run) == {
+        "status": "FAILED",
+        "failure_code": "MAX_ATTEMPTS_EXHAUSTED",
+        "retryable": False,
+    }
+    assert dict(attempt) == {
+        "status": "FAILED",
+        "failure_code": "WORKER_TIMEOUT",
+        "terminal_reason_code": "WORKER_TIMEOUT",
+    }
+
+
+def test_over_limit_repair_preserves_a_live_fenced_attempt(
+    store: PersistenceExecutionKeyStore, run_id: uuid.UUID, admin_engine: Engine
+) -> None:
+    key = worker_execution_key_for(str(run_id), "OFFICIAL_BACKTEST:active-over-limit")
+    claim = store.claim(
+        key, run_id=str(run_id), owner="worker-a", now=T0, lease_duration=LEASE
+    )
+    assert claim.acquired
+
+    status = store.record_run_failure(
+        key, str(run_id), "MAX_ATTEMPTS_EXHAUSTED", now=T0 + timedelta(seconds=1)
+    )
+
+    assert status is ExecutionRecordStatus.IN_PROGRESS
+    with admin_engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT status FROM backtest.runs WHERE id=:id"), {"id": run_id}
+        ) == "RUNNING"
+        assert connection.scalar(
+            text("SELECT status FROM backtest.run_attempts WHERE id=CAST(:id AS uuid)"),
+            {"id": claim.attempt_id},
+        ) == "RUNNING"
+
+
+def test_over_limit_repair_gives_expired_cancellation_precedence_over_failure(
+    persistence: BacktestPersistence,
+    store: PersistenceExecutionKeyStore,
+    run_id: uuid.UUID,
+    admin_engine: Engine,
+) -> None:
+    key = worker_execution_key_for(str(run_id), "OFFICIAL_BACKTEST:cancel-over-limit")
+    claim = store.claim(
+        key, run_id=str(run_id), owner="worker-a", now=T0, lease_duration=LEASE
+    )
+    with persistence.unit_of_work() as uow:
+        uow.runs.request_cancellation(run_id, reason_code="USER_CANCELLED")
+    with admin_engine.begin() as connection:
+        connection.execute(text("""
+            UPDATE backtest.run_attempts
+               SET started_at=clock_timestamp()-interval '3 minutes',
+                   claimed_at=clock_timestamp()-interval '3 minutes',
+                   last_heartbeat_at=clock_timestamp()-interval '2 minutes',
+                   claim_expires_at=clock_timestamp()-interval '1 minute'
+             WHERE id=CAST(:id AS uuid)
+        """), {"id": claim.attempt_id})
+
+    status = store.record_run_failure(
+        key, str(run_id), "MAX_ATTEMPTS_EXHAUSTED", now=T0 + timedelta(minutes=2)
+    )
+
+    assert status is ExecutionRecordStatus.CANCELLED
+    with admin_engine.connect() as connection:
+        run = connection.execute(
+            text("SELECT status, failure_code, cancellation_reason_code FROM backtest.runs WHERE id=:id"),
+            {"id": run_id},
+        ).mappings().one()
+    assert dict(run) == {
+        "status": "CANCELLED",
+        "failure_code": None,
+        "cancellation_reason_code": "USER_CANCELLED",
+    }
+
+
 def test_the_status_of_an_unknown_key_is_none(store: PersistenceExecutionKeyStore, run_id: uuid.UUID) -> None:
     assert store.status(worker_execution_key_for(str(run_id), "never-claimed")) is None
 

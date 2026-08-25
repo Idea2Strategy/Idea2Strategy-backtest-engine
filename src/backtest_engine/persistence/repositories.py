@@ -528,7 +528,7 @@ class RunAttemptRepository(_Repository):
         """Close exactly one live delivery and make its non-terminal run retryable."""
         attempt = (
             self._connection.execute(
-                select(run_attempts.c.run_id).where(run_attempts.c.id == attempt_id).with_for_update()
+                select(run_attempts.c.run_id).where(run_attempts.c.id == attempt_id)
             )
             .mappings()
             .first()
@@ -568,7 +568,7 @@ class RunAttemptRepository(_Repository):
             raise ValueError("close_fenced requires a terminal status")
         attempt = (
             self._connection.execute(
-                select(run_attempts.c.run_id).where(run_attempts.c.id == attempt_id).with_for_update()
+                select(run_attempts.c.run_id).where(run_attempts.c.id == attempt_id)
             )
             .mappings()
             .first()
@@ -586,6 +586,13 @@ class RunAttemptRepository(_Repository):
         )
         if run is None:
             raise RowNotFound(f"backtest run not found: {attempt['run_id']}")
+        locked_attempt = self._connection.execute(
+            select(run_attempts.c.id)
+            .where(run_attempts.c.id == attempt_id)
+            .with_for_update()
+        ).first()
+        if locked_attempt is None:
+            raise StaleAttemptClaim("terminal mutation matched no attempt")
         now = self._connection.scalar(select(func.clock_timestamp()))
         assert isinstance(now, datetime)
         if run["cancellation_requested_at"] is not None and status is WorkStatus.SUCCEEDED:

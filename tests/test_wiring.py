@@ -17,7 +17,7 @@ from __future__ import annotations
 import copy
 import logging
 import uuid
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from fractions import Fraction
 from types import SimpleNamespace
@@ -25,7 +25,14 @@ from typing import Any
 
 import pytest
 
-from backtest_engine.attempt_coordinator import RunState
+from backtest_engine.attempt_coordinator import (
+    AttemptCoordinator,
+    AttemptFailure,
+    AttemptPolicy,
+    FailureKind,
+    ResourceSample,
+    RunState,
+)
 from backtest_engine.basic_runtime import (
     BAR_CLOSED_EVENT_TYPE,
     BasicPlanReplay,
@@ -59,6 +66,7 @@ from backtest_engine.wiring import (
     JobNotSatisfiable,
     OrchestratorJobHandler,
     WiringError,
+    _CancellationAwareMonitor,
     _metric_percent,
     dataset_coverage,
     evaluation_window,
@@ -489,6 +497,32 @@ def test_cancelled_replay_is_published_and_acknowledged_as_cancelled() -> None:
     assert sink.events[0]["metadata"]["messageType"] == "BACKTEST_CANCELLED"
     assert sink.events[0]["reasonCode"] == "USER_CANCELLED"
     assert sink.events[0]["deliveryAttempt"] == 3
+
+
+def test_durable_worker_cancellation_is_applied_at_the_next_replay_checkpoint() -> None:
+    policy = AttemptPolicy(
+        max_attempts=3,
+        lease_duration=timedelta(seconds=30),
+        attempt_timeout=timedelta(minutes=10),
+        max_cpu_time=timedelta(minutes=5),
+        max_memory_bytes=512 * 1024 * 1024,
+    )
+    coordinator = AttemptCoordinator("cancel-run", policy, COMPLETED_AT)
+    lease = coordinator.acquire("worker-1", COMPLETED_AT)
+    delegate = SimpleNamespace(sample=lambda: ResourceSample(
+        cpu_time=timedelta(seconds=1), memory_bytes=1024
+    ))
+    monitor = _CancellationAwareMonitor(
+        delegate, coordinator, lambda: "USER_CANCELLED",
+        lambda: COMPLETED_AT + timedelta(seconds=1),
+    )
+
+    sample = monitor.sample()
+    with pytest.raises(AttemptFailure) as raised:
+        coordinator.heartbeat(lease, COMPLETED_AT + timedelta(seconds=1), sample)
+
+    assert raised.value.kind is FailureKind.CANCELLED
+    assert coordinator.state is RunState.CANCELLED
 
 
 def _terminal_failure_envelope() -> JobEnvelope:

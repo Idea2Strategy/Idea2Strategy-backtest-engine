@@ -63,13 +63,16 @@ from decimal import ROUND_FLOOR, ROUND_HALF_EVEN, Decimal, localcontext
 from typing import Any, Protocol, cast
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from .api import create_app
 from .attempt_coordinator import (
     AttemptCoordinator,
+    AttemptFailure,
     AttemptPolicy,
+    FailureKind,
     ResourceMonitor,
+    ResourceSample,
     RunState,
 )
 from .basic_runtime import (
@@ -160,6 +163,7 @@ from .persistence import (
     ObjectStatus,
     PerformanceSummaryRow,
     RunPublication,
+    RunStatus,
     StorageObjectRow,
     WorkStatus,
     create_backtest_engine,
@@ -831,10 +835,18 @@ class PersistenceExecutionKeyStore:
             raise ValueError("persistent execution mutation requires its fencing claim")
         return uuid.UUID(claim.attempt_id), uuid.UUID(claim.claim_token)
 
-    def heartbeat(self, key: str, claim: ExecutionClaim, *, lease_duration: timedelta) -> None:
+    def heartbeat(
+        self, key: str, claim: ExecutionClaim, *, lease_duration: timedelta
+    ) -> str | None:
         attempt_id, claim_token = self._claim_ids(claim)
         with self._persistence.unit_of_work() as uow:
-            uow.attempts.heartbeat_fenced(attempt_id, claim_token, lease_duration=lease_duration)
+            attempt = uow.attempts.heartbeat_fenced(
+                attempt_id, claim_token, lease_duration=lease_duration
+            )
+            run = uow.runs.get(attempt.run_id)
+            if run.cancellation_requested_at is None:
+                return None
+            return run.cancellation_reason_code or "USER_CANCELLED"
 
     def release(
         self,
@@ -860,6 +872,9 @@ class PersistenceExecutionKeyStore:
         *,
         now: datetime,
         claim: ExecutionClaim | None = None,
+        reason_code: str | None = None,
+        run_id: str | None = None,
+        run_failure_code: str | None = None,
     ) -> None:
         if status is ExecutionRecordStatus.IN_PROGRESS:
             raise ValueError("finish requires a terminal status")
@@ -874,15 +889,95 @@ class PersistenceExecutionKeyStore:
                 attempt_id,
                 claim_token,
                 status=work_status,
-                terminal_reason_code=status.value,
+                terminal_reason_code=reason_code or status.value,
                 failure_code=(
                     None
                     if work_status is WorkStatus.SUCCEEDED
                     else "EXECUTION_CANCELLED"
                     if work_status is WorkStatus.CANCELLED
-                    else "EXECUTION_FAILED"
+                    else reason_code or "EXECUTION_FAILED"
                 ),
             )
+            if status is ExecutionRecordStatus.FAILED and run_id is not None:
+                current = uow.runs.get(uuid.UUID(run_id))
+                if current.status in (RunStatus.QUEUED, RunStatus.RUNNING):
+                    uow.runs.mark_failed(
+                        current.id, now, run_failure_code or reason_code or "EXECUTION_FAILED",
+                        retryable=False,
+                    )
+            elif status is ExecutionRecordStatus.CANCELLED and run_id is not None:
+                current = uow.runs.get(uuid.UUID(run_id))
+                if current.status in (RunStatus.QUEUED, RunStatus.RUNNING):
+                    uow.runs.mark_cancelled(
+                        current.id, now, reason_code or "EXECUTION_CANCELLED"
+                    )
+
+    def record_run_failure(
+        self, key: str, run_id: str, failure_code: str, *, now: datetime
+    ) -> ExecutionRecordStatus:
+        del key
+        with self._persistence.unit_of_work() as uow:
+            run_uuid = uuid.UUID(run_id)
+            current = uow.connection.execute(text("""
+                SELECT status, cancellation_requested_at, cancellation_reason_code
+                  FROM backtest.runs WHERE id=:id FOR UPDATE
+            """), {"id": run_uuid}).mappings().one()
+            run_status = RunStatus(current["status"])
+            if run_status is RunStatus.COMPLETED:
+                return ExecutionRecordStatus.SUCCEEDED
+            if run_status is RunStatus.CANCELLED:
+                return ExecutionRecordStatus.CANCELLED
+            if run_status in (RunStatus.FAILED, RunStatus.UNAVAILABLE):
+                return ExecutionRecordStatus.FAILED
+            database_now = uow.connection.scalar(text("SELECT clock_timestamp()"))
+            latest = uow.connection.execute(text("""
+                SELECT id, status, claim_expires_at
+                  FROM backtest.run_attempts
+                 WHERE run_id=:id
+                 ORDER BY attempt_number DESC
+                 LIMIT 1
+                 FOR UPDATE
+            """), {"id": run_uuid}).mappings().first()
+            if current["cancellation_requested_at"] is not None:
+                if latest is not None and latest["status"] == WorkStatus.RUNNING.value:
+                    if latest["claim_expires_at"] is not None and latest["claim_expires_at"] > database_now:
+                        return ExecutionRecordStatus.IN_PROGRESS
+                    uow.connection.execute(text("""
+                        UPDATE backtest.run_attempts
+                           SET status='CANCELLED', completed_at=:now,
+                               failure_code=NULL, terminal_reason_code='CANCELLED_BY_REQUEST'
+                         WHERE id=:attempt_id AND status='RUNNING'
+                           AND (claim_expires_at IS NULL OR claim_expires_at <= :now)
+                    """), {"attempt_id": latest["id"], "now": database_now})
+                uow.runs.mark_cancelled(
+                    run_uuid,
+                    database_now,
+                    current["cancellation_reason_code"] or "USER_CANCELLED",
+                )
+                return ExecutionRecordStatus.CANCELLED
+            if latest is not None and latest["status"] == WorkStatus.RUNNING.value:
+                if latest["claim_expires_at"] is not None and latest["claim_expires_at"] > database_now:
+                    return ExecutionRecordStatus.IN_PROGRESS
+                uow.connection.execute(text("""
+                    UPDATE backtest.run_attempts
+                       SET status='FAILED', completed_at=:now,
+                           failure_code=:reason, terminal_reason_code=:reason
+                     WHERE id=:attempt_id AND status='RUNNING'
+                       AND (claim_expires_at IS NULL OR claim_expires_at <= :now)
+                """), {
+                    "attempt_id": latest["id"], "now": database_now, "reason": failure_code,
+                })
+            uow.runs.mark_failed(run_uuid, database_now, failure_code, retryable=False)
+            return ExecutionRecordStatus.FAILED
+
+    def recover_stale(self, *, max_attempts: int, queued_timeout: timedelta) -> Any:
+        from .recovery import StaleRunRecovery
+
+        return StaleRunRecovery(
+            self._persistence,
+            max_attempts=max_attempts,
+            queued_timeout=queued_timeout,
+        ).recover_once()
 
     def status(self, key: str) -> ExecutionRecordStatus | None:
         with self._persistence.read_only() as uow:
@@ -1525,6 +1620,38 @@ class ResultSink(Protocol):
     def publish(self, event: Mapping[str, Any], *, delivery_attempt: int) -> None: ...
 
 
+class _CancellationAwareMonitor:
+    """Bridge the worker's durable cancellation poll into replay checkpoints."""
+
+    def __init__(
+        self,
+        delegate: ResourceMonitor,
+        coordinator: AttemptCoordinator,
+        cancellation_reason: Callable[[], str | None],
+        wall_clock: Callable[[], datetime],
+    ) -> None:
+        self._delegate = delegate
+        self._coordinator = coordinator
+        self._cancellation_reason = cancellation_reason
+        self._wall_clock = wall_clock
+
+    def sample(self) -> ResourceSample:
+        reason = self._cancellation_reason()
+        if reason == "WORKER_HEARTBEAT_UNAVAILABLE":
+            self._coordinator.cancel_by_system(
+                self._wall_clock(), reason_code=reason
+            )
+            raise AttemptFailure(
+                FailureKind.SYSTEM_CANCELLED,
+                "durable worker heartbeat became unavailable",
+            )
+        if reason is not None and self._coordinator.cancellation is None:
+            self._coordinator.request_cancellation(
+                self._wall_clock(), reason_code=reason, requested_by="DURABLE_RUN"
+            )
+        return self._delegate.sample()
+
+
 class OrchestratorJobHandler:
     """``worker.JobHandler``: one queue message becomes one orchestrated run.
 
@@ -1691,7 +1818,12 @@ class OrchestratorJobHandler:
             wall_clock=self._wall_clock,
             publication_lag=self._publication_lag,
         )
-        outcome = orchestrator.run(binding.job, coordinator=coordinator, lease=lease, monitor=self._monitor)
+        monitor: ResourceMonitor = self._monitor
+        if context.cancellation_reason is not None:
+            monitor = _CancellationAwareMonitor(
+                monitor, coordinator, context.cancellation_reason, self._wall_clock
+            )
+        outcome = orchestrator.run(binding.job, coordinator=coordinator, lease=lease, monitor=monitor)
         return self._report(binding, outcome, coordinator, context)
 
     # -- binding -----------------------------------------------------------
