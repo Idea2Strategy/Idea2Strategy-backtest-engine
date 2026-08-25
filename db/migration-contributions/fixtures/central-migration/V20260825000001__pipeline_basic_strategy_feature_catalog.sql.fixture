@@ -12,7 +12,7 @@ SELECT
     normalized_parameters,
     output_value_type,
     required_history_points,
-    'sha256:' || encode(digest(
+    'sha256:' || encode(public.digest(
         'basic-elements:2026-08-25:feature:' || feature_code || ':' || resolution || ':'
             || normalized_parameters::text,
         'sha256'), 'hex'),
