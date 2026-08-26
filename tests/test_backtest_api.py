@@ -32,6 +32,7 @@ from backtest_engine.detail_object_manifest import (
     DetailObjectBuilder,
     DetailObjectBundle,
     DetailObjectKind,
+    PerformancePoint,
 )
 from backtest_engine.execution_model import OrderStatus
 from backtest_engine.execution_policy import (
@@ -236,7 +237,27 @@ def _completed_projection() -> tuple[
         ),
     ]
     result = ResultSnapshotBuilder().build(snapshot, records, built_at)
-    details = DetailObjectBuilder().build(result, [], [], built_at)
+    details = DetailObjectBuilder().build(
+        result,
+        [],
+        [
+            PerformancePoint(
+                point_id="00000000-0000-4000-8000-000000002930",
+                run_snapshot_id=snapshot.snapshot_id,
+                occurred_at=_instant("2026-07-31T20:00:00Z"),
+                metric_id="equity",
+                value=Decimal("100000.00000000"),
+            ),
+            PerformancePoint(
+                point_id="00000000-0000-4000-8000-000000002931",
+                run_snapshot_id=snapshot.snapshot_id,
+                occurred_at=_instant("2026-08-01T20:00:00Z"),
+                metric_id="equity",
+                value=Decimal("100250.50000000"),
+            ),
+        ],
+        built_at,
+    )
     monthly = MonthlyJudgmentBuilder().build(
         snapshot.snapshot_id, result.manifest.result_manifest_id, [], result.records
     )
@@ -386,6 +407,7 @@ def _result(status: str, run_id: str = EXPECTED_RUN_ID, **detail: Any) -> dict[s
         ("GET", f"/api/v1/backtests/{EXPECTED_RUN_ID}"),
         ("GET", f"/api/v1/backtests/{EXPECTED_RUN_ID}/attempts"),
         ("GET", f"/api/v1/backtests/{EXPECTED_RUN_ID}/performance"),
+        ("GET", f"/api/v1/backtests/{EXPECTED_RUN_ID}/performance-series"),
         ("GET", f"/api/v1/backtests/{EXPECTED_RUN_ID}/monthly-summaries"),
         ("GET", f"/api/v1/backtests/{EXPECTED_RUN_ID}/detail-manifests"),
         ("GET", f"/api/v1/backtests/{EXPECTED_RUN_ID}/monthly-trades?et_month=2026-07"),
@@ -947,7 +969,7 @@ def test_attempt_history_is_exposed(
 
 @pytest.mark.parametrize(
     "suffix",
-    ["/performance", "/monthly-summaries", "/detail-manifests"],
+    ["/performance", "/performance-series", "/monthly-summaries", "/detail-manifests"],
 )
 def test_evidence_routes_are_409_until_the_run_completes(
     harness: Harness, official_request: dict[str, Any], suffix: str
@@ -994,6 +1016,7 @@ def test_unknown_run_is_404_for_every_query(harness: Harness) -> None:
         "",
         "/attempts",
         "/performance",
+        "/performance-series",
         "/monthly-summaries",
         "/detail-manifests",
         "/monthly-trades?et_month=2026-07",
@@ -1090,6 +1113,26 @@ def test_monthly_trade_detail_is_served_for_the_owning_account(harness: Harness)
             }
         ],
     }
+
+
+def test_performance_series_is_served_from_official_equity_detail_rows(harness: Harness) -> None:
+    """Catches generated curves and payloads disconnected from immutable Parquet evidence."""
+    harness.publish_completed()
+
+    response = harness.client.get(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}/performance-series",
+        headers=harness.owner(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["backtestRunId"] == EXPECTED_RUN_ID
+    assert body["points"] == [
+        {"occurredAt": "2026-07-31T20:00:00Z", "equity": "100000.00000000"},
+        {"occurredAt": "2026-08-01T20:00:00Z", "equity": "100250.50000000"},
+    ]
+    assert body["resultHash"]
+    assert body["sourceSetHash"]
 
 
 def test_one_et_week_part_is_split_across_the_two_et_months_it_spans(

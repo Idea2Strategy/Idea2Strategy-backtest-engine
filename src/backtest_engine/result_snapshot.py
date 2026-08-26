@@ -55,9 +55,13 @@ from backtest_engine.performance import (
     METRIC_CATALOG_VERSION,
     EquityCurve,
     LedgerEvent,
+    MarkPrice,
     MetricSet,
     PositionState,
     TradeStatistics,
+    ValuationBasis,
+    ValuationInstant,
+    ValuationPeriodicity,
     ValuationSeries,
     build_equity_curve,
     build_metrics,
@@ -820,6 +824,8 @@ class ResultSnapshotBuilder:
             "run_snapshot": _run_payload(run_snapshot),
             "records": [_record_payload(item) for item in ordered],
         }
+        if valuation_series is not None and valuation_series.basis is ValuationBasis.MARK_TO_MARKET:
+            payload["valuation"] = _series_payload(valuation_series)
         object_bytes = _canonical_bytes(payload)
         content_hash = _sha256(object_bytes)
         summary_hash = _sha256(_canonical_bytes(_summary_payload(summary)))
@@ -891,10 +897,17 @@ class ResultSnapshotBuilder:
                 _record_from_payload(run_snapshot.snapshot_id, item)
                 for item in payload["records"]
             ]
+            valuation_series = (
+                _series_from_payload(payload["valuation"])
+                if "valuation" in payload
+                else None
+            )
         except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
             raise ResultIntegrityError(f"result object cannot be parsed: {exc}") from exc
 
-        rebuilt = ResultSnapshotBuilder().build(run_snapshot, records, calculated_at)
+        rebuilt = ResultSnapshotBuilder().build(
+            run_snapshot, records, calculated_at, valuation_series
+        )
         if rebuilt.object_bytes != object_bytes:
             raise ResultIntegrityError(
                 "rebuilt result object does not match the stored bytes; the stored "
@@ -941,6 +954,10 @@ class ResultSnapshotBuilder:
             "run_snapshot": _run_payload(result.run_snapshot),
             "records": [_record_payload(item) for item in result.records],
         }
+        if result.summary.equity_curve.basis is ValuationBasis.MARK_TO_MARKET:
+            expected_payload["valuation"] = _series_payload(
+                result.summary.equity_curve.to_series()
+            )
         if result.object_bytes != _canonical_bytes(expected_payload):
             raise ResultIntegrityError("result content does not match records")
         if manifest.record_count != len(result.records):
@@ -1060,6 +1077,34 @@ def _parse_decimal(value: object) -> Decimal:
     if not isinstance(value, str):
         raise ValueError(f"decimal must be canonical text, got {value!r}")
     return Decimal(value)
+
+
+def _series_from_payload(payload: object) -> ValuationSeries:
+    """Inverse of ``_series_payload`` for immutable mark-to-market evidence."""
+    if not isinstance(payload, dict):
+        raise ValueError("valuation must be a JSON object")
+    basis = ValuationBasis(payload["basis"])
+    if payload.get("basis_rule_id") != basis.rule_id:
+        raise ValueError("valuation basis_rule_id does not match basis")
+    raw_instants = payload["instants"]
+    if not isinstance(raw_instants, list):
+        raise ValueError("valuation instants must be a list")
+    instants = []
+    for item in raw_instants:
+        if not isinstance(item, dict) or not isinstance(item.get("marks"), list):
+            raise ValueError("valuation instant must contain marks")
+        marks = []
+        for mark in item["marks"]:
+            if not isinstance(mark, list) or len(mark) != 2:
+                raise ValueError("valuation mark must be [instrument_id, price]")
+            marks.append(MarkPrice(mark[0], _parse_decimal(mark[1])))
+        instants.append(ValuationInstant(_parse_instant(item["as_of"]), tuple(marks)))
+    return ValuationSeries(
+        basis=basis,
+        periodicity=ValuationPeriodicity(payload["periodicity"]),
+        opening_at=_parse_instant(payload["opening_at"]),
+        instants=tuple(instants),
+    )
 
 
 def _run_snapshot_from_payload(payload: object) -> RunSnapshot:

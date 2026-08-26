@@ -571,6 +571,18 @@ def test_a_supplied_daily_mark_grid_produces_a_mark_to_market_equity_curve() -> 
     assert result.summary.metrics["sharpe"].value is not None
 
 
+def test_a_daily_mark_grid_survives_rebuild_from_the_immutable_result_object() -> None:
+    completed_at = _utc("2025-11-05T21:00:00Z")
+    result = ResultSnapshotBuilder().build(
+        _run(), _buy_then_sell(), completed_at, _mark_series()
+    )
+
+    rebuilt = ResultSnapshotBuilder.rebuild(result.object_bytes, completed_at)
+
+    assert rebuilt.summary == result.summary
+    assert rebuilt.summary.equity_curve.points == result.summary.equity_curve.points
+
+
 def test_without_a_mark_grid_the_curve_is_an_explicit_cost_basis_event_curve() -> None:
     result = ResultSnapshotBuilder().build(
         _run(), [_accepted_record(), _fill_record()], _utc("2025-11-28T14:35:00Z")

@@ -688,6 +688,25 @@ def _settle(engine: ExecutionModelEngine, index: int) -> int:
     return engine.settle(_bar_event(index, resolution=STRATEGY_RESOLUTION))
 
 
+def test_engine_builds_the_official_daily_valuation_grid_from_market_instants() -> None:
+    engine = _engine()
+    engine.place(_candidate())
+    first = _bar_event(15, resolution=STRATEGY_RESOLUTION)
+    later_same_session = _bar_event(16, resolution=STRATEGY_RESOLUTION)
+    engine.settle(first)
+    engine.runtime_values(first.occurred_at, (first,))
+    engine.runtime_values(later_same_session.occurred_at, (later_same_session,))
+
+    series = engine.valuation_series
+
+    assert series is not None
+    assert series.opening_at == first.occurred_at - timedelta(microseconds=1)
+    assert [instant.as_of for instant in series.instants] == [later_same_session.occurred_at]
+    assert series.instants[0].marks[0].price == Decimal(CLOSES[16])
+    assert series.periodicity.value == "DAILY"
+    assert series.basis.value == "MARK_TO_MARKET"
+
+
 def test_same_bar_buy_and_sell_records_preserve_each_fill_position_transition() -> None:
     """A bar can fill more than one open order; each record needs its own after-state."""
     engine = _engine()

@@ -13,7 +13,11 @@ from decimal import Decimal
 
 import pytest
 
-from backtest_engine.detail_object_manifest import DetailObjectBuilder, DetailObjectKind
+from backtest_engine.detail_object_manifest import (
+    DetailObjectBuilder,
+    DetailObjectKind,
+    PerformancePoint,
+)
 from backtest_engine.execution_model import OrderStatus
 from backtest_engine.monthly_judgment import EtMonth, MonthlyJudgmentBuilder
 from backtest_engine.result_query import (
@@ -187,7 +191,23 @@ def _november_record() -> ResultRecord:
 
 def _artifacts(records: list[ResultRecord], built_at: str = "2025-11-02T04:10:00Z"):
     result = ResultSnapshotBuilder().build(_snapshot(), records, _instant(built_at))
-    details = DetailObjectBuilder().build(result, [], [], _instant(built_at))
+    points = [
+        PerformancePoint(
+            point_id="00000000-0000-4000-8000-000000002930",
+            run_snapshot_id=_snapshot().snapshot_id,
+            occurred_at=_instant("2025-10-30T20:00:00Z"),
+            metric_id="equity",
+            value=Decimal("10000.00000000"),
+        ),
+        PerformancePoint(
+            point_id="00000000-0000-4000-8000-000000002931",
+            run_snapshot_id=_snapshot().snapshot_id,
+            occurred_at=_instant("2025-10-31T20:00:00Z"),
+            metric_id="equity",
+            value=Decimal("10025.50000000"),
+        ),
+    ]
+    details = DetailObjectBuilder().build(result, [], points, _instant(built_at))
     monthly = MonthlyJudgmentBuilder().build(
         _snapshot().snapshot_id, result.manifest.result_manifest_id, [], result.records
     )
@@ -385,6 +405,22 @@ def test_complete_query_returns_performance_and_et_monthly_judgments() -> None:
     assert performance == result.summary
     assert [summary.et_month.key for summary in judgments] == ["2025-10"]
     assert judgments[0].trade_record_ids == (RECORD_ID,)
+
+
+def test_performance_series_reads_the_official_equity_parquet_in_time_order() -> None:
+    """Catches returning activity counts or summary endpoints as an equity curve."""
+    service, store = _service()
+    run, result, details, monthly = _completed_artifacts()
+    store.publish_completed(run, result, details, monthly)
+
+    series = service.performance_series(OWNER_ID, RUN_ID)
+
+    assert [(point.occurred_at.isoformat(), point.equity) for point in series.points] == [
+        ("2025-10-30T20:00:00+00:00", Decimal("10000.00000000")),
+        ("2025-10-31T20:00:00+00:00", Decimal("10025.50000000")),
+    ]
+    assert series.result_hash == result.summary.result_hash
+    assert series.source_set_hash == result.summary.source_set_hash
 
 
 # --------------------------------------------------------------------------------

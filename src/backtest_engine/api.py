@@ -103,6 +103,7 @@ from .result_query import (
     BacktestOverview,
     BacktestResultQueryService,
     InputModelView,
+    PerformanceSeriesView,
     QueryIntegrityError,
     QueryNotFound,
     QueryNotReady,
@@ -282,6 +283,18 @@ def _trade_payload(view: TradeDetailView) -> dict[str, Any]:
         "fee": _amount(view.fee),
         "costBasis": _amount(view.cost_basis),
         "realizedPnl": _amount(view.realized_pnl),
+    }
+
+
+def _performance_series_payload(view: PerformanceSeriesView) -> dict[str, Any]:
+    return {
+        "backtestRunId": view.run_id,
+        "points": [
+            {"occurredAt": _iso(point.occurred_at), "equity": _amount(point.equity)}
+            for point in view.points
+        ],
+        "resultHash": view.result_hash,
+        "sourceSetHash": view.source_set_hash,
     }
 
 
@@ -559,6 +572,36 @@ def create_app(
         _require_completed(_owned(lifecycle, run_id, principal))
         summaries = lifecycle.monthly_of(run_id, owner_account_id=principal.account_id)
         return {"items": [_monthly_payload(row) for row in summaries]}
+
+    @app.get(f"{API_PREFIX}/backtests/{{run_id}}/performance-series", tags=["backtests"])
+    def get_performance_series(run_id: UUID, principal: Principal = Auth) -> dict[str, Any]:
+        """Official mark-to-market equity points reconstructed from immutable Parquet."""
+        service = _result_query(results)
+        try:
+            view = service.performance_series(str(principal.account_id), str(run_id))
+        except QueryNotFound as exc:
+            # Acceptance and immutable-result publication are separate transactions.
+            # Before publication the result projection legitimately has no row, so use
+            # the write model only to distinguish "owned and pending" from not found.
+            try:
+                pending = lifecycle.get(run_id, owner_account_id=principal.account_id)
+            except (BacktestRunNotFound, NotRunOwner):
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="backtest not found") from exc
+            _require_completed(pending)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"backtest run {run_id} is COMPLETED but has no performance series",
+            ) from exc
+        except QueryNotReady as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"message": str(exc), "reasonCode": RESULT_NOT_READY_REASON},
+            ) from exc
+        except QueryValidationError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        except QueryIntegrityError as exc:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+        return _performance_series_payload(view)
 
     @app.get(f"{API_PREFIX}/backtests/{{run_id}}/detail-manifests", tags=["backtests"])
     def get_manifests(run_id: UUID, principal: Principal = Auth) -> dict[str, Any]:

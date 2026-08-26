@@ -151,6 +151,14 @@ from .orchestrator import (
     ResultPublicationError,
     SessionCalendar,
 )
+from .performance.equity_curve import (
+    OPENING_INSTANT_LEAD,
+    MarkPrice,
+    ValuationBasis,
+    ValuationInstant,
+    ValuationPeriodicity,
+    ValuationSeries,
+)
 from .persistence import (
     BacktestPersistence,
     DetailManifestRow,
@@ -385,6 +393,9 @@ class ExecutionModelEngine:
         self._peak_price: dict[str, Decimal] = {}
         self._holding_bars: dict[tuple[str, str], int] = {}
         self._last_runtime_instant: datetime | None = None
+        self._valuation_opening_at: datetime | None = None
+        self._latest_prices: dict[str, Decimal] = {}
+        self._daily_marks: dict[date, tuple[datetime, dict[str, Decimal]]] = {}
 
     # -- evidence ---------------------------------------------------------
 
@@ -401,6 +412,25 @@ class ExecutionModelEngine:
     def declined_candidates(self) -> tuple[str, ...]:
         """Evaluation ids whose candidate never became an order request."""
         return tuple(self._declined)
+
+    @property
+    def valuation_series(self) -> ValuationSeries | None:
+        """Actual daily market marks used by the replay, never wall-clock samples."""
+        if self._valuation_opening_at is None or not self._daily_marks:
+            return None
+        instants = tuple(
+            ValuationInstant(
+                instant,
+                tuple(MarkPrice(instrument_id, price) for instrument_id, price in sorted(prices.items())),
+            )
+            for instant, prices in (self._daily_marks[day] for day in sorted(self._daily_marks))
+        )
+        return ValuationSeries(
+            basis=ValuationBasis.MARK_TO_MARKET,
+            periodicity=ValuationPeriodicity.DAILY,
+            opening_at=self._valuation_opening_at - OPENING_INSTANT_LEAD,
+            instants=instants,
+        )
 
     # -- ExecutionEngine ---------------------------------------------------
 
@@ -515,6 +545,16 @@ class ExecutionModelEngine:
         current_prices = {
             event.instrument_id: event.payload["bar"].close for event in events
         }
+        if self._valuation_opening_at is None:
+            self._valuation_opening_at = instant
+        self._latest_prices.update(current_prices)
+        market_day = instant.astimezone(ZoneInfo("America/New_York")).date()
+        held_prices = {
+            instrument_id: price
+            for instrument_id, price in self._latest_prices.items()
+            if self._model.position(instrument_id).quantity > _ZERO
+        }
+        self._daily_marks[market_day] = (instant, held_prices)
         # A new cycle has to zero the counters *before* this bar is counted, because this bar is
         # already the position's first held bar. Live starts a fresh PositionTracker and then counts
         # the closing bar, so it publishes holdingBars 1 on the entry bar; zeroing afterwards would
@@ -1265,7 +1305,12 @@ class DurableResultPublisher:
     def _publish(self, request: PublishRequest) -> PublishedManifests:
         binding = self._binding
         snapshot = binding.run_snapshot
-        result = ResultSnapshotBuilder().build(snapshot, self._engine.records, request.completed_at)
+        result = ResultSnapshotBuilder().build(
+            snapshot,
+            self._engine.records,
+            request.completed_at,
+            valuation_series=self._engine.valuation_series,
+        )
         ledger = tuple(
             ReplayLedgerDetail(snapshot.snapshot_id, transaction) for transaction in self._engine.ledger_transactions
         )

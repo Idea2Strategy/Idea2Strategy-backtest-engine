@@ -136,6 +136,8 @@ __all__ = [
     "DurableBacktestResultQueryStore",
     "InMemoryBacktestResultQueryStore",
     "InputModelView",
+    "PerformanceSeriesPoint",
+    "PerformanceSeriesView",
     "QueryIntegrityError",
     "QueryNotFound",
     "QueryNotReady",
@@ -366,6 +368,20 @@ class InputModelView:
     calculation_model_version: str | None
     cost_model_version: str | None
     execution_model_version: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PerformanceSeriesPoint:
+    occurred_at: datetime
+    equity: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class PerformanceSeriesView:
+    run_id: str
+    points: tuple[PerformanceSeriesPoint, ...]
+    result_hash: str
+    source_set_hash: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1095,6 +1111,22 @@ class BacktestResultQueryService:
         assert entry.result is not None
         return entry.result.summary
 
+    def performance_series(
+        self, owner_account_id: str, run_id: str
+    ) -> PerformanceSeriesView:
+        entry = self._completed(owner_account_id, run_id)
+        assert entry.result is not None
+        assert entry.details is not None
+        points = _read_equity_series(entry.details)
+        if not points:
+            raise QueryIntegrityError("completed run is missing official equity series")
+        return PerformanceSeriesView(
+            run_id=entry.run.run_id,
+            points=points,
+            result_hash=entry.result.summary.result_hash,
+            source_set_hash=entry.result.summary.source_set_hash,
+        )
+
     def monthly_judgments(
         self, owner_account_id: str, run_id: str
     ) -> tuple[MonthlyJudgmentSummary, ...]:
@@ -1238,6 +1270,35 @@ def _month_rows(
             raise QueryIntegrityError("monthly detail Parquet cannot be read") from exc
         rows.extend(row for row in part if EtMonth.from_instant(row["occurred_at"]) == month)
     return sorted(rows, key=lambda row: (row["occurred_at"], str(row["record_id"])))
+
+
+def _read_equity_series(details: DetailObjectBundle) -> tuple[PerformanceSeriesPoint, ...]:
+    rows: list[dict[str, Any]] = []
+    for item in details.objects:
+        if item.descriptor.record_type is not DetailObjectKind.CALCULATION_SERIES:
+            continue
+        try:
+            rows.extend(pq.read_table(pa.BufferReader(item.parquet_bytes)).to_pylist())
+        except Exception as exc:
+            raise QueryIntegrityError("performance-series detail Parquet cannot be read") from exc
+
+    equity_rows = sorted(
+        (row for row in rows if row["metric_id"] == "equity"),
+        key=lambda row: (row["occurred_at"], str(row["point_id"])),
+    )
+    instants = [row["occurred_at"] for row in equity_rows]
+    if len(instants) != len(set(instants)):
+        raise QueryIntegrityError("official equity series contains duplicate instants")
+    points = tuple(
+        PerformanceSeriesPoint(
+            occurred_at=row["occurred_at"],
+            equity=Decimal(str(row["value"])),
+        )
+        for row in equity_rows
+    )
+    if any(point.equity < 0 for point in points):
+        raise QueryIntegrityError("official equity series contains negative equity")
+    return points
 
 
 def _read_month(entry: _QueryEntry, month: EtMonth) -> tuple[TradeDetailView, ...]:
