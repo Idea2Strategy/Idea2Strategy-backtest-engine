@@ -1968,10 +1968,19 @@ class OrchestratorJobHandler:
                     reason_code="REQUIRED_INPUT_UNAVAILABLE",
                 )
             manifests_by_resolution.setdefault(resolution, []).append(resolved)
-        coverage_by_resolution = {
-            resolution: segmented_dataset_coverage(manifests)
-            for resolution, manifests in manifests_by_resolution.items()
-        }
+        coverage_by_resolution: dict[str, tuple[datetime, datetime]] = {}
+        for resolution, manifests in manifests_by_resolution.items():
+            manifests_by_scope: dict[str, list[Mapping[str, Any]]] = {}
+            for resolved in manifests:
+                manifests_by_scope.setdefault(str(resolved.get("instrument_id") or "*"), []).append(resolved)
+            scoped_windows = [
+                segmented_dataset_coverage(scoped)
+                for scoped in manifests_by_scope.values()
+            ]
+            coverage_by_resolution[resolution] = (
+                max(window[0] for window in scoped_windows),
+                min(window[1] for window in scoped_windows),
+            )
         if plan.reference_series[1] == "$DATASET":
             primary = [item for item in resolved_manifests if item[0].manifest_id == envelope.dataset_manifest_id]
             if len(primary) != 1:
@@ -2031,6 +2040,24 @@ class OrchestratorJobHandler:
                     reason_code="REQUIRED_INPUT_UNAVAILABLE",
                 )
         else:
+            resolved_flows = []
+            for flow in plan.flows:
+                if flow.reference_series[1] != "$DATASET":
+                    resolved_flows.append(flow)
+                    continue
+                inherited = {
+                    candidate.reference_series
+                    for candidate in plan.flows
+                    if candidate.reference_series[1] != "$DATASET"
+                    and set(candidate.instrument_ids).intersection(flow.instrument_ids)
+                }
+                if len(inherited) != 1:
+                    raise JobNotSatisfiable(
+                        f"position-only flow {flow.flow_id} has no unambiguous market clock",
+                        reason_code="REQUIRED_INPUT_UNAVAILABLE",
+                    )
+                resolved_flows.append(replace(flow, reference_series=next(iter(inherited))))
+            plan = replace(plan, flows=tuple(resolved_flows))
             reference_start, reference_end = coverage_by_resolution[plan.reference_series[1]]
             warmup = max(
                 (feature.warmup_span for feature in plan.required_features),
@@ -2067,6 +2094,10 @@ class OrchestratorJobHandler:
                 ) from exc
         requirements = derive_data_requirements(
             plan, evaluation_from=evaluation_from, evaluation_through=evaluation_through
+        )
+        requirements = tuple(
+            replace(requirement, warmup_from=max(requirement.warmup_from, policy.period_start))
+            for requirement in requirements
         )
         if not requirements:  # pragma: no cover - a loaded plan always declares one
             raise JobNotSatisfiable(
