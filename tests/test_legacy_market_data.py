@@ -52,6 +52,18 @@ def test_exact_development_manifest_binds_to_the_one_month_et_policy() -> None:
     require_compatible_execution_window(policy, _fixture(), XNYS_CALENDAR)
 
 
+def test_legacy_manifest_may_be_one_segment_inside_a_longer_policy() -> None:
+    policy = replace(
+        D17_EXECUTION_POLICY_FIXTURE,
+        version="development-official-backtest-2026-q3-v3",
+        period_start=datetime(2024, 1, 1, 5, tzinfo=timezone.utc),
+        period_end=datetime(2025, 1, 1, 5, tzinfo=timezone.utc),
+        market_data_schema_version="market-bars/1",
+    )
+
+    require_compatible_execution_window(policy, _fixture(), XNYS_CALENDAR)
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -141,6 +153,31 @@ def test_reader_consumes_legacy_parquet_without_weakening_the_canonical_path(
     result = ParquetMarketDataReader(tmp_path).read(manifest, policy)
 
     assert result.num_rows == 2
+
+
+def test_reader_consumes_one_legacy_segment_inside_a_longer_policy(tmp_path: Path) -> None:
+    key_root = (
+        tmp_path
+        / "historical/provider=alpaca/feed=sip/adjustment=all/session=regular"
+        / "resolution=30m/revision=00000001/year=2024/shard=00-of-01"
+        / "manifest_id=11111111-1111-4111-8111-111111111111"
+    )
+    extended_key_root = Path(long_path(key_root))
+    extended_key_root.mkdir(parents=True)
+    fixture = write_small_market_bars(extended_key_root / "part-00001.parquet")
+    table = pq.read_table(fixture.path).replace_schema_metadata(
+        {b"schema_version": b"market-bars/1", b"processing_version": b"market-loader/1.0.0"}
+    )
+    pq.write_table(table, fixture.path, compression="zstd", version="2.6")
+    manifest = _one_shard_manifest(fixture.path)
+    policy = replace(
+        D17_EXECUTION_POLICY_FIXTURE,
+        period_start=datetime(2024, 1, 1, 5, tzinfo=timezone.utc),
+        period_end=datetime(2025, 1, 1, 5, tzinfo=timezone.utc),
+        market_data_schema_version="market-bars/1",
+    )
+
+    assert ParquetMarketDataReader(tmp_path).read(manifest, policy).num_rows == 2
 
 
 def test_composite_legacy_manifest_hashes_and_validates_multiple_source_years() -> None:

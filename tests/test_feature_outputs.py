@@ -789,8 +789,8 @@ def test_incompatible_development_windows_are_one_terminal_binding_failure(
         row_count=len(CLOSES),
         coverage_end=EVALUATION_THROUGH,
     )
-    manifest["period_start"] = "2024-01-01T05:00:00Z"
-    manifest["period_end"] = "2024-02-01T05:00:00Z"
+    manifest["period_start"] = "2015-01-01T05:00:00Z"
+    manifest["period_end"] = "2015-02-01T05:00:00Z"
     handler = _handler(Source({}), Reader(b""))
     handler._policies = ExecutionPolicyCatalog([policy])
     handler._manifests = StaticDatasetManifestSource({DATASET_MANIFEST_ID: manifest})

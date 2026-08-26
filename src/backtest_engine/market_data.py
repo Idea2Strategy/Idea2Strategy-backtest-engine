@@ -36,7 +36,7 @@ from .execution_policy import ExecutionPolicy
 from .legacy_market_data import (
     LEGACY_MARKET_SCHEMA_ID,
     is_legacy_market_loader_manifest,
-    legacy_period_matches,
+    legacy_period_within_policy,
     validate_legacy_market_loader_manifest,
 )
 from .object_store.paths import long_path
@@ -318,24 +318,18 @@ class ParquetMarketDataReader:
         if manifest.get("schema_id") != policy.market_data_schema_version:
             raise MarketDataValidationError("manifest schema_id does not match policy")
         if legacy:
-            if not legacy_period_matches(
+            if not legacy_period_within_policy(
                 manifest,
                 policy.period_start,
                 policy.period_end,
                 policy.timezone,
             ):
-                raise MarketDataValidationError("legacy manifest period does not match policy")
+                raise MarketDataValidationError("legacy manifest period is outside policy")
         else:
-            if (
-                _utc_timestamp(manifest.get("period_start"), "manifest.period_start")
-                != policy.period_start
-            ):
-                raise MarketDataValidationError("manifest period_start does not match policy")
-            if (
-                _utc_timestamp(manifest.get("period_end"), "manifest.period_end")
-                != policy.period_end
-            ):
-                raise MarketDataValidationError("manifest period_end does not match policy")
+            manifest_start = _utc_timestamp(manifest.get("period_start"), "manifest.period_start")
+            manifest_end = _utc_timestamp(manifest.get("period_end"), "manifest.period_end")
+            if not policy.period_start <= manifest_start < manifest_end <= policy.period_end:
+                raise MarketDataValidationError("manifest period is outside policy")
 
     def iter_batches(
         self,

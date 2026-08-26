@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from fractions import Fraction
@@ -538,6 +539,24 @@ def _run(
     return outcome, harness, coordinator
 
 
+def test_explicit_evaluation_interval_keeps_warmup_visible_but_never_trades_outside_it(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "bars.parquet"
+    write_bars(path)
+    job = replace(
+        _job(manifest_for(path)),
+        evaluation_from=SECOND,
+        evaluation_through=THIRD,
+    )
+
+    outcome, harness, _ = _run(tmp_path, job=job)
+
+    assert outcome.status is ReplayStatus.COMPLETED
+    assert [step.instant for step in outcome.steps] == [SECOND]
+    assert all(candidate.decided_at == SECOND for candidate in harness.engine.placed)
+
+
 # --------------------------------------------------------------------------
 # The seams line up with BT-a's real classes
 # --------------------------------------------------------------------------
@@ -600,10 +619,9 @@ def test_orchestrator_reads_every_pinned_resolution_into_one_replay_clock() -> N
          _bar_row(_utc(14, 45), date(2024, 1, 2))],
         schema=_SCHEMA,
     )
-    rows_30m = pa.Table.from_pylist(
-        [_bar_row(_utc(14, 30), date(2024, 1, 2))],
-        schema=_SCHEMA,
-    )
+    row_30m = _bar_row(_utc(14, 30), date(2024, 1, 2))
+    row_30m.update(instrument_id=MSFT, provider_symbol="MSFT")
+    rows_30m = pa.Table.from_pylist([row_30m], schema=_SCHEMA)
     manifests = ({"resolution": "15m"}, {"resolution": "30m"})
 
     class Reader:
@@ -617,8 +635,10 @@ def test_orchestrator_reads_every_pinned_resolution_into_one_replay_clock() -> N
             *,
             instrument_ids: frozenset[str] | None = None,
         ) -> Any:
-            assert instrument_ids == frozenset({AAPL})
             resolution = str(manifest["resolution"])
+            assert instrument_ids == (
+                frozenset({AAPL}) if resolution == "15m" else frozenset({MSFT})
+            )
             self.seen.append(resolution)
             return (rows_15m if resolution == "15m" else rows_30m).to_batches()
 
@@ -640,7 +660,7 @@ def test_orchestrator_reads_every_pinned_resolution_into_one_replay_clock() -> N
             evaluation_through=_utc(15, 0),
         ),
         DataRequirement(
-            requirement_id="aapl-30m", instrument_id=AAPL, data_kind=DATA_KIND,
+            requirement_id="msft-30m", instrument_id=MSFT, data_kind=DATA_KIND,
             resolution="30m", warmup_from=_utc(14, 30), evaluation_from=_utc(14, 30),
             evaluation_through=_utc(15, 0),
         ),
@@ -666,8 +686,9 @@ def test_orchestrator_reads_every_pinned_resolution_into_one_replay_clock() -> N
 
     assert outcome.status is ReplayStatus.COMPLETED
     assert reader.seen == ["15m", "30m"]
-    visible = runtime.inputs_by_instant[_utc(15, 0)][AAPL]
-    assert {series.resolution for series in visible.series} == {"15m", "30m"}
+    visible = runtime.inputs_by_instant[_utc(15, 0)]
+    assert {series.resolution for series in visible[AAPL].series} == {"15m"}
+    assert {series.resolution for series in visible[MSFT].series} == {"30m"}
 
 
 # --------------------------------------------------------------------------

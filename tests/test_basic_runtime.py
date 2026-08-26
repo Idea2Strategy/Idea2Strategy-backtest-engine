@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
@@ -1092,6 +1093,44 @@ def test_requirements_are_deduplicated_across_flows_and_partitions() -> None:
     ]
 
 
+def test_requirements_do_not_cross_product_unrelated_flow_instruments_and_clocks() -> None:
+    loaded = _runtime().load(_two_container_document())
+    buy, sell = loaded.flows
+    sell_conditions = tuple(
+        replace(
+            step,
+            arguments=dict(step.arguments, resolution="30m")
+            if "resolution" in step.arguments else step.arguments,
+        )
+        for step in sell.condition_steps
+    )
+    plan = replace(
+        loaded,
+        flows=(
+            buy,
+            replace(
+                sell,
+                instrument_ids=(SECOND,),
+                condition_steps=sell_conditions,
+                reference_series=("ADJUSTED_BAR", "30m"),
+            ),
+        ),
+    )
+
+    requirements = derive_data_requirements(
+        plan,
+        evaluation_from=_utc("2025-11-28T14:45:00Z"),
+        evaluation_through=_utc("2025-11-28T20:00:00Z"),
+    )
+
+    assert [(item.instrument_id, item.resolution) for item in requirements] == [
+        (FIRST, "1m"),
+        (SECOND, "30m"),
+    ]
+    assert plan.flows[0].reference_series == ("ADJUSTED_BAR", "1m")
+    assert plan.flows[1].reference_series == ("ADJUSTED_BAR", "30m")
+
+
 # ---------------------------------------------------------------------------
 # Replay: clock and availability gate actually applied
 # ---------------------------------------------------------------------------
@@ -1395,6 +1434,51 @@ def test_loads_one_container_per_side_from_a_version_two_plan() -> None:
     buy, sell = plan.flows
     assert buy.condition_steps != sell.condition_steps
     assert sell.condition_steps[-1].arguments["operator"] == "GT"
+
+
+def test_loads_raw_market_containers_with_independent_resolutions() -> None:
+    document = _two_container_document()
+    document["elementCatalogVersion"] = "basic-elements:2026-08-25"
+    document["requiredFeatures"] = []
+    flows = document["executionSnapshot"]["partitions"][0]["flows"]
+    for flow, instrument_id, resolution in zip(
+        flows,
+        (FIRST, SECOND),
+        ("1h", "4h"),
+        strict=True,
+    ):
+        flow["officialInstrumentIds"] = [instrument_id]
+        price_step = {
+            "sequence": 1,
+            "operation": "PRICE_COMPARE",
+            "arguments": {
+                "operator": "GT",
+                "reference": "PREVIOUS_CLOSE",
+                "resolution": resolution,
+            },
+        }
+        terminal_step = flow["steps"][-1]
+        terminal_step["sequence"] = 2
+        terminal_step["arguments"].update(
+            {
+                "executionMode": "주기마다",
+                "maxExecutions": "20",
+                "maxPositionPercent": "25",
+                "orderPercent": "10",
+                "timeInForce": "DAY",
+                "waitInterval": "5",
+                "waitMode": "N봉 이후",
+            }
+        )
+        flow["steps"] = [price_step, terminal_step]
+    document["planChecksum"] = compute_compiled_plan_checksum(document)
+
+    plan = _runtime().load(document)
+
+    assert [flow.reference_series for flow in plan.flows] == [
+        ("ADJUSTED_BAR", "1h"),
+        ("ADJUSTED_BAR", "4h"),
+    ]
 
 
 def test_a_version_two_plan_missing_per_flow_steps_is_refused() -> None:

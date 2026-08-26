@@ -70,6 +70,7 @@ from backtest_engine.wiring import (
     _metric_percent,
     dataset_coverage,
     evaluation_window,
+    segmented_dataset_coverage,
 )
 from backtest_engine.worker import JobContext, JobResult
 from d_reproducibility_testkit import (
@@ -661,6 +662,36 @@ def test_dataset_coverage_reads_the_objects_not_the_dataset_window() -> None:
     assert widened["period_start"] == "2024-01-01T05:00:00Z"
     assert widened["period_end"] == "2024-04-01T04:00:00Z"
     assert dataset_coverage(widened)[1] == FIRST_BAR_START + BAR * len(CLOSES)
+
+
+def test_adjacent_manifests_of_the_same_resolution_form_one_cover() -> None:
+    first = dataset_manifest("1" * 64, row_count=1, coverage_end=FIRST_BAR_START + BAR)
+    second = dataset_manifest("2" * 64, row_count=1, coverage_end=FIRST_BAR_START + BAR)
+    for manifest in (first, second):
+        manifest["resolution"] = "1h"
+    first["objects"][0]["period_start"] = "2024-01-01T00:00:00Z"
+    first["objects"][0]["period_end"] = "2025-01-01T00:00:00Z"
+    second["objects"][0]["period_start"] = "2025-01-01T00:00:00Z"
+    second["objects"][0]["period_end"] = "2026-01-01T00:00:00Z"
+
+    assert segmented_dataset_coverage((second, first)) == (
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+
+def test_segmented_manifest_cover_rejects_a_gap() -> None:
+    first = dataset_manifest("1" * 64, row_count=1, coverage_end=FIRST_BAR_START + BAR)
+    second = dataset_manifest("2" * 64, row_count=1, coverage_end=FIRST_BAR_START + BAR)
+    for manifest in (first, second):
+        manifest["resolution"] = "4h"
+    first["objects"][0]["period_start"] = "2024-01-01T00:00:00Z"
+    first["objects"][0]["period_end"] = "2025-01-01T00:00:00Z"
+    second["objects"][0]["period_start"] = "2025-02-01T00:00:00Z"
+    second["objects"][0]["period_end"] = "2026-01-01T00:00:00Z"
+
+    with pytest.raises(JobNotSatisfiable, match="gap"):
+        segmented_dataset_coverage((first, second))
 
 
 def test_the_pinned_completion_instant_follows_every_replay_instant() -> None:
