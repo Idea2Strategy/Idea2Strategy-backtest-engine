@@ -17,6 +17,7 @@ from backtest_engine.execution_model import (
     CHART_OF_ACCOUNTS_VERSION,
     D23_MICROSTRUCTURE_POLICY_V1,
     BacktestExecutionModel,
+    ExecutionBar,
     ExecutionMicrostructurePolicy,
     ExecutionModelValidationError,
     InstrumentFractionalPolicy,
@@ -142,6 +143,27 @@ def _bar(
         volume=Decimal(volume),
         complete=complete,
     )
+
+
+def test_overlapping_multi_resolution_bars_do_not_reverse_the_execution_clock() -> None:
+    model = _model()
+    one_hour = ExecutionBar(
+        instrument_id=INSTRUMENT,
+        starts_at=_utc("2025-11-28T17:00:00Z"),
+        ends_at=_utc("2025-11-28T18:00:00Z"),
+        open=Decimal("100"), high=Decimal("101"), low=Decimal("99"),
+        close=Decimal("100"), volume=Decimal("1000"), resolution="1h",
+    )
+    four_hour = ExecutionBar(
+        instrument_id=OTHER_INSTRUMENT,
+        starts_at=_utc("2025-11-28T14:00:00Z"),
+        ends_at=_utc("2025-11-28T18:00:00Z"),
+        open=Decimal("200"), high=Decimal("202"), low=Decimal("198"),
+        close=Decimal("200"), volume=Decimal("1000"), resolution="4h",
+    )
+
+    assert model.process_bar(one_hour) == ()
+    assert model.process_bar(four_hour) == ()
 
 
 def _entry(

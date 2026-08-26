@@ -421,6 +421,8 @@ class BacktestJob:
     resolution: str
     initial_cash: Decimal
     manifests: tuple[Mapping[str, Any], ...] = ()
+    evaluation_from: datetime | None = None
+    evaluation_through: datetime | None = None
 
     def __post_init__(self) -> None:
         if not self.run_id:
@@ -437,6 +439,13 @@ class BacktestJob:
         if any(not isinstance(item, Mapping) for item in manifests):
             raise OrchestratorError("manifests must contain dataset manifest mappings")
         object.__setattr__(self, "manifests", manifests)
+        if (self.evaluation_from is None) != (self.evaluation_through is None):
+            raise OrchestratorError("evaluation interval must include both boundaries")
+        if self.evaluation_from is not None:
+            if self.evaluation_from.tzinfo is None or self.evaluation_through.tzinfo is None:
+                raise OrchestratorError("evaluation interval must be timezone-aware")
+            if self.evaluation_from >= self.evaluation_through:
+                raise OrchestratorError("evaluation interval must not be empty")
         # One source of truth for the bar period: the element catalog's
         # resolution table. A separately configured interval could disagree
         # with the resolution the plan actually reads.
@@ -729,9 +738,14 @@ class BacktestOrchestrator:
         monitor: ResourceMonitor,
     ) -> ReplayOutcome:
         schedule = self._schedule(job.execution_policy)
-        required_instrument_ids = frozenset(
-            requirement.instrument_id for requirement in job.requirements
-        )
+        required_instruments_by_resolution: dict[str, frozenset[str]] = {
+            resolution: frozenset(
+                requirement.instrument_id
+                for requirement in job.requirements
+                if requirement.resolution == resolution
+            )
+            for resolution in {requirement.resolution for requirement in job.requirements}
+        }
         try:
             combined_events: list[MarketDataEvent] = []
             for manifest in job.manifests:
@@ -741,6 +755,11 @@ class BacktestOrchestrator:
                 if not resolution:
                     raise MarketDataValidationError(
                         "every pinned dataset manifest must declare its resolution"
+                    )
+                required_instrument_ids = required_instruments_by_resolution.get(resolution)
+                if not required_instrument_ids:
+                    raise MarketDataValidationError(
+                        f"pinned dataset resolution {resolution} is not required by the plan"
                     )
                 manifest_events = bar_events_from_batches(
                     self._reader.iter_batches(
@@ -758,9 +777,23 @@ class BacktestOrchestrator:
                     if len(job.manifests) > 1 else event
                     for event in manifest_events
                 )
+            combined_events.sort(key=lambda event: (
+                event.occurred_at,
+                resolution_period(str(event.payload.get("resolution", ""))),
+                event.instrument_id,
+                event.event_id,
+            ))
             events = tuple(
                 replace(event, source_sequence=index)
-                for index, event in enumerate(combined_events, start=1)
+                for index, event in enumerate(
+                    (
+                        event
+                        for event in combined_events
+                        if event.occurred_at >= min(requirement.warmup_from for requirement in job.requirements)
+                        and (job.evaluation_through is None or event.occurred_at < job.evaluation_through)
+                    ),
+                    start=1,
+                )
             )
         except MarketDataValidationError:
             return self._abort(
@@ -833,6 +866,11 @@ class BacktestOrchestrator:
             per_series_limit=getattr(replay, "visible_event_limit", None),
         )
         for sequence, instant in enumerate(sorted(events_at), start=1):
+            if job.evaluation_through is not None and instant >= job.evaluation_through:
+                break
+            if job.evaluation_from is not None and instant < job.evaluation_from:
+                visible_window.advance_to(instant)
+                continue
             try:
                 lease = coordinator.heartbeat(
                     lease, self._wall_clock(), monitor.sample()

@@ -274,6 +274,8 @@ class BacktestRequestJobPublisher:
             "datasetManifestId": str(primary.dataset_manifest_id),
             "expectedDatasetHash": primary.locked_dataset_hash,
             "expectedSnapshotHash": str(request["expectedSnapshotHash"]),
+            "evaluationStart": run.evaluation_start.isoformat(),
+            "evaluationEnd": run.evaluation_end.isoformat(),
             "datasets": [_dataset_payload(item) for item in stored_datasets],
             "featureMaterializations": [_feature_payload(item) for item in stored_features],
             **period_identity,

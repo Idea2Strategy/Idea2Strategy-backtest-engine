@@ -28,6 +28,7 @@ __all__ = [
     "is_legacy_market_loader_manifest",
     "legacy_dataset_hash",
     "legacy_period_matches",
+    "legacy_period_within_policy",
     "validate_legacy_market_loader_manifest",
 ]
 
@@ -304,4 +305,24 @@ def legacy_period_matches(
         and (local_end.hour, local_end.minute, local_end.second, local_end.microsecond) == midnight
         and _period_date(manifest.get("period_start"), "period_start") == local_start.date()
         and _period_date(manifest.get("period_end"), "period_end") == local_end.date()
+    )
+
+
+def legacy_period_within_policy(
+    manifest: Mapping[str, Any],
+    period_start: datetime,
+    period_end: datetime,
+    timezone_name: str,
+) -> bool:
+    """Accept one loader date-labelled segment contained by policy-local dates."""
+    zone = ZoneInfo(timezone_name)
+    local_start = period_start.astimezone(zone)
+    local_end = period_end.astimezone(zone)
+    midnight = (0, 0, 0, 0)
+    manifest_start = _period_date(manifest.get("period_start"), "period_start")
+    manifest_end = _period_date(manifest.get("period_end"), "period_end")
+    return (
+        (local_start.hour, local_start.minute, local_start.second, local_start.microsecond) == midnight
+        and (local_end.hour, local_end.minute, local_end.second, local_end.microsecond) == midnight
+        and local_start.date() <= manifest_start < manifest_end <= local_end.date()
     )

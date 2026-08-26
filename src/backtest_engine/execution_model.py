@@ -907,10 +907,24 @@ class BacktestExecutionModel:
             fills.extend(self.process_bar(bar))
         return tuple(fills)
 
+    def advance_to_bar(self, bar: ExecutionBar) -> tuple[BacktestOrder, ...]:
+        """Advance for a bar, permitting only a still-overlapping coarser bar."""
+        if self._now is None or bar.starts_at >= self._now:
+            return self.advance_time(bar.starts_at)
+        if bar.ends_at < self._now:
+            raise ExecutionModelValidationError(
+                "a completed bar must not precede the execution clock"
+            )
+        return ()
+
     def process_bar(self, bar: ExecutionBar) -> tuple[Fill, ...]:
         if not isinstance(bar, ExecutionBar):
             raise ExecutionModelValidationError("bar must be an ExecutionBar")
-        self.advance_time(bar.starts_at)
+        self.advance_to_bar(bar)
+        # Different resolutions overlap by definition. A 4h bar becomes visible
+        # after several 1h bars whose starts already advanced the shared account
+        # clock. Processing that still-open interval is not clock reversal: only
+        # orders eligible at the 4h bar's own start may fill below.
         if not bar.complete:
             return ()
         # VOLUME_PARTICIPATION_RULE: one capacity per bar, shared by every order.

@@ -58,7 +58,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_FLOOR, ROUND_HALF_EVEN, Decimal, localcontext
 from typing import Any, Protocol, cast
 from zoneinfo import ZoneInfo
@@ -120,7 +120,7 @@ from .feature_outputs import (
 )
 from .legacy_market_data import (
     is_legacy_market_loader_manifest,
-    legacy_period_matches,
+    legacy_period_within_policy,
     validate_legacy_market_loader_manifest,
 )
 from .lifecycle import BacktestLifecycleService, PersistenceRunGateway, SqsBacktestJobQueue
@@ -479,7 +479,7 @@ class ExecutionModelEngine:
     def settle(self, event: MarketDataEvent) -> int:
         before = self._model.position(event.instrument_id)
         bar = self._bar_of(event)
-        for expired in self._model.advance_time(bar.starts_at):
+        for expired in self._model.advance_to_bar(bar):
             self._records.append(
                 order_result_record(self._run, expired, bar.starts_at, self._model.cash, self._positions())
             )
@@ -1119,6 +1119,8 @@ class JobEnvelope:
     feature_materializations: tuple[FeatureMaterializationPin, ...]
     evaluation_period_id: uuid.UUID | None
     input_set_hash: str | None
+    evaluation_start: date | None = None
+    evaluation_end: date | None = None
 
     @classmethod
     def parse(cls, job: Mapping[str, Any]) -> JobEnvelope:
@@ -1186,6 +1188,16 @@ class JobEnvelope:
                 input_set_hash=(
                     _pinned_hash(job["inputSetHash"])
                     if job.get("inputSetHash") is not None
+                    else None
+                ),
+                evaluation_start=(
+                    date.fromisoformat(str(job["evaluationStart"]))
+                    if job.get("evaluationStart") is not None
+                    else None
+                ),
+                evaluation_end=(
+                    date.fromisoformat(str(job["evaluationEnd"]))
+                    if job.get("evaluationEnd") is not None
                     else None
                 ),
             )
@@ -1567,6 +1579,40 @@ def dataset_coverage(manifest: Mapping[str, Any]) -> tuple[datetime, datetime]:
     return min(starts), max(ends)
 
 
+def segmented_dataset_coverage(
+    manifests: Sequence[Mapping[str, Any]],
+) -> tuple[datetime, datetime]:
+    """Validate and join adjacent immutable segments of one exact resolution."""
+    if not manifests:
+        raise JobNotSatisfiable(
+            "no dataset manifest segments were pinned",
+            reason_code="REQUIRED_INPUT_UNAVAILABLE",
+        )
+    resolutions = {str(item.get("resolution", "")) for item in manifests}
+    if "" in resolutions or len(resolutions) != 1:
+        raise JobNotSatisfiable(
+            "a segmented dataset cover must declare one exact resolution",
+            reason_code="REQUIRED_INPUT_UNAVAILABLE",
+        )
+    windows = sorted(dataset_coverage(item) for item in manifests)
+    start, end = windows[0]
+    for next_start, next_end in windows[1:]:
+        if next_start < end:
+            raise JobNotSatisfiable(
+                f"pinned {next(iter(resolutions))} dataset segments overlap at "
+                f"{next_start.isoformat()}",
+                reason_code="REQUIRED_INPUT_UNAVAILABLE",
+            )
+        if next_start > end:
+            raise JobNotSatisfiable(
+                f"pinned {next(iter(resolutions))} dataset segments leave a gap "
+                f"{end.isoformat()}..{next_start.isoformat()}",
+                reason_code="REQUIRED_INPUT_UNAVAILABLE",
+            )
+        end = max(end, next_end)
+    return start, end
+
+
 def evaluation_window(manifest: Mapping[str, Any], plan: BasicCompiledPlan) -> tuple[datetime, datetime]:
     """Where warm-up ends and evaluation begins, for this plan on this dataset.
 
@@ -1610,7 +1656,7 @@ def require_compatible_execution_window(
     if legacy:
         try:
             validate_legacy_market_loader_manifest(manifest)
-            period_matches = legacy_period_matches(
+            period_matches = legacy_period_within_policy(
                 manifest,
                 policy.period_start,
                 policy.period_end,
@@ -1620,11 +1666,13 @@ def require_compatible_execution_window(
             problems.append(f"legacy dataset manifest is invalid: {exc}")
             period_matches = False
     else:
-        period_matches = manifest_start == policy.period_start and manifest_end == policy.period_end
+        period_matches = (
+            policy.period_start <= manifest_start < manifest_end <= policy.period_end
+        )
     if not period_matches:
         problems.append(
             "dataset manifest period "
-            f"{manifest_start.isoformat()}..{manifest_end.isoformat()} does not match "
+            f"{manifest_start.isoformat()}..{manifest_end.isoformat()} is outside "
             f"execution policy {policy.version} period "
             f"{policy.period_start.isoformat()}..{policy.period_end.isoformat()}"
         )
@@ -1887,6 +1935,10 @@ class OrchestratorJobHandler:
                 f"compiled plan {plan_checksum} is not resolvable",
                 reason_code="REQUIRED_INPUT_UNAVAILABLE",
             )
+        try:
+            plan = self._runtime.load(plan_document, compiled_plan_checksum=plan_checksum)
+        except BasicPlanCompatibilityError as exc:
+            raise JobNotSatisfiable(str(exc), reason_code=exc.failure.value) from exc
         resolved_manifests: list[tuple[DatasetPin, Mapping[str, Any]]] = []
         for pin in envelope.datasets:
             resolved = self._manifests.by_id(pin.manifest_id)
@@ -1898,36 +1950,28 @@ class OrchestratorJobHandler:
                     f"dataset manifest {pin.manifest_id} is missing or changed",
                     reason_code="REQUIRED_INPUT_UNAVAILABLE",
                 )
+            if (
+                not str(resolved.get("resolution", ""))
+                and len(envelope.datasets) == 1
+                and plan.reference_series[1] != "$DATASET"
+            ):
+                resolved = dict(resolved, resolution=plan.reference_series[1])
             resolved_manifests.append((pin, resolved))
         for _pin, resolved in resolved_manifests:
             require_compatible_execution_window(policy, resolved, self._calendar)
-        declared_resolutions = [
-            str(resolved.get("resolution", "")) for _pin, resolved in resolved_manifests
-        ]
-        if len(resolved_manifests) > 1 and (
-            any(not resolution for resolution in declared_resolutions)
-            or len(set(declared_resolutions)) != len(declared_resolutions)
-        ):
-            raise JobNotSatisfiable(
-                "multiple pinned market datasets must declare unique resolutions",
-                reason_code="REQUIRED_INPUT_UNAVAILABLE",
-            )
-        coverage_windows = {dataset_coverage(resolved) for _pin, resolved in resolved_manifests}
-        if len(coverage_windows) != 1:
-            raise JobNotSatisfiable(
-                "all pinned market datasets must share one evaluation period",
-                reason_code="REQUIRED_INPUT_UNAVAILABLE",
-            )
-        try:
-            plan = self._runtime.load(plan_document, compiled_plan_checksum=plan_checksum)
-        except BasicPlanCompatibilityError as exc:
-            # The plan is immutable and addressed by its checksum. A schema,
-            # integrity, or catalog incompatibility therefore cannot become
-            # valid when SQS redelivers the same message. Translate it at the
-            # binding boundary so the existing terminal-result path records
-            # the precise plan-load failure once instead of retrying a
-            # deterministic producer/consumer mismatch to exhaustion.
-            raise JobNotSatisfiable(str(exc), reason_code=exc.failure.value) from exc
+        manifests_by_resolution: dict[str, list[Mapping[str, Any]]] = {}
+        for _pin, resolved in resolved_manifests:
+            resolution = str(resolved.get("resolution", ""))
+            if not resolution:
+                raise JobNotSatisfiable(
+                    "every pinned market dataset must declare its resolution",
+                    reason_code="REQUIRED_INPUT_UNAVAILABLE",
+                )
+            manifests_by_resolution.setdefault(resolution, []).append(resolved)
+        coverage_by_resolution = {
+            resolution: segmented_dataset_coverage(manifests)
+            for resolution, manifests in manifests_by_resolution.items()
+        }
         if plan.reference_series[1] == "$DATASET":
             primary = [item for item in resolved_manifests if item[0].manifest_id == envelope.dataset_manifest_id]
             if len(primary) != 1:
@@ -1943,30 +1987,64 @@ class OrchestratorJobHandler:
                     reason_code="REQUIRED_INPUT_UNAVAILABLE",
                 )
             plan = replace(
-                plan, reference_series=(plan.reference_series[0], dataset_resolution)
+                plan,
+                reference_series=(plan.reference_series[0], dataset_resolution),
+                flows=tuple(
+                    replace(flow, reference_series=(flow.reference_series[0], dataset_resolution))
+                    if flow.reference_series[1] == "$DATASET"
+                    else flow
+                    for flow in plan.flows
+                ),
             )
         else:
             reference_resolution = plan.reference_series[1]
-            reference_manifests = [
-                resolved for _pin, resolved in resolved_manifests
-                if str(resolved.get("resolution", "")) == reference_resolution
-            ]
-            if (
-                not reference_manifests
-                and len(resolved_manifests) == 1
-                and not str(resolved_manifests[0][1].get("resolution", ""))
-            ):
-                # Legacy single-dataset fixtures and messages predate the
-                # manifest-level resolution field. Multiple datasets never
-                # receive this fallback because their binding must be explicit.
-                reference_manifests = [resolved_manifests[0][1]]
-            if len(reference_manifests) != 1:
+            reference_manifests = manifests_by_resolution.get(reference_resolution, [])
+            if not reference_manifests:
                 raise JobNotSatisfiable(
-                    f"the plan reference resolution {reference_resolution} must match exactly one pinned dataset",
+                    f"the plan reference resolution {reference_resolution} has no pinned dataset cover",
                     reason_code="REQUIRED_INPUT_UNAVAILABLE",
                 )
-            manifest = reference_manifests[0]
-        evaluation_from, evaluation_through = evaluation_window(manifest, plan)
+            primary = [
+                resolved for pin, resolved in resolved_manifests
+                if pin.manifest_id == envelope.dataset_manifest_id
+                and str(resolved.get("resolution", "")) == reference_resolution
+            ]
+            manifest = primary[0] if len(primary) == 1 else sorted(
+                reference_manifests, key=lambda item: dataset_coverage(item)
+            )[0]
+        if envelope.evaluation_start is not None or envelope.evaluation_end is not None:
+            if envelope.evaluation_start is None or envelope.evaluation_end is None:
+                raise JobNotSatisfiable(
+                    "the explicit evaluation interval must include both boundaries",
+                    reason_code="REQUIRED_INPUT_UNAVAILABLE",
+                )
+            policy_zone = ZoneInfo(policy.timezone)
+            evaluation_from = datetime.combine(
+                envelope.evaluation_start, time.min, tzinfo=policy_zone
+            ).astimezone(timezone.utc)
+            evaluation_through = datetime.combine(
+                envelope.evaluation_end + timedelta(days=1), time.min, tzinfo=policy_zone
+            ).astimezone(timezone.utc)
+            if evaluation_from >= evaluation_through:
+                raise JobNotSatisfiable(
+                    "the explicit evaluation interval is empty or reversed",
+                    reason_code="REQUIRED_INPUT_UNAVAILABLE",
+                )
+        else:
+            reference_start, reference_end = coverage_by_resolution[plan.reference_series[1]]
+            warmup = max(
+                (feature.warmup_span for feature in plan.required_features),
+                default=timedelta(0),
+            )
+            evaluation_from, evaluation_through = reference_start + warmup, reference_end
+        for resolution, (coverage_start, coverage_end) in coverage_by_resolution.items():
+            if coverage_start > evaluation_from or coverage_end < evaluation_through:
+                raise JobNotSatisfiable(
+                    f"pinned {resolution} dataset cover {coverage_start.isoformat()}.."
+                    f"{coverage_end.isoformat()} does not contain evaluation interval "
+                    f"{evaluation_from.isoformat()}..{evaluation_through.isoformat()}",
+                    reason_code="REQUIRED_INPUT_UNAVAILABLE",
+                )
         feature_series: tuple[PinnedFeatureSeries, ...] = ()
         if self._feature_materializations is not None or envelope.feature_materializations:
             if self._feature_materializations is None or self._feature_object_reader is None:
@@ -2021,6 +2099,8 @@ class OrchestratorJobHandler:
                 resolution=resolution,
                 initial_cash=plan.initial_cash,
                 manifests=tuple(resolved for _pin, resolved in resolved_manifests),
+                evaluation_from=evaluation_from,
+                evaluation_through=evaluation_through,
             )
         except OrchestratorError as exc:
             raise JobNotSatisfiable(str(exc), reason_code="REQUIRED_INPUT_UNAVAILABLE") from exc

@@ -334,6 +334,7 @@ class BasicPlanFlow:
     condition_steps: tuple[PlanStep, ...] = ()
     terminal_step: PlanStep | None = None
     allocation: str = ""
+    reference_series: tuple[str, str] = ("ADJUSTED_BAR", "$DATASET")
 
 
 @dataclass(frozen=True, slots=True)
@@ -585,11 +586,16 @@ class BasicPlanRuntime:
 
         condition_steps, terminal_step = chains[0]
         required_features = self._required_features(root, catalog)
-        reference_series = self._require_declared_features(
-            tuple(step for chain, _ in chains for step in chain),
-            required_features,
-            catalog,
+        chain_references = tuple(
+            self._require_declared_features(condition_steps, required_features, catalog)
+            for condition_steps, _terminal in chains
         )
+        # Resolution belongs to a flow/container. Combining every condition chain here
+        # used to reject an otherwise valid multi-container strategy as soon as two
+        # partitions or flows used different bar sizes. The plan-level field is kept
+        # only for the v1 compatibility surface; all v2 execution and requirement
+        # derivation uses each BasicPlanFlow.reference_series.
+        reference_series = chain_references[0]
         self._require_compatibility(root, required_features, runtime_schema_version)
 
         version = snapshot["immutableStrategyVersion"]
@@ -615,7 +621,7 @@ class BasicPlanRuntime:
             allocation=terminal_step.argument("allocation"),
             required_features=required_features,
             reference_series=reference_series,
-            flows=self._load_flows(snapshot, chains, per_container),
+            flows=self._load_flows(snapshot, chains, chain_references, per_container),
             catalog=catalog,
         )
 
@@ -871,6 +877,7 @@ class BasicPlanRuntime:
     def _load_flows(
         snapshot: Mapping[str, Any],
         chains: Sequence[tuple[tuple[PlanStep, ...], PlanStep]],
+        chain_references: Sequence[tuple[str, str]],
         per_container: bool,
     ) -> tuple[BasicPlanFlow, ...]:
         """Flatten the snapshot's flows, giving each the chain that belongs to it.
@@ -899,6 +906,7 @@ class BasicPlanRuntime:
                         "repeated instrument would be allocated twice"
                     )
                 condition_steps, terminal_step = chains[position if per_container else 0]
+                flow_reference = chain_references[position if per_container else 0]
                 position += 1
                 flows.append(
                     BasicPlanFlow(
@@ -910,6 +918,7 @@ class BasicPlanRuntime:
                         condition_steps=condition_steps,
                         terminal_step=terminal_step,
                         allocation=terminal_step.argument("allocation"),
+                        reference_series=flow_reference,
                     )
                 )
         return tuple(flows)
@@ -1051,7 +1060,7 @@ class BasicPlanRuntime:
             side=flow.side,
             status=BasicDecisionStatus.CANDIDATE,
             trace=tuple(trace),
-            reference_price=_reference_price(plan, evaluation),
+            reference_price=_reference_price(plan, flow, evaluation),
         )
 
     # -- emission --------------------------------------------------------
@@ -1136,8 +1145,12 @@ def _allocate_equally(decisions: list[BasicInstrumentDecision], side: str) -> tu
     )
 
 
-def _reference_price(plan: BasicCompiledPlan, evaluation: ElementEvaluation) -> Decimal:
-    data_kind, resolution = plan.reference_series
+def _reference_price(
+    plan: BasicCompiledPlan, flow: BasicPlanFlow, evaluation: ElementEvaluation
+) -> Decimal:
+    data_kind, resolution = (
+        plan.reference_series if flow.reference_series[1] == "$DATASET" else flow.reference_series
+    )
     series = evaluation.inputs.series_for(data_kind, resolution)
     completed = series.completed_through(evaluation.as_of) if series else ()
     if not completed:  # pragma: no cover - a candidate loaded a feature from it
@@ -1168,24 +1181,12 @@ def derive_data_requirements(
     same plan always makes the same request of the data layer.
     """
     by_id: dict[str, DataRequirement] = {}
-    raw_lookback: dict[tuple[str, str], int] = {}
-    for flow in plan.flows:
-        for step in flow.condition_steps:
-            resolution = step.arguments.get("resolution")
-            if resolution is None:
-                continue
-            lookback = _raw_operation_lookback(step)
-            key = ("ADJUSTED_BAR", resolution)
-            raw_lookback[key] = max(raw_lookback.get(key, 1), lookback)
-    if not raw_lookback and plan.reference_series[1] != "$DATASET":
-        raw_lookback[plan.reference_series] = 1
-    for instrument_id in plan.instrument_ids:
-        for feature in plan.required_features:
+    for feature in plan.required_features:
+        for instrument_id in feature.instruments:
             requirement_id = f"{instrument_id}|{feature.data_kind}|{feature.bar_resolution}"
             warmup_from = evaluation_from - feature.warmup_span
             existing = by_id.get(requirement_id)
             if existing is not None and existing.warmup_from <= warmup_from:
-                # Two features on the same series: the longer warm-up wins.
                 continue
             by_id[requirement_id] = DataRequirement(
                 requirement_id=requirement_id,
@@ -1196,21 +1197,33 @@ def derive_data_requirements(
                 evaluation_from=evaluation_from,
                 evaluation_through=evaluation_through,
             )
-        for (data_kind, resolution), bars in raw_lookback.items():
-            requirement_id = f"{instrument_id}|{data_kind}|{resolution}"
-            warmup_from = evaluation_from - resolution_period(resolution) * bars
-            existing = by_id.get(requirement_id)
-            if existing is not None and existing.warmup_from <= warmup_from:
+    for flow in plan.flows:
+        raw_lookback: dict[tuple[str, str], int] = {}
+        for step in flow.condition_steps:
+            resolution = step.arguments.get("resolution")
+            if resolution is None:
                 continue
-            by_id[requirement_id] = DataRequirement(
-                requirement_id=requirement_id,
-                instrument_id=instrument_id,
-                data_kind=data_kind,
-                resolution=resolution,
-                warmup_from=warmup_from,
-                evaluation_from=evaluation_from,
-                evaluation_through=evaluation_through,
-            )
+            lookback = _raw_operation_lookback(step)
+            key = ("ADJUSTED_BAR", resolution)
+            raw_lookback[key] = max(raw_lookback.get(key, 1), lookback)
+        if not raw_lookback and flow.reference_series[1] != "$DATASET":
+            raw_lookback[flow.reference_series] = 1
+        for instrument_id in flow.instrument_ids:
+            for (data_kind, resolution), bars in raw_lookback.items():
+                requirement_id = f"{instrument_id}|{data_kind}|{resolution}"
+                warmup_from = evaluation_from - resolution_period(resolution) * bars
+                existing = by_id.get(requirement_id)
+                if existing is not None and existing.warmup_from <= warmup_from:
+                    continue
+                by_id[requirement_id] = DataRequirement(
+                    requirement_id=requirement_id,
+                    instrument_id=instrument_id,
+                    data_kind=data_kind,
+                    resolution=resolution,
+                    warmup_from=warmup_from,
+                    evaluation_from=evaluation_from,
+                    evaluation_through=evaluation_through,
+                )
     return tuple(by_id[key] for key in sorted(by_id))
 
 

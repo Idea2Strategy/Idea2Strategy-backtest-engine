@@ -116,7 +116,8 @@ def test_publishes_existing_provider_created_run_as_an_execution_job(
 ) -> None:
     request = factory()
     queue = Queue()
-    publisher = BacktestRequestJobPublisher(Source(projection(request, lane)), queue)
+    run = projection(request, lane)
+    publisher = BacktestRequestJobPublisher(Source(run), queue)
 
     publisher(request, lane)
 
@@ -139,6 +140,8 @@ def test_publishes_existing_provider_created_run_as_an_execution_job(
                     else request["periods"][0]["datasets"][0]["expectedDatasetHash"]
                 ),
                 "expectedSnapshotHash": request["expectedSnapshotHash"],
+                "evaluationStart": run.evaluation_start.isoformat(),
+                "evaluationEnd": run.evaluation_end.isoformat(),
                 "datasets": [
                     {
                         "datasetManifestId": str(DATASET_ID),
@@ -273,6 +276,8 @@ def test_basic_request_is_dispatched_through_the_same_pinned_two_stage_boundary(
                 "datasetManifestId": request["datasetManifestId"],
                 "expectedDatasetHash": request["expectedDatasetHash"],
                 "expectedSnapshotHash": request["expectedSnapshotHash"],
+                "evaluationStart": run.evaluation_start.isoformat(),
+                "evaluationEnd": run.evaluation_end.isoformat(),
                 "datasets": [
                     {
                         "datasetManifestId": request["datasetManifestId"],
