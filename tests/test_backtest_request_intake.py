@@ -99,6 +99,23 @@ def custom_request(
     }
 
 
+def custom_request_with_two_market_datasets() -> dict[str, Any]:
+    request = custom_request()
+    request["datasets"] = [
+        {
+            "datasetManifestId": request["datasetManifestId"],
+            "purposeCode": "MARKET_BARS",
+            "expectedDatasetHash": request["expectedDatasetHash"],
+        },
+        {
+            "datasetManifestId": "97000000-0000-4000-8000-000000000013",
+            "purposeCode": "MARKET_BARS",
+            "expectedDatasetHash": "sha256:" + "9" * 64,
+        },
+    ]
+    return request
+
+
 def competition_request() -> dict[str, Any]:
     key = _sha(f"COMPETITION_PERIOD\n{ROOM_ID}\n{PARTICIPATION_ID}\n{PERIOD_ID}\n{ROOM_PLAN}")
     request_hash = _sha(
@@ -302,6 +319,18 @@ def test_accepts_exact_backend_payload_and_routes_only_to_its_lane(
     assert sqs.deleted == [message["ReceiptHandle"]]
     assert sqs.dead_letters == []
     assert receipts.completed_message_ids == {uuid.UUID(factory()["metadata"]["messageId"])}
+
+
+def test_accepts_custom_request_with_every_server_selected_market_dataset() -> None:
+    handled: list[Mapping[str, Any]] = []
+    consumer, _, _ = intake(
+        RequestLane.CUSTOM, lambda request, _lane: handled.append(request)
+    )
+
+    outcome = consumer.handle(delivery(custom_request_with_two_market_datasets()))
+
+    assert outcome.disposition is RequestIntakeDisposition.ACCEPTED
+    assert len(handled[0]["datasets"]) == 2
 
 
 def test_wrong_lane_is_dead_lettered_without_invoking_handler() -> None:

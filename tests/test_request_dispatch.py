@@ -26,6 +26,7 @@ from test_backtest_request_intake import (
     basic_request,
     competition_request,
     custom_request,
+    custom_request_with_two_market_datasets,
 )
 
 
@@ -77,13 +78,13 @@ def projection(request: dict[str, Any], lane: RequestLane) -> QueuedRunProjectio
             for item in (
                 request["periods"][0]["datasets"]
                 if lane is RequestLane.COMPETITION
-                else (
+                else request.get("datasets", (
                     {
                         "datasetManifestId": request["datasetManifestId"],
                         "purposeCode": "MARKET_BARS",
                         "expectedDatasetHash": request["expectedDatasetHash"],
                     },
-                )
+                ))
             )
         ),
         feature_materializations=tuple(
@@ -314,6 +315,18 @@ def test_basic_request_preserves_every_server_selected_market_dataset() -> None:
     queue = Queue()
 
     BacktestRequestJobPublisher(Source(run), queue)(request, RequestLane.BASIC)
+
+    assert queue.jobs[0][1]["datasetManifestId"] == request["datasetManifestId"]
+    assert queue.jobs[0][1]["datasets"] == request["datasets"]
+
+
+def test_custom_request_preserves_every_server_selected_market_dataset() -> None:
+    request = custom_request_with_two_market_datasets()
+    queue = Queue()
+
+    BacktestRequestJobPublisher(Source(projection(request, RequestLane.CUSTOM)), queue)(
+        request, RequestLane.CUSTOM
+    )
 
     assert queue.jobs[0][1]["datasetManifestId"] == request["datasetManifestId"]
     assert queue.jobs[0][1]["datasets"] == request["datasets"]

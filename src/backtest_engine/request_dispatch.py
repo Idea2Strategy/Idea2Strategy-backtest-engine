@@ -113,15 +113,25 @@ def _request_period(
                 ),
             )
         if lane is RequestLane.CUSTOM:
+            raw_datasets = request.get("datasets") or (
+                {
+                    "datasetManifestId": request["datasetManifestId"],
+                    "purposeCode": "MARKET_BARS",
+                    "expectedDatasetHash": request["expectedDatasetHash"],
+                },
+            )
             return (
                 date.fromisoformat(str(request["periodStart"])),
                 date.fromisoformat(str(request["periodEnd"])),
-                (
-                    PinnedDataset(
-                        uuid.UUID(str(request["datasetManifestId"])),
-                        "MARKET_BARS",
-                        str(request["expectedDatasetHash"]),
-                    ),
+                tuple(
+                    sorted(
+                        PinnedDataset(
+                            uuid.UUID(str(item["datasetManifestId"])),
+                            str(item["purposeCode"]),
+                            str(item["expectedDatasetHash"]),
+                        )
+                        for item in raw_datasets
+                    )
                 ),
                 tuple(
                     sorted(
@@ -200,7 +210,7 @@ class BacktestRequestJobPublisher:
         stored_datasets = tuple(sorted(run.datasets))
         stored_features = tuple(sorted(run.feature_materializations))
         market_bars = tuple(item for item in stored_datasets if item.purpose_code == "MARKET_BARS")
-        if not market_bars or (lane is not RequestLane.BASIC and len(market_bars) != 1):
+        if not market_bars or (lane is RequestLane.COMPETITION and len(market_bars) != 1):
             raise RequestProcessingError("MARKET_BARS_DATASET_INVALID", retryable=False)
         representative_id = (
             market_bars[0].dataset_manifest_id

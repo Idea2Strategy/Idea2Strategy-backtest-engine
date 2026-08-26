@@ -64,6 +64,7 @@
             "compiledPlanChecksum": { "$ref": "#/$defs/sha256" },
             "datasetManifestId": { "$ref": "#/$defs/uuid" },
             "expectedDatasetHash": { "$ref": "#/$defs/sha256" },
+            "datasets": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/competitionDataset" } },
             "periodStart": { "type": "string", "format": "date" },
             "periodEnd": { "type": "string", "format": "date" },
             "instrumentCatalogVersion": { "type": "string", "minLength": 1 },
