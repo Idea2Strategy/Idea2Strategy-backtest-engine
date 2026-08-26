@@ -246,7 +246,7 @@ class PostgresDatasetManifestSource:
     def by_id(self, manifest_id: uuid.UUID) -> Mapping[str, Any] | None:
         manifest_sql = text(
             """
-            SELECT manifest.id, manifest.revision_number, manifest.status,
+            SELECT manifest.id, manifest.instrument_id, manifest.revision_number, manifest.status,
                    manifest.dataset_hash, manifest.schema_version,
                    manifest.period_start, manifest.period_end, manifest.available_at,
                    provider.code AS provider_code, feed.code AS feed_code,
@@ -338,6 +338,7 @@ class PostgresDatasetManifestSource:
             "contract_id": "com06.dataset-manifest",
             "schema_version": 1,
             "manifest_id": str(row["id"]),
+            "instrument_id": str(row.get("instrument_id")) if row.get("instrument_id") else None,
             "dataset_id": _dataset_id(
                 [item["object_key"] for item in objects],
                 manifest_id,
