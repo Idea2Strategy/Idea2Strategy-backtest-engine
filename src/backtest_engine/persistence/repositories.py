@@ -25,7 +25,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Connection, Row, Select, func, select, update
+from sqlalchemy import Connection, Row, Select, case, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .errors import (
@@ -343,7 +343,7 @@ class RunRepository(_Repository):
         )
         return _hydrate(RunRow, updated)
 
-    def request_deletion(self, run_id: UUID, *, requested_at: datetime) -> RunRow:
+    def request_deletion(self, run_id: UUID) -> RunRow:
         """Cancel active work and retain the row as immutable owner evidence."""
         current = self._connection.execute(
             select(runs).where(runs.c.id == run_id).with_for_update()
@@ -353,6 +353,8 @@ class RunRepository(_Repository):
         hydrated = _hydrate(RunRow, current)
         if hydrated.deleted_at is not None:
             return hydrated
+        requested_at = self._connection.scalar(select(func.clock_timestamp()))
+        assert isinstance(requested_at, datetime)
         values: dict[str, Any] = {
             "deletion_requested_at": hydrated.deletion_requested_at or requested_at,
         }
@@ -383,14 +385,24 @@ class RunRepository(_Repository):
         return _hydrate(RunRow, updated)
 
     def _transition(self, run_id: UUID, target: RunStatus, **values: Any) -> RunRow:
-        current_before = self.get(run_id)
-        if current_before.deletion_requested_at is not None and target in {
+        if target in {
             RunStatus.COMPLETED,
             RunStatus.FAILED,
             RunStatus.CANCELLED,
             RunStatus.UNAVAILABLE,
         }:
-            values.setdefault("deleted_at", values.get("completed_at") or values.get("cancelled_at"))
+            terminal_at = values.get("completed_at") or values.get("cancelled_at")
+            if terminal_at is not None:
+                values.setdefault(
+                    "deleted_at",
+                    case(
+                        (
+                            runs.c.deletion_requested_at.is_not(None),
+                            func.greatest(terminal_at, runs.c.deletion_requested_at),
+                        ),
+                        else_=runs.c.deleted_at,
+                    ),
+                )
         sources = sorted(source.value for source, allowed in RUN_STATUS_TRANSITIONS.items() if target in allowed)
         statement = (
             update(runs)

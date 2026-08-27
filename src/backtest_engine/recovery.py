@@ -101,7 +101,10 @@ class StaleRunRecovery:
             changed = connection.execute(text("""
                 UPDATE backtest.runs
                    SET status='CANCELLED', completed_at=:now, cancelled_at=:now,
-                       cancellation_reason_code=COALESCE(cancellation_reason_code, 'USER_CANCELLED')
+                       cancellation_reason_code=COALESCE(cancellation_reason_code, 'USER_CANCELLED'),
+                       deleted_at=CASE WHEN deletion_requested_at IS NOT NULL
+                                       THEN GREATEST(:now, deletion_requested_at)
+                                       ELSE deleted_at END
                  WHERE id=:id AND status IN ('QUEUED', 'RUNNING')
             """), {"id": row["id"], "now": now})
             counts["cancelled"] += changed.rowcount

@@ -548,7 +548,7 @@ class PersistenceRunGateway:
     def request_deletion(self, run_id: UUID, *, requested_at: datetime) -> RunRow:
         try:
             with self._write() as uow:
-                return uow.runs.request_deletion(run_id, requested_at=requested_at)
+                return uow.runs.request_deletion(run_id)
         except RowNotFound as exc:
             raise BacktestRunNotFound(str(exc)) from exc
 
