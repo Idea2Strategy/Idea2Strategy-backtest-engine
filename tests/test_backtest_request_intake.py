@@ -113,6 +113,30 @@ def custom_request_with_two_market_datasets() -> dict[str, Any]:
             "expectedDatasetHash": "sha256:" + "9" * 64,
         },
     ]
+    dataset_material = "".join(
+        f"{item['datasetManifestId']}:{item['purposeCode']}:{item['expectedDatasetHash']};"
+        for item in request["datasets"]
+    )
+    request["requestHash"] = _sha(
+        "\n".join(
+            (
+                request["requestingAccountId"],
+                request["botId"],
+                request["datasetManifestId"],
+                request["expectedDatasetHash"],
+                request["periodStart"],
+                request["periodEnd"],
+                request["expectedSnapshotHash"],
+                request["compiledPlanChecksum"],
+                request["instrumentCatalogVersion"],
+                dataset_material,
+                "",
+                request["initialCashAmount"],
+                request["assumptionsVersion"],
+                request["executionPolicyVersion"],
+            )
+        )
+    )
     return request
 
 
