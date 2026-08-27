@@ -488,6 +488,7 @@ def bar_events_from_batches(
     resolution: str,
     publication_lag: timedelta = timedelta(0),
     schedule: OfficialSessionSchedule | None = None,
+    allow_empty: bool = False,
 ) -> tuple[MarketDataEvent, ...]:
     """Turn verified Parquet rows into the clock's event stream.
 
@@ -560,7 +561,7 @@ def bar_events_from_batches(
                     },
                 )
             )
-    if not events:
+    if not events and not allow_empty:
         raise OrchestratorError("the pinned dataset contains no bars")
     return tuple(events)
 
@@ -773,6 +774,12 @@ class BacktestOrchestrator:
                     resolution=resolution,
                     publication_lag=self._publication_lag,
                     schedule=schedule,
+                    # Universe manifests are segmented by time. An instrument
+                    # may legitimately have no rows in an early segment (for
+                    # example before listing) while later pinned segments do.
+                    # Availability is assessed over the combined verified
+                    # stream below, not one storage segment at a time.
+                    allow_empty=True,
                 )
                 combined_events.extend(
                     replace(event, event_id=f"{event.event_id}:{resolution}")
@@ -915,11 +922,20 @@ class BacktestOrchestrator:
             )
             try:
                 evaluation = replay.evaluate_at(instant, visible_events, runtime_values)
-            except Exception:
+            except Exception as exc:
+                detail = f"{type(exc).__name__}: {exc}"
+                _LOG.error(
+                    "backtest run %s plan replay failed at %s: %s",
+                    job.run_id,
+                    instant.isoformat(),
+                    detail,
+                    exc_info=exc,
+                )
                 return self._abort(
                     job, coordinator, lease, "PLAN_REPLAY_FAILED",
                     retryable=False, status=ReplayStatus.FAILED,
                     availability=assessment.status, steps=tuple(steps),
+                    detail=detail,
                 )
             compact_evaluation = getattr(replay, "compact_evaluation", None)
             evaluations.append(

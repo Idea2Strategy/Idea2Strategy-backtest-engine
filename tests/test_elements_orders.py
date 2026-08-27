@@ -135,6 +135,26 @@ def test_the_side_comes_from_the_step_and_a_sell_carries_no_allocation() -> None
     assert candidate.allocation is None
 
 
+def test_a_sell_can_execute_each_period_as_published_by_the_shared_catalog() -> None:
+    candidate = _emit(
+        step=_step(
+            allocation="EQUAL",
+            orderType="MARKET",
+            side="SELL",
+            orderPercent="100",
+            maxPositionPercent="25",
+            executionMode="주기마다",
+            waitMode="조건 재충족",
+            waitInterval="1",
+            maxExecutions="100",
+        ),
+        allocation=None,
+    )
+
+    assert candidate.side == "SELL"
+    assert candidate.execution_mode == "주기마다"
+
+
 def test_a_non_terminal_step_can_never_emit() -> None:
     load = PlanStep(
         sequence=1,

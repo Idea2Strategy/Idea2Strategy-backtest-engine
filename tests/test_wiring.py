@@ -17,6 +17,7 @@ from __future__ import annotations
 import copy
 import logging
 import uuid
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from fractions import Fraction
@@ -67,7 +68,9 @@ from backtest_engine.wiring import (
     OrchestratorJobHandler,
     WiringError,
     _CancellationAwareMonitor,
+    _dataset_cover_contains_evaluation,
     _metric_percent,
+    _resolve_position_only_flow_clocks,
     dataset_coverage,
     evaluation_window,
     segmented_dataset_coverage,
@@ -680,6 +683,82 @@ def test_adjacent_manifests_of_the_same_resolution_form_one_cover() -> None:
     )
 
 
+def test_position_only_flow_inherits_its_own_instruments_clock_in_a_mixed_resolution_plan() -> None:
+    plan = _plan()
+    source = plan.flows[0]
+    other_instrument = "00000000-0000-4000-8000-000000000099"
+    thirty_minute = replace(
+        source,
+        flow_id="aapl-30m",
+        instrument_ids=(INSTRUMENT_ID,),
+        reference_series=("ADJUSTED_BAR", "30m"),
+    )
+    four_hour = replace(
+        source,
+        flow_id="meta-4h",
+        instrument_ids=(other_instrument,),
+        reference_series=("ADJUSTED_BAR", "4h"),
+    )
+    position_only = replace(
+        source,
+        flow_id="meta-position-exit",
+        instrument_ids=(other_instrument,),
+        condition_steps=(),
+        reference_series=("ADJUSTED_BAR", "$DATASET"),
+    )
+    mixed = replace(
+        plan,
+        reference_series=thirty_minute.reference_series,
+        flows=(thirty_minute, four_hour, position_only),
+    )
+
+    resolved = _resolve_position_only_flow_clocks(mixed)
+
+    assert [flow.reference_series for flow in resolved.flows] == [
+        ("ADJUSTED_BAR", "30m"),
+        ("ADJUSTED_BAR", "4h"),
+        ("ADJUSTED_BAR", "4h"),
+    ]
+
+
+def test_position_only_first_flow_uses_its_instruments_clock_not_representative_dataset() -> None:
+    plan = _plan()
+    source = plan.flows[0]
+    meta = "00000000-0000-4000-8000-000000000099"
+    position_only = replace(
+        source,
+        flow_id="meta-position-exit",
+        instrument_ids=(meta,),
+        condition_steps=(),
+        reference_series=("ADJUSTED_BAR", "$DATASET"),
+    )
+    meta_four_hour = replace(
+        source,
+        flow_id="meta-4h-entry",
+        instrument_ids=(meta,),
+        reference_series=("ADJUSTED_BAR", "4h"),
+    )
+    aapl_thirty_minute = replace(
+        source,
+        flow_id="aapl-30m-entry",
+        instrument_ids=(INSTRUMENT_ID,),
+        reference_series=("ADJUSTED_BAR", "30m"),
+    )
+    mixed = replace(
+        plan,
+        reference_series=("ADJUSTED_BAR", "$DATASET"),
+        flows=(position_only, meta_four_hour, aapl_thirty_minute),
+    )
+
+    resolved = _resolve_position_only_flow_clocks(mixed, fallback_resolution="30m")
+
+    assert [flow.reference_series for flow in resolved.flows] == [
+        ("ADJUSTED_BAR", "4h"),
+        ("ADJUSTED_BAR", "4h"),
+        ("ADJUSTED_BAR", "30m"),
+    ]
+
+
 def test_segmented_manifest_cover_rejects_a_gap() -> None:
     first = dataset_manifest("1" * 64, row_count=1, coverage_end=FIRST_BAR_START + BAR)
     second = dataset_manifest("2" * 64, row_count=1, coverage_end=FIRST_BAR_START + BAR)
@@ -692,6 +771,27 @@ def test_segmented_manifest_cover_rejects_a_gap() -> None:
 
     with pytest.raises(JobNotSatisfiable, match="gap"):
         segmented_dataset_coverage((first, second))
+
+
+def test_dataset_cover_may_end_before_local_midnight_only_when_no_session_is_missing() -> None:
+    schedule = XNYS_CALENDAR.session_schedule(date(2026, 7, 29), date(2026, 7, 30))
+    coverage_start = datetime(2016, 1, 1, tzinfo=UTC)
+    coverage_end = datetime(2026, 7, 30, tzinfo=UTC)
+
+    assert _dataset_cover_contains_evaluation(
+        schedule,
+        coverage_start,
+        coverage_end,
+        datetime(2016, 1, 1, 5, tzinfo=UTC),
+        datetime(2026, 7, 30, 4, tzinfo=UTC),
+    )
+    assert not _dataset_cover_contains_evaluation(
+        schedule,
+        coverage_start,
+        coverage_end,
+        datetime(2016, 1, 1, 5, tzinfo=UTC),
+        datetime(2026, 7, 31, 4, tzinfo=UTC),
+    )
 
 
 def test_the_pinned_completion_instant_follows_every_replay_instant() -> None:
