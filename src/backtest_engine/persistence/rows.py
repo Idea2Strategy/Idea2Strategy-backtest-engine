@@ -193,6 +193,8 @@ class RunRow:
     cancellation_requested_at: datetime | None = None
     cancellation_reason_code: str | None = None
     cancelled_at: datetime | None = None
+    deletion_requested_at: datetime | None = None
+    deleted_at: datetime | None = None
 
     def __post_init__(self) -> None:
         validate_money(self.initial_cash_amount, "initial_cash_amount")

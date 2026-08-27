@@ -311,6 +311,53 @@ def test_an_unknown_run_is_not_found(service: BacktestLifecycleService) -> None:
         service.get(uuid4(), owner_account_id=OWNER_ID)
 
 
+def test_deleting_a_queued_run_cancels_hides_and_preserves_its_evidence(
+    service: BacktestLifecycleService, official_request: dict[str, Any]
+) -> None:
+    service.accept(official_request)
+
+    deleted = service.request_deletion(
+        EXPECTED_RUN_ID,
+        owner_account_id=OWNER_ID,
+        requested_at=datetime(2026, 7, 31, 12, 4, tzinfo=timezone.utc),
+    )
+
+    assert deleted.status is RunStatus.CANCELLED
+    assert deleted.run.deletion_requested_at is not None
+    assert deleted.run.deleted_at is not None
+    assert service.list_runs(OWNER_ID) == ()
+    with pytest.raises(BacktestRunNotFound):
+        service.get(EXPECTED_RUN_ID, owner_account_id=OWNER_ID)
+    assert service.gateway.get(EXPECTED_RUN_ID).id == EXPECTED_RUN_ID
+
+
+def test_deleting_a_running_run_waits_for_cooperative_cancellation_before_hiding_evidence(
+    service: BacktestLifecycleService, official_request: dict[str, Any]
+) -> None:
+    service.accept(official_request)
+    service.ingest_result(_event(service, "RUNNING", startedAt="2026-07-31T12:05:00Z", attempt=1))
+
+    pending = service.request_deletion(
+        EXPECTED_RUN_ID,
+        owner_account_id=OWNER_ID,
+        requested_at=datetime(2026, 7, 31, 12, 6, tzinfo=timezone.utc),
+    )
+    assert pending.status is RunStatus.RUNNING
+    assert pending.run.deletion_requested_at is not None
+    assert pending.run.deleted_at is None
+
+    terminal = service.ingest_result(_event(
+        service,
+        "CANCELLED",
+        cancelledAt="2026-07-31T12:07:00Z",
+        reasonCode="USER_DELETED",
+        attempt=1,
+    )).run
+    assert terminal.status is RunStatus.CANCELLED
+    assert terminal.run.deleted_at == datetime(2026, 7, 31, 12, 7, tzinfo=timezone.utc)
+    assert service.list_runs(OWNER_ID) == ()
+
+
 # ===========================================================================
 # Result ingestion
 # ===========================================================================

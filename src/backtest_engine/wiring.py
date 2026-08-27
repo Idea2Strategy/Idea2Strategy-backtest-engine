@@ -1982,13 +1982,17 @@ class OrchestratorJobHandler:
                 min(window[1] for window in scoped_windows),
             )
         if plan.reference_series[1] == "$DATASET":
-            primary = [item for item in resolved_manifests if item[0].manifest_id == envelope.dataset_manifest_id]
-            if len(primary) != 1:
+            primary_pins = [
+                item
+                for item in resolved_manifests
+                if item[0].manifest_id == envelope.dataset_manifest_id
+            ]
+            if len(primary_pins) != 1:
                 raise JobNotSatisfiable(
                     "the representative dataset is not pinned exactly once",
                     reason_code="REQUIRED_INPUT_UNAVAILABLE",
                 )
-            manifest = primary[0][1]
+            manifest = primary_pins[0][1]
             dataset_resolution = str(manifest.get("resolution", ""))
             if dataset_resolution not in {"30m", "1h", "4h", "1d"}:
                 raise JobNotSatisfiable(
@@ -2013,12 +2017,12 @@ class OrchestratorJobHandler:
                     f"the plan reference resolution {reference_resolution} has no pinned dataset cover",
                     reason_code="REQUIRED_INPUT_UNAVAILABLE",
                 )
-            primary = [
+            primary_manifests = [
                 resolved for pin, resolved in resolved_manifests
                 if pin.manifest_id == envelope.dataset_manifest_id
                 and str(resolved.get("resolution", "")) == reference_resolution
             ]
-            manifest = primary[0] if len(primary) == 1 else sorted(
+            manifest = primary_manifests[0] if len(primary_manifests) == 1 else sorted(
                 reference_manifests, key=lambda item: dataset_coverage(item)
             )[0]
         if envelope.evaluation_start is not None or envelope.evaluation_end is not None:

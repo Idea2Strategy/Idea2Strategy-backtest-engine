@@ -407,6 +407,8 @@ class RunGateway(Protocol):
         self, run_id: UUID, *, reason_code: str, requested_at: datetime
     ) -> RunRow: ...
 
+    def request_deletion(self, run_id: UUID, *, requested_at: datetime) -> RunRow: ...
+
 
 class PersistenceRunGateway:
     """Durable `RunGateway` over the canonical schema, in SQLAlchemy Core."""
@@ -543,6 +545,13 @@ class PersistenceRunGateway:
         except RowNotFound as exc:
             raise BacktestRunNotFound(str(exc)) from exc
 
+    def request_deletion(self, run_id: UUID, *, requested_at: datetime) -> RunRow:
+        try:
+            with self._write() as uow:
+                return uow.runs.request_deletion(run_id, requested_at=requested_at)
+        except RowNotFound as exc:
+            raise BacktestRunNotFound(str(exc)) from exc
+
 
 class InMemoryRunGateway:
     """Faithful in-process `RunGateway`, for tests about HTTP rather than SQL.
@@ -629,7 +638,11 @@ class InMemoryRunGateway:
 
     def list_by_owner(self, owner_account_id: UUID, *, limit: int, offset: int) -> tuple[RunRow, ...]:
         with self._lock:
-            owned = [row for row in self._runs.values() if row.owner_account_id == owner_account_id]
+            owned = [
+                row
+                for row in self._runs.values()
+                if row.owner_account_id == owner_account_id and row.deleted_at is None
+            ]
         owned.sort(key=lambda row: (row.queued_at, row.id), reverse=True)
         return tuple(owned[offset : offset + limit])
 
@@ -666,7 +679,47 @@ class InMemoryRunGateway:
                 raise InvalidStatusTransition(
                     f"backtest run {run_id} is {current.status.value}; it cannot move to {target.value}"
                 )
+            if current.deletion_requested_at is not None and target in {
+                RunStatus.COMPLETED,
+                RunStatus.FAILED,
+                RunStatus.CANCELLED,
+                RunStatus.UNAVAILABLE,
+            }:
+                values.setdefault("deleted_at", values.get("completed_at") or values.get("cancelled_at"))
             updated = replace(current, status=target, **values)
+            self._runs[run_id] = updated
+            return updated
+
+    def request_deletion(self, run_id: UUID, *, requested_at: datetime) -> RunRow:
+        with self._lock:
+            current = self.get(run_id)
+            if current.deleted_at is not None:
+                return current
+            values: dict[str, Any] = {
+                "deletion_requested_at": current.deletion_requested_at or requested_at,
+            }
+            if current.status in {
+                RunStatus.COMPLETED,
+                RunStatus.FAILED,
+                RunStatus.CANCELLED,
+                RunStatus.UNAVAILABLE,
+            }:
+                values["deleted_at"] = requested_at
+            elif current.status is RunStatus.QUEUED:
+                values.update(
+                    status=RunStatus.CANCELLED,
+                    cancellation_requested_at=current.cancellation_requested_at or requested_at,
+                    cancellation_reason_code=current.cancellation_reason_code or "USER_DELETED",
+                    cancelled_at=requested_at,
+                    completed_at=requested_at,
+                    deleted_at=requested_at,
+                )
+            else:
+                values.update(
+                    cancellation_requested_at=current.cancellation_requested_at or requested_at,
+                    cancellation_reason_code=current.cancellation_reason_code or "USER_DELETED",
+                )
+            updated = replace(current, **values)
             self._runs[run_id] = updated
             return updated
 
@@ -926,6 +979,8 @@ class BacktestLifecycleService:
     def get(self, run_id: UUID, *, owner_account_id: UUID) -> BacktestRun:
         run = self._load(self.gateway.get(run_id))
         self._require_owner(run, owner_account_id)
+        if run.run.deleted_at is not None:
+            raise BacktestRunNotFound(f"backtest run not found: {run_id}")
         return run
 
     def list_runs(self, owner_account_id: UUID, *, limit: int = 50, offset: int = 0) -> tuple[BacktestRun, ...]:
@@ -983,6 +1038,27 @@ class BacktestLifecycleService:
         row = self.gateway.request_cancellation(
             run_id,
             reason_code=reason,
+            requested_at=requested_at or datetime.now(timezone.utc),
+        )
+        return self._load(row)
+
+    def request_deletion(
+        self,
+        run_id: UUID,
+        *,
+        owner_account_id: UUID,
+        requested_at: datetime | None = None,
+    ) -> BacktestRun:
+        """Hide a run from the owner while preserving durable execution evidence.
+
+        Queued work is cancelled and deleted atomically. Running work receives a
+        cooperative cancellation request and becomes hidden only when it reaches a
+        terminal status. Repeating the request is idempotent.
+        """
+        current = self._load(self.gateway.get(run_id))
+        self._require_owner(current, owner_account_id)
+        row = self.gateway.request_deletion(
+            run_id,
             requested_at=requested_at or datetime.now(timezone.utc),
         )
         return self._load(row)
