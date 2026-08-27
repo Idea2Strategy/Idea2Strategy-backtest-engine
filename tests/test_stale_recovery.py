@@ -157,6 +157,36 @@ def test_expired_running_cancellation_finishes_cancelled_not_failed(
     }
 
 
+def test_expired_running_deletion_finishes_cancelled_and_hidden(
+    persistence: BacktestPersistence, admin_engine: Engine
+) -> None:
+    run_id = _run(persistence)
+    store = PersistenceExecutionKeyStore(persistence)
+    store.claim(
+        worker_execution_key_for(str(run_id), "delete"), run_id=str(run_id), owner="worker",
+        now=datetime.now(UTC), lease_duration=timedelta(minutes=1),
+    )
+    with persistence.unit_of_work() as uow:
+        pending = uow.runs.request_deletion(run_id)
+    assert pending.deletion_requested_at is not None
+    assert pending.deleted_at is None
+    _expire(admin_engine, run_id)
+
+    report = StaleRunRecovery(
+        persistence, max_attempts=5, queued_timeout=timedelta(minutes=15)
+    ).recover_once()
+
+    assert report.cancelled == 1
+    with admin_engine.connect() as connection:
+        row = connection.execute(text("""
+            SELECT status, deletion_requested_at, deleted_at
+              FROM backtest.runs WHERE id=:id
+        """), {"id": run_id}).mappings().one()
+    assert row["status"] == "CANCELLED"
+    assert row["deleted_at"] is not None
+    assert row["deleted_at"] >= row["deletion_requested_at"]
+
+
 def test_never_dispatched_queued_run_fails_after_timeout_and_recovery_is_idempotent(
     persistence: BacktestPersistence, admin_engine: Engine
 ) -> None:

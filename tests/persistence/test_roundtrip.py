@@ -245,19 +245,17 @@ def test_owner_soft_delete_cancels_queued_run_and_preserves_internal_evidence(
     persistence: BacktestPersistence,
 ) -> None:
     run = make_run(idempotency_key="ROUNDTRIP:soft-delete")
-    requested_at = datetime(2026, 8, 27, 9, 0, tzinfo=UTC)
-
     with persistence.unit_of_work() as uow:
         uow.runs.accept(run)
-        deleted = uow.runs.request_deletion(run.id, requested_at=requested_at)
+        deleted = uow.runs.request_deletion(run.id)
 
     assert deleted.status is RunStatus.CANCELLED
     assert deleted.cancellation_reason_code == "USER_DELETED"
-    assert deleted.deletion_requested_at == requested_at
-    assert deleted.deleted_at == requested_at
+    assert deleted.deletion_requested_at is not None
+    assert deleted.deleted_at == deleted.deletion_requested_at
 
     with persistence.unit_of_work() as uow:
-        assert uow.runs.get(run.id).deleted_at == requested_at
+        assert uow.runs.get(run.id).deleted_at == deleted.deleted_at
         with pytest.raises(RowNotFound):
             uow.runs.get_owned(ACCOUNT_ID, run.id)
         assert uow.runs.list_by_owner(ACCOUNT_ID) == ()
@@ -268,24 +266,23 @@ def test_owner_soft_delete_waits_for_running_worker_then_hides_terminal_evidence
 ) -> None:
     run = make_run(idempotency_key="ROUNDTRIP:running-soft-delete")
     started_at = datetime(2026, 8, 27, 9, 0, tzinfo=UTC)
-    requested_at = datetime(2026, 8, 27, 9, 1, tzinfo=UTC)
     cancelled_at = datetime(2026, 8, 27, 9, 2, tzinfo=UTC)
 
     with persistence.unit_of_work() as uow:
         uow.runs.accept(run)
         uow.runs.mark_running(run.id, started_at)
-        pending = uow.runs.request_deletion(run.id, requested_at=requested_at)
+        pending = uow.runs.request_deletion(run.id)
 
     assert pending.status is RunStatus.RUNNING
-    assert pending.cancellation_requested_at == requested_at
-    assert pending.deletion_requested_at == requested_at
+    assert pending.cancellation_requested_at is not None
+    assert pending.deletion_requested_at == pending.cancellation_requested_at
     assert pending.deleted_at is None
 
     with persistence.unit_of_work() as uow:
         cancelled = uow.runs.mark_cancelled(run.id, cancelled_at, "USER_DELETED")
 
     assert cancelled.status is RunStatus.CANCELLED
-    assert cancelled.deleted_at == cancelled_at
+    assert cancelled.deleted_at == max(cancelled_at, pending.deletion_requested_at)
     with persistence.unit_of_work() as uow:
         with pytest.raises(RowNotFound):
             uow.runs.get_owned(ACCOUNT_ID, run.id)
