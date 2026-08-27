@@ -207,7 +207,7 @@ class OrderCandidate:
         allowed_modes = (
             {"1회만", "주기마다", "대기 후 재진입"}
             if self.side == "BUY"
-            else {"1회만", "대기 후 재실행"}
+            else {"1회만", "주기마다", "대기 후 재실행"}
         )
         if self.execution_mode not in allowed_modes:
             raise ElementEvaluationError(

@@ -691,6 +691,75 @@ def test_orchestrator_reads_every_pinned_resolution_into_one_replay_clock() -> N
     assert {series.resolution for series in visible[MSFT].series} == {"30m"}
 
 
+def test_orchestrator_allows_an_empty_segment_when_a_later_segment_has_required_bars() -> None:
+    rows = pa.Table.from_pylist(
+        [
+            _bar_row(_utc(14, 30), date(2024, 1, 2)),
+            _bar_row(_utc(14, 45), date(2024, 1, 2)),
+        ],
+        schema=_SCHEMA,
+    )
+    manifests = (
+        {"resolution": "15m", "segment": "before-listing"},
+        {"resolution": "15m", "segment": "available"},
+    )
+
+    class SegmentedReader:
+        def iter_batches(
+            self,
+            manifest: Mapping[str, Any],
+            _policy: Any,
+            *,
+            instrument_ids: frozenset[str] | None = None,
+        ) -> Any:
+            assert instrument_ids == frozenset({AAPL})
+            return () if manifest["segment"] == "before-listing" else rows.to_batches()
+
+    runtime = StubRuntime(buy_at=None)
+    harness = Harness(Path(), runtime, RecordingEngine(), RecordingPublisher())
+    orchestrator = BacktestOrchestrator(
+        reader=SegmentedReader(),
+        calendar=XNYS_CALENDAR,
+        replay_factory=harness.factory,
+        engine=harness.engine,
+        publisher=harness.publisher,
+        wall_clock=WallClock(),
+    )
+    requirement = DataRequirement(
+        requirement_id="aapl-15m",
+        instrument_id=AAPL,
+        data_kind=DATA_KIND,
+        resolution="15m",
+        warmup_from=_utc(14, 30),
+        evaluation_from=_utc(14, 30),
+        evaluation_through=_utc(15, 0),
+    )
+    coordinator = AttemptCoordinator(RUN_ID, _policy(), WALL_T0)
+
+    outcome = orchestrator.run(
+        BacktestJob(
+            run_id=RUN_ID,
+            idempotency_key="OFFICIAL_BACKTEST:segmented",
+            worker_execution_key=f"BACKTEST_RUN:{RUN_ID}:segmented",
+            manifest=manifests[0],
+            execution_policy=D17_EXECUTION_POLICY_FIXTURE,
+            requirements=(requirement,),
+            data_kind=DATA_KIND,
+            resolution="15m",
+            initial_cash=Decimal("10000"),
+            manifests=manifests,
+            evaluation_from=_utc(14, 30),
+            evaluation_through=_utc(15, 0),
+        ),
+        coordinator=coordinator,
+        lease=coordinator.acquire("segmented-worker", WALL_T0),
+        monitor=FixedMonitor(),
+    )
+
+    assert outcome.status is ReplayStatus.COMPLETED
+    assert len(outcome.steps) == 1
+
+
 # --------------------------------------------------------------------------
 # The replay loop is genuinely driven by the event clock.
 # --------------------------------------------------------------------------
@@ -870,6 +939,7 @@ def test_plan_replay_failure_fails_the_run_permanently_and_publishes_nothing(
 
     assert outcome.status is ReplayStatus.FAILED
     assert outcome.reason_code == "PLAN_REPLAY_FAILED"
+    assert outcome.failure_detail == "ZeroDivisionError: condition evaluator blew up"
     assert harness.publisher.requests == []
     assert coordinator.state is RunState.FAILED
     assert coordinator.attempts[0].state is AttemptState.PERMANENT_FAILED

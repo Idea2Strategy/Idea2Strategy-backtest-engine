@@ -64,6 +64,7 @@ UNSUPPORTED_PLAN = FIXTURES / "basic-compiled-plan.unsupported-version.json"
 
 FIRST = "00000000-0000-4000-8000-000000000301"
 SECOND = "00000000-0000-4000-8000-000000000302"
+THIRD = "00000000-0000-4000-8000-000000000303"
 
 SESSION_DATE = date(2025, 11, 28)
 OPEN = datetime.fromisoformat("2025-11-28T14:30:00+00:00")
@@ -1441,10 +1442,13 @@ def test_loads_raw_market_containers_with_independent_resolutions() -> None:
     document["elementCatalogVersion"] = "basic-elements:2026-08-25"
     document["requiredFeatures"] = []
     flows = document["executionSnapshot"]["partitions"][0]["flows"]
+    daily_flow = copy.deepcopy(flows[-1])
+    daily_flow["key"] = "daily-flow"
+    flows.append(daily_flow)
     for flow, instrument_id, resolution in zip(
         flows,
-        (FIRST, SECOND),
-        ("1h", "4h"),
+        (FIRST, SECOND, THIRD),
+        ("30m", "4h", "1d"),
         strict=True,
     ):
         flow["officialInstrumentIds"] = [instrument_id]
@@ -1476,8 +1480,20 @@ def test_loads_raw_market_containers_with_independent_resolutions() -> None:
     plan = _runtime().load(document)
 
     assert [flow.reference_series for flow in plan.flows] == [
-        ("ADJUSTED_BAR", "1h"),
+        ("ADJUSTED_BAR", "30m"),
         ("ADJUSTED_BAR", "4h"),
+        ("ADJUSTED_BAR", "1d"),
+    ]
+
+    requirements = derive_data_requirements(
+        plan,
+        evaluation_from=_utc("2025-11-28T14:45:00Z"),
+        evaluation_through=_utc("2025-11-28T20:00:00Z"),
+    )
+    assert [(item.instrument_id, item.resolution) for item in requirements] == [
+        (FIRST, "30m"),
+        (SECOND, "4h"),
+        (THIRD, "1d"),
     ]
 
 

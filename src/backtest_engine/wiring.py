@@ -98,7 +98,7 @@ from .detail_object_manifest import (
     ReplayLedgerDetail,
 )
 from .elements import PinnedFeatureSeries
-from .event_clock import MarketDataEvent, MarketEventClock
+from .event_clock import MarketDataEvent, MarketEventClock, OfficialSessionSchedule
 from .execution_model import (
     BacktestExecutionModel,
     ExecutionBar,
@@ -1613,6 +1613,78 @@ def segmented_dataset_coverage(
     return start, end
 
 
+def _dataset_cover_contains_evaluation(
+    schedule: OfficialSessionSchedule,
+    coverage_start: datetime,
+    coverage_end: datetime,
+    evaluation_from: datetime,
+    evaluation_through: datetime,
+) -> bool:
+    """Accept wall-clock boundary gaps only when no regular session is omitted.
+
+    Dataset object boundaries describe the first and last delivered bars, while
+    an explicit evaluation request uses whole local trading dates.  Those two
+    clocks legitimately differ overnight, on weekends, and on holidays.  The
+    cover is sufficient when every official session that intersects the
+    evaluation interval is fully contained by it; an actually missing trading
+    session still fails closed.
+    """
+    if coverage_start >= coverage_end or evaluation_from >= evaluation_through:
+        return False
+    for session in schedule.sessions:
+        if session.closes_at <= evaluation_from or session.opens_at >= evaluation_through:
+            continue
+        required_start = max(session.opens_at, evaluation_from)
+        required_end = min(session.closes_at, evaluation_through)
+        if required_start < coverage_start or required_end > coverage_end:
+            return False
+    return True
+
+
+def _resolve_position_only_flow_clocks(
+    plan: BasicCompiledPlan, *, fallback_resolution: str | None = None
+) -> BasicCompiledPlan:
+    """Bind each position-only flow to the unique market clock for its instruments."""
+    has_concrete_clock = any(
+        flow.reference_series[1] != "$DATASET" for flow in plan.flows
+    )
+    if not has_concrete_clock:
+        if fallback_resolution is None:
+            raise JobNotSatisfiable(
+                "a position-only plan has no market clock",
+                reason_code="REQUIRED_INPUT_UNAVAILABLE",
+            )
+        return replace(
+            plan,
+            flows=tuple(
+                replace(
+                    flow,
+                    reference_series=(flow.reference_series[0], fallback_resolution),
+                )
+                for flow in plan.flows
+            ),
+        )
+
+    resolved_flows = []
+    for flow in plan.flows:
+        if flow.reference_series[1] != "$DATASET":
+            resolved_flows.append(flow)
+            continue
+        inherited = {
+            candidate.reference_series
+            for candidate in plan.flows
+            if candidate.reference_series[1] != "$DATASET"
+            and set(candidate.instrument_ids).intersection(flow.instrument_ids)
+        }
+        if len(inherited) != 1:
+            raise JobNotSatisfiable(
+                f"position-only flow {flow.flow_id} has no unambiguous market clock",
+                reason_code="REQUIRED_INPUT_UNAVAILABLE",
+            )
+        resolved_flows.append(replace(flow, reference_series=next(iter(inherited))))
+    return replace(plan, flows=tuple(resolved_flows))
+
+
 def evaluation_window(manifest: Mapping[str, Any], plan: BasicCompiledPlan) -> tuple[datetime, datetime]:
     """Where warm-up ends and evaluation begins, for this plan on this dataset.
 
@@ -1981,6 +2053,7 @@ class OrchestratorJobHandler:
                 max(window[0] for window in scoped_windows),
                 min(window[1] for window in scoped_windows),
             )
+        position_only_fallback: str | None = None
         if plan.reference_series[1] == "$DATASET":
             primary_pins = [
                 item
@@ -2002,13 +2075,8 @@ class OrchestratorJobHandler:
             plan = replace(
                 plan,
                 reference_series=(plan.reference_series[0], dataset_resolution),
-                flows=tuple(
-                    replace(flow, reference_series=(flow.reference_series[0], dataset_resolution))
-                    if flow.reference_series[1] == "$DATASET"
-                    else flow
-                    for flow in plan.flows
-                ),
             )
+            position_only_fallback = dataset_resolution
         else:
             reference_resolution = plan.reference_series[1]
             reference_manifests = manifests_by_resolution.get(reference_resolution, [])
@@ -2025,6 +2093,10 @@ class OrchestratorJobHandler:
             manifest = primary_manifests[0] if len(primary_manifests) == 1 else sorted(
                 reference_manifests, key=lambda item: dataset_coverage(item)
             )[0]
+        plan = _resolve_position_only_flow_clocks(
+            plan,
+            fallback_resolution=position_only_fallback,
+        )
         if envelope.evaluation_start is not None or envelope.evaluation_end is not None:
             if envelope.evaluation_start is None or envelope.evaluation_end is None:
                 raise JobNotSatisfiable(
@@ -2044,32 +2116,34 @@ class OrchestratorJobHandler:
                     reason_code="REQUIRED_INPUT_UNAVAILABLE",
                 )
         else:
-            resolved_flows = []
-            for flow in plan.flows:
-                if flow.reference_series[1] != "$DATASET":
-                    resolved_flows.append(flow)
-                    continue
-                inherited = {
-                    candidate.reference_series
-                    for candidate in plan.flows
-                    if candidate.reference_series[1] != "$DATASET"
-                    and set(candidate.instrument_ids).intersection(flow.instrument_ids)
-                }
-                if len(inherited) != 1:
-                    raise JobNotSatisfiable(
-                        f"position-only flow {flow.flow_id} has no unambiguous market clock",
-                        reason_code="REQUIRED_INPUT_UNAVAILABLE",
-                    )
-                resolved_flows.append(replace(flow, reference_series=next(iter(inherited))))
-            plan = replace(plan, flows=tuple(resolved_flows))
             reference_start, reference_end = coverage_by_resolution[plan.reference_series[1]]
             warmup = max(
                 (feature.warmup_span for feature in plan.required_features),
                 default=timedelta(0),
             )
             evaluation_from, evaluation_through = reference_start + warmup, reference_end
+        policy_zone = ZoneInfo(policy.timezone)
+        schedule_first = evaluation_from.astimezone(policy_zone).date()
+        schedule_last = (evaluation_through - timedelta(microseconds=1)).astimezone(
+            policy_zone
+        ).date()
+        try:
+            evaluation_schedule = self._calendar.session_schedule(
+                schedule_first, schedule_last
+            )
+        except CalendarCoverageError as exc:
+            raise JobNotSatisfiable(
+                f"the official session calendar does not cover the evaluation interval: {exc}",
+                reason_code="REQUIRED_INPUT_UNAVAILABLE",
+            ) from exc
         for resolution, (coverage_start, coverage_end) in coverage_by_resolution.items():
-            if coverage_start > evaluation_from or coverage_end < evaluation_through:
+            if not _dataset_cover_contains_evaluation(
+                evaluation_schedule,
+                coverage_start,
+                coverage_end,
+                evaluation_from,
+                evaluation_through,
+            ):
                 raise JobNotSatisfiable(
                     f"pinned {resolution} dataset cover {coverage_start.isoformat()}.."
                     f"{coverage_end.isoformat()} does not contain evaluation interval "
