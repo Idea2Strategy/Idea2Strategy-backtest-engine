@@ -594,6 +594,14 @@ def validate_backtest_request(document: Mapping[str, Any]) -> dict[str, Any]:
                     "instrumentCatalogVersion",
                 )
             ]
+            if "datasets" in instance:
+                request_fields.append(
+                    "".join(
+                        f"{dataset['datasetManifestId']}:{dataset['purposeCode']}:"
+                        f"{dataset['expectedDatasetHash']};"
+                        for dataset in instance["datasets"]
+                    )
+                )
             request_fields.append("".join(
                 f"{feature['featureMaterializationId']}:{feature['lockedResultHash']};"
                 for feature in sorted(
