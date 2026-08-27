@@ -194,7 +194,11 @@ class RunRepository(_Repository):
         """Owner-scoped read. A foreign run is indistinguishable from a missing one."""
 
         found = self._fetch_one(
-            select(runs).where(runs.c.id == run_id, runs.c.owner_account_id == owner_account_id),
+            select(runs).where(
+                runs.c.id == run_id,
+                runs.c.owner_account_id == owner_account_id,
+                runs.c.deleted_at.is_(None),
+            ),
             RunRow,
         )
         if found is None:
@@ -222,7 +226,10 @@ class RunRepository(_Repository):
             raise ValueError("limit must be positive")
         if offset < 0:
             raise ValueError("offset must not be negative")
-        statement = select(runs).where(runs.c.owner_account_id == owner_account_id)
+        statement = select(runs).where(
+            runs.c.owner_account_id == owner_account_id,
+            runs.c.deleted_at.is_(None),
+        )
         if bot_id is not None:
             statement = statement.where(runs.c.bot_id == bot_id)
         return self._fetch_all(
@@ -336,7 +343,54 @@ class RunRepository(_Repository):
         )
         return _hydrate(RunRow, updated)
 
+    def request_deletion(self, run_id: UUID, *, requested_at: datetime) -> RunRow:
+        """Cancel active work and retain the row as immutable owner evidence."""
+        current = self._connection.execute(
+            select(runs).where(runs.c.id == run_id).with_for_update()
+        ).mappings().first()
+        if current is None:
+            raise RowNotFound(f"backtest run not found: {run_id}")
+        hydrated = _hydrate(RunRow, current)
+        if hydrated.deleted_at is not None:
+            return hydrated
+        values: dict[str, Any] = {
+            "deletion_requested_at": hydrated.deletion_requested_at or requested_at,
+        }
+        if hydrated.status in {
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+            RunStatus.UNAVAILABLE,
+        }:
+            values["deleted_at"] = requested_at
+        elif hydrated.status is RunStatus.QUEUED:
+            values.update(
+                status=RunStatus.CANCELLED.value,
+                cancellation_requested_at=hydrated.cancellation_requested_at or requested_at,
+                cancellation_reason_code=hydrated.cancellation_reason_code or "USER_DELETED",
+                cancelled_at=requested_at,
+                completed_at=requested_at,
+                deleted_at=requested_at,
+            )
+        else:
+            values.update(
+                cancellation_requested_at=hydrated.cancellation_requested_at or requested_at,
+                cancellation_reason_code=hydrated.cancellation_reason_code or "USER_DELETED",
+            )
+        updated = self._connection.execute(
+            update(runs).where(runs.c.id == run_id).values(**values).returning(*runs.c)
+        ).mappings().one()
+        return _hydrate(RunRow, updated)
+
     def _transition(self, run_id: UUID, target: RunStatus, **values: Any) -> RunRow:
+        current_before = self.get(run_id)
+        if current_before.deletion_requested_at is not None and target in {
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+            RunStatus.UNAVAILABLE,
+        }:
+            values.setdefault("deleted_at", values.get("completed_at") or values.get("cancelled_at"))
         sources = sorted(source.value for source, allowed in RUN_STATUS_TRANSITIONS.items() if target in allowed)
         statement = (
             update(runs)

@@ -99,6 +99,8 @@ class RunStore(Protocol):
 
     def mark_unavailable(self, run_id: UUID, completed_at: datetime, failure_code: str) -> RunRow: ...
 
+    def request_deletion(self, run_id: UUID, *, requested_at: datetime) -> RunRow: ...
+
 
 class AttemptStore(Protocol):
     """Durable replacement for the in-process attempt lock in `attempt_coordinator`."""

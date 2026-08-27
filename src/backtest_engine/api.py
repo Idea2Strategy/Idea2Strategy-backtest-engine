@@ -192,6 +192,8 @@ def _run_payload(run: BacktestRun) -> dict[str, Any]:
         "cancellationRequestedAt": _iso(row.cancellation_requested_at),
         "cancellationReasonCode": row.cancellation_reason_code,
         "cancelledAt": _iso(row.cancelled_at),
+        "deletionRequestedAt": _iso(row.deletion_requested_at),
+        "deletedAt": _iso(row.deleted_at),
         "attemptCount": len(run.attempts),
     }
 
@@ -544,6 +546,28 @@ def create_app(
         except InvalidStatusTransition as exc:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
         return {"run": _run_payload(run), "cancellationRequested": True}
+
+    @app.delete(
+        f"{API_PREFIX}/backtests/{{run_id}}",
+        status_code=status.HTTP_202_ACCEPTED,
+        tags=["backtests"],
+    )
+    def delete_backtest(run_id: UUID, principal: Principal = Auth) -> dict[str, Any]:
+        """Owner delete with evidence retention and cooperative running cancellation."""
+        try:
+            run = lifecycle.request_deletion(
+                run_id,
+                owner_account_id=principal.account_id,
+            )
+        except BacktestRunNotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except NotRunOwner as exc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+        return {
+            "run": _run_payload(run),
+            "deletionRequested": True,
+            "deleted": run.run.deleted_at is not None,
+        }
 
     @app.get(f"{API_PREFIX}/backtests/{{run_id}}/attempts", tags=["backtests"])
     def get_attempts(run_id: UUID, principal: Principal = Auth) -> dict[str, Any]:

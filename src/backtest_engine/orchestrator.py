@@ -442,9 +442,11 @@ class BacktestJob:
         if (self.evaluation_from is None) != (self.evaluation_through is None):
             raise OrchestratorError("evaluation interval must include both boundaries")
         if self.evaluation_from is not None:
-            if self.evaluation_from.tzinfo is None or self.evaluation_through.tzinfo is None:
+            evaluation_through = self.evaluation_through
+            assert evaluation_through is not None
+            if self.evaluation_from.tzinfo is None or evaluation_through.tzinfo is None:
                 raise OrchestratorError("evaluation interval must be timezone-aware")
-            if self.evaluation_from >= self.evaluation_through:
+            if self.evaluation_from >= evaluation_through:
                 raise OrchestratorError("evaluation interval must not be empty")
         # One source of truth for the bar period: the element catalog's
         # resolution table. A separately configured interval could disagree

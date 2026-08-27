@@ -167,6 +167,8 @@ runs = Table(
     Column("cancellation_requested_at", TIMESTAMP(timezone=True)),
     Column("cancellation_reason_code", VARCHAR(80)),
     Column("cancelled_at", TIMESTAMP(timezone=True)),
+    Column("deletion_requested_at", TIMESTAMP(timezone=True)),
+    Column("deleted_at", TIMESTAMP(timezone=True)),
     # Appended by the globally ordered forward contribution
     # `V20260805170000__backtest_run_outcome_detail.sql`. Each belongs to exactly one
     # terminal status and is NULL in every other, so absence stays distinguishable
@@ -187,6 +189,7 @@ runs = Table(
     Index("ix_runs_bot_id_queued_at", "bot_id", "queued_at"),
     Index("ix_runs_status_queued_at", "status", "queued_at"),
     Index("ix_runs_owner_account_id_queued_at", "owner_account_id", "queued_at"),
+    Index("ix_runs_owner_deleted_queued_at", "owner_account_id", "deleted_at", "queued_at"),
     schema=BACKTEST_SCHEMA,
 )
 

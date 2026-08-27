@@ -520,6 +520,45 @@ def test_running_cancellation_is_cooperative_and_owner_scoped(
     assert run["cancelledAt"] is None
 
 
+def test_owner_delete_is_idempotent_and_deleted_runs_disappear_from_customer_queries(
+    harness: Harness, official_request: dict[str, Any]
+) -> None:
+    _accept(harness, official_request)
+
+    first = harness.client.delete(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}", headers=harness.owner()
+    )
+    second = harness.client.delete(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}", headers=harness.owner()
+    )
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert first.json()["run"]["status"] == "CANCELLED"
+    assert first.json()["deletionRequested"] is True
+    assert first.json()["deleted"] is True
+    assert harness.client.get("/api/v1/backtests", headers=harness.owner()).json()["items"] == []
+    assert harness.client.get(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}", headers=harness.owner()
+    ).status_code == 404
+    assert harness.gateway.get(UUID(EXPECTED_RUN_ID)).deleted_at is not None
+
+
+def test_foreign_owner_cannot_delete_a_backtest(
+    harness: Harness, official_request: dict[str, Any]
+) -> None:
+    _accept(harness, official_request)
+
+    response = harness.client.delete(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}", headers=harness.other()
+    )
+
+    assert response.status_code == 403
+    assert harness.client.get(
+        f"/api/v1/backtests/{EXPECTED_RUN_ID}", headers=harness.owner()
+    ).status_code == 200
+
+
 def test_result_ingestion_requires_its_own_scope(
     harness: Harness, official_request: dict[str, Any]
 ) -> None:
