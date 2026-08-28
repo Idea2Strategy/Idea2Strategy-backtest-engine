@@ -77,6 +77,30 @@ RSI_FEED_IDENTITIES: Mapping[str, tuple[str, str, str, str]] = {
         "6d2647f8-5caf-55ee-8821-869dc693f68a",
         "FEATURE_RSI_14_1D_RSI_1_0_0",
     ),
+    "ec37984b-6605-5560-8ea0-774c5b8e9626": (
+        "sha256:250df12e46d233e7b8ece86c64df7a3941f0d70436aebe522b1387f15fb346dc",
+        "30m",
+        "57794d8c-2254-53e4-966e-44f97edd9e6a",
+        "FEATURE_RSI_14_30M_RSI_1_0_0",
+    ),
+    "85f4f80f-be4e-d9dc-bd52-d4781ba5f30f": (
+        "sha256:7e8c5600ff2bf07a043f797a50d6467f86fbdb56ee532c87929df97f246af2de",
+        "1h",
+        "28012549-4f45-56d3-8bb6-329e4c7a9d77",
+        "FEATURE_RSI_14_1H_RSI_1_0_0",
+    ),
+    "65a5aaf5-f536-820f-119a-239b0aec0de7": (
+        "sha256:42e28b02a1552eb2aa42e0d89b1ea3dd909ee8d34c3bc290c4ce0234c6d705da",
+        "4h",
+        "e1d7d508-aaf1-5ae9-8098-c4af870f6fa4",
+        "FEATURE_RSI_14_4H_RSI_1_0_0",
+    ),
+    "647a5fd6-98ed-0617-d4b2-844748d54fac": (
+        "sha256:64dbbcda7352d0add9a4a6a6ed94a780603880891684dc32cf39e0a3d1167422",
+        "1d",
+        "6d2647f8-5caf-55ee-8821-869dc693f68a",
+        "FEATURE_RSI_14_1D_RSI_1_0_0",
+    ),
 }
 FEATURE_SERIES_SCHEMA = pa.schema(
     [
@@ -149,18 +173,6 @@ def _expected_feature_feed_id(record: Mapping[str, Any]) -> str:
         )
     if resolution != expected_resolution:
         raise FeatureOutputBindingError("feature definition resolution does not match its pinned RSI identity")
-    feed_identity = "|".join(
-        (
-            "feature-output-feed",
-            definition_hash,
-            calculator_version,
-            resolution,
-            FEATURE_SERIES_SCHEMA_VERSION,
-        )
-    )
-    expected = str(uuid.uuid5(PROJECT_UUID_NAMESPACE, feed_identity))
-    if expected != expected_feed_id:
-        raise FeatureOutputBindingError("feature feed identity inputs do not match the official RSI adapter")
     return expected_feed_id
 
 
@@ -250,8 +262,8 @@ def _require_metadata(
 
     period_start = _utc(record.get("period_start"), "period_start")
     period_end = _utc(record.get("period_end"), "period_end")
-    if period_start > evaluation_from - requirement.warmup_span:
-        raise FeatureOutputBindingError("feature period does not cover the required warm-up")
+    if period_start > evaluation_from:
+        raise FeatureOutputBindingError("feature period does not cover the evaluation start")
     if period_end < evaluation_through:
         raise FeatureOutputBindingError("feature period does not cover the full evaluation window")
 

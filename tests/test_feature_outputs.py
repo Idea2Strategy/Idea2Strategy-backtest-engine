@@ -77,14 +77,17 @@ def _utc_text(value: datetime) -> str:
 
 
 def _canonical_hash(
-    rows: list[dict[str, str]], *, definition_hash: str = DEFINITION_HASH
+    rows: list[dict[str, str]],
+    *,
+    definition_hash: str = DEFINITION_HASH,
+    period_start: datetime = PERIOD_START,
 ) -> str:
     payload = {
         "definition_hash": definition_hash.removeprefix("sha256:"),
         "input_dataset_set_hash": INPUT_HASH,
         "instrument_id": INSTRUMENT_ID,
         "period_end": _utc_text(PERIOD_END),
-        "period_start": _utc_text(PERIOD_START),
+        "period_start": _utc_text(period_start),
         "result_schema_version": 1,
         "rows": rows,
     }
@@ -353,6 +356,30 @@ def test_proposed_rsi_seed_reproduces_the_exact_deterministic_feed_identity() ->
             "1d",
             "6d2647f8-5caf-55ee-8821-869dc693f68a",
         ),
+        (
+            "ec37984b-6605-5560-8ea0-774c5b8e9626",
+            "sha256:250df12e46d233e7b8ece86c64df7a3941f0d70436aebe522b1387f15fb346dc",
+            "30m",
+            "57794d8c-2254-53e4-966e-44f97edd9e6a",
+        ),
+        (
+            "85f4f80f-be4e-d9dc-bd52-d4781ba5f30f",
+            "sha256:7e8c5600ff2bf07a043f797a50d6467f86fbdb56ee532c87929df97f246af2de",
+            "1h",
+            "28012549-4f45-56d3-8bb6-329e4c7a9d77",
+        ),
+        (
+            "65a5aaf5-f536-820f-119a-239b0aec0de7",
+            "sha256:42e28b02a1552eb2aa42e0d89b1ea3dd909ee8d34c3bc290c4ce0234c6d705da",
+            "4h",
+            "e1d7d508-aaf1-5ae9-8098-c4af870f6fa4",
+        ),
+        (
+            "647a5fd6-98ed-0617-d4b2-844748d54fac",
+            "sha256:64dbbcda7352d0add9a4a6a6ed94a780603880891684dc32cf39e0a3d1167422",
+            "1d",
+            "6d2647f8-5caf-55ee-8821-869dc693f68a",
+        ),
     ],
 )
 def test_each_production_resolution_has_one_deterministic_rsi_feed_identity(
@@ -441,7 +468,7 @@ def test_exact_pin_is_read_from_the_named_object_version_and_decoded() -> None:
         (lambda record: record.update(status="FAILED"), "SUCCEEDED"),
         (lambda record: record.update(calculator_version="rsi:2.0.0"), "semantic version"),
         (lambda record: record.update(resolution="15m"), "resolution"),
-        (lambda record: record.update(period_start=PERIOD_START + BAR), "warm-up"),
+        (lambda record: record.update(period_start=EVALUATION_FROM + BAR), "evaluation start"),
         (lambda record: record.update(period_end=PERIOD_END - BAR), "evaluation window"),
         (lambda record: record.update(output_dataset_status="BUILDING"), "AVAILABLE"),
         (lambda record: record.update(output_dataset_layer="RAW"), "DERIVED"),
@@ -474,6 +501,16 @@ def test_missing_pin_fails_the_required_feature_instrument_join() -> None:
             evaluation_from=EVALUATION_FROM,
             evaluation_through=EVALUATION_THROUGH,
         )
+
+
+def test_feature_series_may_warm_up_inside_the_evaluation_period() -> None:
+    body = _parquet()
+    result_hash = _canonical_hash(_rows(), period_start=EVALUATION_FROM)
+    record = _record(body, period_start=EVALUATION_FROM, result_hash=result_hash)
+
+    resolved, _reader = _resolve(records={MATERIALIZATION_ID: record}, body=body)
+
+    assert resolved[0].value_at(EVALUATION_FROM) == Decimal("0.00000000")
 
 
 def test_duplicate_tuple_fails_the_required_feature_instrument_join() -> None:

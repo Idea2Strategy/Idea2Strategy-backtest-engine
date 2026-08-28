@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import operator as operator_module
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from decimal import ROUND_HALF_UP, Context, Decimal, InvalidOperation
 from types import MappingProxyType
 
@@ -228,12 +228,31 @@ def _value(evaluation: ElementEvaluation, key: str, operation: str) -> str:
 
 
 def _decimal_value(evaluation: ElementEvaluation, key: str, operation: str) -> Decimal:
-    return Decimal(_value(evaluation, key, operation))
+    raw = _value(evaluation, key, operation)
+    try:
+        value = Decimal(raw)
+    except InvalidOperation as exc:
+        raise ElementEvaluationError(f"{operation} runtime input {key} must be a decimal number, got {raw!r}") from exc
+    if not value.is_finite():
+        raise ElementEvaluationError(f"{operation} runtime input {key} must be finite, got {raw!r}")
+    return value
 
 
 def _series_values(evaluation: ElementEvaluation, key: str, required: int, operation: str) -> list[Decimal]:
     raw = _value(evaluation, key, operation)
-    values = [Decimal(item) for item in raw.split(",") if item]
+    values: list[Decimal] = []
+    for item in raw.split(","):
+        if not item:
+            continue
+        try:
+            value = Decimal(item)
+        except InvalidOperation as exc:
+            raise ElementEvaluationError(
+                f"{operation} runtime input {key} must contain decimal numbers, got {item!r}"
+            ) from exc
+        if not value.is_finite():
+            raise ElementEvaluationError(f"{operation} runtime input {key} must contain finite numbers, got {item!r}")
+        values.append(value)
     if len(values) < required:
         raise ElementInputMissing(
             f"{operation} needs {required} values from {key}, got {len(values)}",
@@ -352,10 +371,7 @@ def _evaluate_catalog_operation(step: PlanStep, evaluation: ElementEvaluation) -
     if (
         resolution is not None
         and operation not in {"HOLDING_PERIOD", "SCHEDULE"}
-        and evaluation.inputs.values.get(
-            f"bar.closed.{resolution}", "false"
-        ).lower()
-        != "true"
+        and evaluation.inputs.values.get(f"bar.closed.{resolution}", "false").lower() != "true"
     ):
         return StepOutcome.failed(
             "WAITING_FOR_BAR_CLOSE",
@@ -412,9 +428,7 @@ def _evaluate_catalog_operation(step: PlanStep, evaluation: ElementEvaluation) -
         closes = _series_values(evaluation, f"closes.{resolution}", bars + 1, operation)
         direction = step.argument("direction")
         count = 0
-        for current, previous in zip(
-            reversed(closes[1:]), reversed(closes[:-1]), strict=True
-        ):
+        for current, previous in zip(reversed(closes[1:]), reversed(closes[:-1]), strict=True):
             if (direction == "UP" and current > previous) or (direction == "DOWN" and current < previous):
                 count += 1
             else:
@@ -466,13 +480,8 @@ def _evaluate_catalog_operation(step: PlanStep, evaluation: ElementEvaluation) -
             int(step.argument("signalPeriod")),
         )
         closes = _series_values(evaluation, f"closes.{resolution}", slow + signal + 2, operation)
-        macd = [
-            a - b
-            for a, b in zip(_ema(closes, fast), _ema(closes, slow), strict=True)
-        ]
-        histogram = [
-            a - b for a, b in zip(macd, _ema(macd, signal), strict=True)
-        ]
+        macd = [a - b for a, b in zip(_ema(closes, fast), _ema(closes, slow), strict=True)]
+        histogram = [a - b for a, b in zip(macd, _ema(macd, signal), strict=True)]
         previous, current = histogram[-2], histogram[-1]
         direction = step.argument("direction")
         passed = previous <= 0 < current if direction == "UP" else previous >= 0 > current
@@ -569,6 +578,10 @@ class ElementSpec:
     produces_value: bool
     consumes_value: bool
     evaluator: StepEvaluator
+    minimum_arguments: Mapping[str, Decimal] = field(default_factory=lambda: MappingProxyType({}))
+    exclusive_minimum_arguments: Mapping[str, Decimal] = field(default_factory=lambda: MappingProxyType({}))
+    maximum_arguments: Mapping[str, Decimal] = field(default_factory=lambda: MappingProxyType({}))
+    integer_arguments: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -629,8 +642,31 @@ class ElementCatalog:
                     PlanLoadFailure.UNSUPPORTED_ELEMENT_ARGUMENT,
                     f"{step.operation} argument {name}={value!r} is not one of " + ", ".join(allowed),
                 )
-        for name in spec.decimal_arguments:
-            _parse_decimal(step, name)
+        decimal_values = {name: _parse_decimal(step, name) for name in spec.decimal_arguments}
+        for name, minimum in spec.minimum_arguments.items():
+            if decimal_values[name] < minimum:
+                raise _reject(
+                    PlanLoadFailure.UNSUPPORTED_ELEMENT_ARGUMENT,
+                    f"{step.operation} argument {name} must be at least {minimum}, got {step.arguments[name]!r}",
+                )
+        for name, minimum in spec.exclusive_minimum_arguments.items():
+            if decimal_values[name] <= minimum:
+                raise _reject(
+                    PlanLoadFailure.UNSUPPORTED_ELEMENT_ARGUMENT,
+                    f"{step.operation} argument {name} must be greater than {minimum}, got {step.arguments[name]!r}",
+                )
+        for name, maximum in spec.maximum_arguments.items():
+            if decimal_values[name] > maximum:
+                raise _reject(
+                    PlanLoadFailure.UNSUPPORTED_ELEMENT_ARGUMENT,
+                    f"{step.operation} argument {name} must be at most {maximum}, got {step.arguments[name]!r}",
+                )
+        for name in spec.integer_arguments:
+            if decimal_values[name] != decimal_values[name].to_integral_value():
+                raise _reject(
+                    PlanLoadFailure.UNSUPPORTED_ELEMENT_ARGUMENT,
+                    f"{step.operation} argument {name} must be an integer, got {step.arguments[name]!r}",
+                )
         for name in spec.feature_arguments:
             self.require_feature(step.arguments[name])
         return spec
@@ -957,6 +993,22 @@ _BASIC_ELEMENTS_2026_08_08 = ElementCatalog(
 
 def _v2_specs() -> Mapping[str, ElementSpec]:
     specs = dict(_BASIC_ELEMENTS_2026_08_08.specs)
+    zero = Decimal(0)
+    hundred = Decimal(100)
+    specs["PRICE_CHANGE_PERCENT"] = replace(
+        specs["PRICE_CHANGE_PERCENT"],
+        minimum_arguments=MappingProxyType({"thresholdPercent": zero}),
+    )
+    specs["RSI_CROSS"] = replace(
+        specs["RSI_CROSS"],
+        minimum_arguments=MappingProxyType({"threshold": zero}),
+        maximum_arguments=MappingProxyType({"threshold": hundred}),
+    )
+    specs["POSITION_RETURN"] = replace(
+        specs["POSITION_RETURN"],
+        minimum_arguments=MappingProxyType({"thresholdPercent": zero}),
+        maximum_arguments=MappingProxyType({"thresholdPercent": hundred}),
+    )
     specs["HOLDING_PERIOD"] = _production_spec(
         "HOLDING_PERIOD",
         ("unit", "amount", "resolution"),
@@ -965,6 +1017,22 @@ def _v2_specs() -> Mapping[str, ElementSpec]:
             "resolution": _PRODUCTION_RESOLUTIONS,
         },
         decimals=("amount",),
+    )
+    specs["HOLDING_PERIOD"] = replace(
+        specs["HOLDING_PERIOD"],
+        minimum_arguments=MappingProxyType({"amount": zero}),
+        integer_arguments=("amount",),
+    )
+    for operation in ("PEAK_RETURN", "DRAWDOWN_FROM_PEAK"):
+        specs[operation] = replace(
+            specs[operation],
+            minimum_arguments=MappingProxyType({"thresholdPercent": zero}),
+            maximum_arguments=MappingProxyType({"thresholdPercent": hundred}),
+        )
+    specs["SCHEDULE"] = replace(
+        specs["SCHEDULE"],
+        exclusive_minimum_arguments=MappingProxyType({"interval": zero}),
+        integer_arguments=("interval",),
     )
     specs["EMIT_ORDER_CANDIDATE"] = ElementSpec(
         operation="EMIT_ORDER_CANDIDATE",
@@ -1001,6 +1069,21 @@ def _v2_specs() -> Mapping[str, ElementSpec]:
         produces_value=False,
         consumes_value=False,
         evaluator=_evaluate_terminal,
+        exclusive_minimum_arguments=MappingProxyType(
+            {
+                "orderPercent": zero,
+                "maxPositionPercent": zero,
+                "waitInterval": zero,
+                "maxExecutions": zero,
+            }
+        ),
+        maximum_arguments=MappingProxyType(
+            {
+                "orderPercent": hundred,
+                "maxPositionPercent": hundred,
+            }
+        ),
+        integer_arguments=("waitInterval", "maxExecutions"),
     )
     return MappingProxyType(specs)
 
@@ -1009,8 +1092,22 @@ _BASIC_ELEMENTS_2026_08_25 = ElementCatalog(
     version="basic-elements:2026-08-25",
     specs=_v2_specs(),
     feature_versions=_BASIC_ELEMENTS_2026_08_08.feature_versions,
-    canonical_feature_ids=_BASIC_ELEMENTS_2026_08_08.canonical_feature_ids,
-    canonical_feature_resolutions=_BASIC_ELEMENTS_2026_08_08.canonical_feature_resolutions,
+    canonical_feature_ids=MappingProxyType(
+        {
+            "ec37984b-6605-5560-8ea0-774c5b8e9626": "RSI_14",
+            "85f4f80f-be4e-d9dc-bd52-d4781ba5f30f": "RSI_14",
+            "65a5aaf5-f536-820f-119a-239b0aec0de7": "RSI_14",
+            "647a5fd6-98ed-0617-d4b2-844748d54fac": "RSI_14",
+        }
+    ),
+    canonical_feature_resolutions=MappingProxyType(
+        {
+            "ec37984b-6605-5560-8ea0-774c5b8e9626": "30m",
+            "85f4f80f-be4e-d9dc-bd52-d4781ba5f30f": "1h",
+            "65a5aaf5-f536-820f-119a-239b0aec0de7": "4h",
+            "647a5fd6-98ed-0617-d4b2-844748d54fac": "1d",
+        }
+    ),
 )
 
 

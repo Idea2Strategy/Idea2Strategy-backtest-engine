@@ -1560,6 +1560,27 @@ def _condition_outcomes(evaluation: PlanEvaluation) -> tuple[ConditionOutcome, .
 # ==========================================================================
 
 
+def _required_feature_through(
+    schedule: OfficialSessionSchedule,
+    evaluation_from: datetime,
+    evaluation_through: datetime,
+) -> datetime:
+    """Return the last instant at which an evaluation can consume a feature.
+
+    Explicit run dates are converted from the policy timezone to a half-open UTC
+    interval.  Requiring a feature output to cover that wall-clock boundary
+    incorrectly rejects a complete trading day (for example 20:00 UTC close
+    versus the following 04:00 UTC New York date boundary).  Features are only
+    consumed by market events, so the final official session close is the
+    meaningful coverage boundary.
+    """
+    last_close = max(
+        (session.closes_at for session in schedule.sessions),
+        default=evaluation_from,
+    )
+    return min(last_close, evaluation_through)
+
+
 def dataset_coverage(manifest: Mapping[str, Any]) -> tuple[datetime, datetime]:
     """The union of the pinned objects' declared coverage, in UTC.
 
@@ -2164,7 +2185,9 @@ class OrchestratorJobHandler:
                     source=self._feature_materializations,
                     reader=self._feature_object_reader,
                     evaluation_from=evaluation_from,
-                    evaluation_through=evaluation_through,
+                    evaluation_through=_required_feature_through(
+                        evaluation_schedule, evaluation_from, evaluation_through
+                    ),
                 )
             except FeatureOutputBindingError as exc:
                 raise JobNotSatisfiable(
