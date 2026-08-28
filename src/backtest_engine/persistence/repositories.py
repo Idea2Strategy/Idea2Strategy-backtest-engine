@@ -345,9 +345,7 @@ class RunRepository(_Repository):
 
     def request_deletion(self, run_id: UUID) -> RunRow:
         """Cancel active work and retain the row as immutable owner evidence."""
-        current = self._connection.execute(
-            select(runs).where(runs.c.id == run_id).with_for_update()
-        ).mappings().first()
+        current = self._connection.execute(select(runs).where(runs.c.id == run_id).with_for_update()).mappings().first()
         if current is None:
             raise RowNotFound(f"backtest run not found: {run_id}")
         hydrated = _hydrate(RunRow, current)
@@ -379,9 +377,11 @@ class RunRepository(_Repository):
                 cancellation_requested_at=hydrated.cancellation_requested_at or requested_at,
                 cancellation_reason_code=hydrated.cancellation_reason_code or "USER_DELETED",
             )
-        updated = self._connection.execute(
-            update(runs).where(runs.c.id == run_id).values(**values).returning(*runs.c)
-        ).mappings().one()
+        updated = (
+            self._connection.execute(update(runs).where(runs.c.id == run_id).values(**values).returning(*runs.c))
+            .mappings()
+            .one()
+        )
         return _hydrate(RunRow, updated)
 
     def _transition(self, run_id: UUID, target: RunStatus, **values: Any) -> RunRow:
@@ -593,9 +593,7 @@ class RunAttemptRepository(_Repository):
     ) -> RunAttemptRow:
         """Close exactly one live delivery and make its non-terminal run retryable."""
         attempt = (
-            self._connection.execute(
-                select(run_attempts.c.run_id).where(run_attempts.c.id == attempt_id)
-            )
+            self._connection.execute(select(run_attempts.c.run_id).where(run_attempts.c.id == attempt_id))
             .mappings()
             .first()
         )
@@ -633,9 +631,7 @@ class RunAttemptRepository(_Repository):
         if status in (WorkStatus.PENDING, WorkStatus.RUNNING):
             raise ValueError("close_fenced requires a terminal status")
         attempt = (
-            self._connection.execute(
-                select(run_attempts.c.run_id).where(run_attempts.c.id == attempt_id)
-            )
+            self._connection.execute(select(run_attempts.c.run_id).where(run_attempts.c.id == attempt_id))
             .mappings()
             .first()
         )
@@ -653,9 +649,7 @@ class RunAttemptRepository(_Repository):
         if run is None:
             raise RowNotFound(f"backtest run not found: {attempt['run_id']}")
         locked_attempt = self._connection.execute(
-            select(run_attempts.c.id)
-            .where(run_attempts.c.id == attempt_id)
-            .with_for_update()
+            select(run_attempts.c.id).where(run_attempts.c.id == attempt_id).with_for_update()
         ).first()
         if locked_attempt is None:
             raise StaleAttemptClaim("terminal mutation matched no attempt")
