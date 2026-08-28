@@ -282,11 +282,16 @@ def test_owner_soft_delete_waits_for_running_worker_then_hides_terminal_evidence
         cancelled = uow.runs.mark_cancelled(run.id, cancelled_at, "USER_DELETED")
 
     assert cancelled.status is RunStatus.CANCELLED
-    assert cancelled.deleted_at == max(cancelled_at, pending.deletion_requested_at)
+    effective_cancelled_at = max(cancelled_at, pending.deletion_requested_at)
+    assert cancelled.cancelled_at == effective_cancelled_at
+    assert cancelled.completed_at == effective_cancelled_at
+    assert cancelled.deleted_at == effective_cancelled_at
     with persistence.unit_of_work() as uow:
         with pytest.raises(RowNotFound):
             uow.runs.get_owned(ACCOUNT_ID, run.id)
-        assert uow.runs.get(run.id).deleted_at == cancelled_at
+        persisted = uow.runs.get(run.id)
+        assert persisted.cancelled_at == effective_cancelled_at
+        assert persisted.deleted_at == effective_cancelled_at
 
 
 def test_lifecycle_transitions_use_the_canonical_completed_label(

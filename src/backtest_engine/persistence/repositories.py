@@ -304,13 +304,15 @@ class RunRepository(_Repository):
         reason_code: str,
     ) -> RunRow:
         current = self.get(run_id)
+        requested_at = current.cancellation_requested_at or cancelled_at
+        effective_cancelled_at = max(cancelled_at, requested_at)
         return self._transition(
             run_id,
             RunStatus.CANCELLED,
-            completed_at=cancelled_at,
-            cancellation_requested_at=current.cancellation_requested_at or cancelled_at,
+            completed_at=effective_cancelled_at,
+            cancellation_requested_at=requested_at,
             cancellation_reason_code=current.cancellation_reason_code or reason_code,
-            cancelled_at=cancelled_at,
+            cancelled_at=effective_cancelled_at,
         )
 
     def request_cancellation(self, run_id: UUID, *, reason_code: str) -> RunRow:
