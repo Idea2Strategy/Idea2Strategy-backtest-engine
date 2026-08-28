@@ -49,7 +49,7 @@ from backtest_engine.data_availability import (
 )
 from backtest_engine.elements import SeriesBar, resolution_period
 from backtest_engine.elements.orders import OrderCandidate
-from backtest_engine.event_clock import MarketDataEvent, MarketEventClock
+from backtest_engine.event_clock import MarketDataEvent, MarketEventClock, OfficialSessionSchedule
 from backtest_engine.execution_model import BacktestExecutionModel, RiskLimits
 from backtest_engine.orchestrator import (
     PlanReplay,
@@ -70,6 +70,7 @@ from backtest_engine.wiring import (
     _CancellationAwareMonitor,
     _dataset_cover_contains_evaluation,
     _metric_percent,
+    _required_feature_through,
     _resolve_position_only_flow_clocks,
     dataset_coverage,
     evaluation_window,
@@ -95,6 +96,20 @@ from d_reproducibility_testkit import (
 
 SESSION_CLOSE = datetime(2024, 1, 2, 21, 0, tzinfo=UTC)
 INITIAL_CASH = Decimal("100000.00000000")
+
+
+def test_feature_coverage_ends_at_the_last_market_close_not_the_local_date_boundary() -> None:
+    evaluation_from = datetime(2026, 7, 29, 4, 0, tzinfo=UTC)
+    evaluation_through = datetime(2026, 7, 30, 4, 0, tzinfo=UTC)
+    schedule = XNYS_CALENDAR.session_schedule(date(2026, 7, 29), date(2026, 7, 29))
+
+    assert _required_feature_through(schedule, evaluation_from, evaluation_through) == datetime(
+        2026, 7, 29, 20, 0, tzinfo=UTC
+    )
+    empty = OfficialSessionSchedule(date(2026, 7, 30), date(2026, 7, 30), ())
+    assert _required_feature_through(empty, evaluation_from, evaluation_through) == evaluation_from
+    partial_session_end = datetime(2026, 7, 29, 16, 0, tzinfo=UTC)
+    assert _required_feature_through(schedule, evaluation_from, partial_session_end) == partial_session_end
 
 
 def _plan() -> Any:

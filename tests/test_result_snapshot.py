@@ -535,6 +535,53 @@ def test_a_fill_whose_position_delta_contradicts_its_quantity_is_rejected() -> N
         )
 
 
+def test_fill_ledger_recovers_causal_position_order_across_overlapping_bar_times() -> None:
+    """Mixed resolutions can be consumed in an order unlike their bar-end timestamps."""
+    opens_four = _record(
+        kind=ResultRecordKind.FILL,
+        record_id="00000000-0000-4000-8000-000000000851",
+        occurred_at="2025-11-28T16:00:00Z",
+        order_id=ORDER_ID,
+        status=OrderStatus.FILLED,
+        cash_after="9600",
+        positions_after=(_position(quantity="4", cost_basis="400"),),
+        fill_id="00000000-0000-4000-8000-000000000852",
+        quantity="4",
+        base_price="100",
+        price="100",
+        gross_amount="400",
+        slippage_amount="0",
+        fee="0",
+        cost_basis="400",
+        realized_pnl="0",
+    )
+    adds_twenty_seven = _record(
+        kind=ResultRecordKind.FILL,
+        record_id="00000000-0000-4000-8000-000000000853",
+        occurred_at="2025-11-28T15:00:00Z",
+        order_id=OTHER_ORDER_ID,
+        status=OrderStatus.FILLED,
+        cash_after="6900",
+        positions_after=(_position(quantity="31", cost_basis="3100"),),
+        fill_id="00000000-0000-4000-8000-000000000854",
+        quantity="27",
+        base_price="100",
+        price="100",
+        gross_amount="2700",
+        slippage_amount="0",
+        fee="0",
+        cost_basis="2700",
+        realized_pnl="0",
+    )
+
+    result = ResultSnapshotBuilder().build(
+        _run(), [adds_twenty_seven, opens_four], _utc("2025-11-28T17:00:00Z")
+    )
+
+    assert result.summary.ending_positions == (_position(quantity="31", cost_basis="3100"),)
+    assert result.summary.metrics["fillCount"].value == Decimal("2")
+
+
 def _mark_series() -> ValuationSeries:
     return ValuationSeries(
         basis=ValuationBasis.MARK_TO_MARKET,

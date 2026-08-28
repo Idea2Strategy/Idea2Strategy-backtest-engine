@@ -1218,7 +1218,7 @@ def _fill_ledger(
     fill_count = closing_count = winning_count = losing_count = 0
     realized_pnl = total_fees = total_slippage = ZERO
 
-    for record in _causal_fill_order(ordered):
+    for record in _causal_fill_order(run_snapshot.initial_cash, ordered):
         quantity = record.quantity
         gross_amount = record.gross_amount
         fee = record.fee
@@ -1325,55 +1325,67 @@ def _fill_ledger(
 
 
 def _causal_fill_order(
+    initial_cash: Decimal,
     ordered: tuple[ResultRecord, ...],
 ) -> tuple[ResultRecord, ...]:
-    """Restore the causal order of fills sharing one market-data instant.
+    """Restore causal fill order from successive immutable position snapshots.
 
     Record ids are content-derived and therefore cannot encode the order in
-    which multiple orders consumed the same bar.  Their successive position
-    snapshots do encode that order, so follow that chain before rebuilding the
-    ledger.
+    which multiple orders consumed overlapping mixed-resolution bars.  Their
+    bar-end timestamps can also differ from consumption order: a coarser bar
+    becomes available after finer bars whose timestamps overlap it.  Successive
+    position snapshots do encode the actual order, so follow that chain across
+    the complete fill set before rebuilding the ledger.
     """
 
     fills = [item for item in ordered if item.kind is ResultRecordKind.FILL]
+    pending_ids = {item.record_id for item in fills}
+    by_predecessor_cash: dict[Decimal, list[ResultRecord]] = {}
+    for record in fills:
+        if record.gross_amount is None or record.fee is None:  # pragma: no cover
+            continue
+        buy_before = quantize_money(
+            record.cash_after + record.gross_amount + record.fee, "cash_before"
+        )
+        sell_before = quantize_money(
+            record.cash_after - record.gross_amount + record.fee, "cash_before"
+        )
+        by_predecessor_cash.setdefault(buy_before, []).append(record)
+        if sell_before != buy_before:
+            by_predecessor_cash.setdefault(sell_before, []).append(record)
     result: list[ResultRecord] = []
     book: dict[str, PositionAfter] = {}
-    index = 0
-    while index < len(fills):
-        instant = fills[index].occurred_at
-        pending: list[ResultRecord] = []
-        while index < len(fills) and fills[index].occurred_at == instant:
-            pending.append(fills[index])
-            index += 1
-
-        while pending:
-            matched_index = next(
-                (
-                    candidate_index
-                    for candidate_index, candidate in enumerate(pending)
-                    if _matches_position_transition(book, candidate)
-                ),
-                None,
-            )
-            if matched_index is None:
-                # Preserve the deterministic record ordering so the canonical
-                # validation below reports its detailed contradiction.
-                result.extend(pending)
-                break
-            record = pending.pop(matched_index)
-            result.append(record)
-            book = {
-                item.instrument_id: item
-                for item in record.positions_after
-                if item.quantity > ZERO
-            }
+    cash = quantize_money(initial_cash, "initial_cash")
+    while pending_ids:
+        matched_record = next(
+            (
+                candidate
+                for candidate in by_predecessor_cash.get(cash, ())
+                if candidate.record_id in pending_ids
+                and _matches_fill_transition(book, cash, candidate)
+            ),
+            None,
+        )
+        if matched_record is None:
+            # Preserve deterministic canonical order so ledger validation emits
+            # the first concrete contradictory transition.
+            result.extend(item for item in fills if item.record_id in pending_ids)
+            break
+        pending_ids.remove(matched_record.record_id)
+        result.append(matched_record)
+        book = {
+            item.instrument_id: item
+            for item in matched_record.positions_after
+            if item.quantity > ZERO
+        }
+        cash = matched_record.cash_after
     return tuple(result)
 
 
-def _matches_position_transition(
-    book: dict[str, PositionAfter], record: ResultRecord
+def _matches_fill_transition(
+    book: dict[str, PositionAfter], cash: Decimal, record: ResultRecord
 ) -> bool:
-    if record.quantity is None:
+    if record.quantity is None or record.gross_amount is None or record.fee is None:
         return False
     after = {
         item.instrument_id: item
@@ -1386,7 +1398,14 @@ def _matches_position_transition(
     after_quantity = after.get(
         record.instrument_id, PositionAfter(record.instrument_id, ZERO, ZERO)
     ).quantity
-    if (after_quantity - before_quantity).copy_abs() != record.quantity:
+    delta = after_quantity - before_quantity
+    if delta == record.quantity:
+        expected_cash = quantize_money(cash - record.gross_amount - record.fee, "cash_after")
+    elif delta == -record.quantity:
+        expected_cash = quantize_money(cash + record.gross_amount - record.fee, "cash_after")
+    else:
+        return False
+    if record.cash_after != expected_cash:
         return False
     return all(
         book.get(instrument_id) == after.get(instrument_id)

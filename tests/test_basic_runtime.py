@@ -310,19 +310,23 @@ def test_v2_catalog_position_cap_survives_plan_loading_and_candidate_emission() 
 
 
 @pytest.mark.parametrize(
-    ("resolution", "wire_resolution", "feature_id"),
+    ("catalog_version", "resolution", "wire_resolution", "feature_id"),
     [
-        ("30m", "PT30M", "4b1c6801-0259-5176-a857-0e5ea923d898"),
-        ("1h", "PT1H", "2e18c093-5d4e-5d9a-bd22-b7e5679f1a3e"),
-        ("4h", "PT4H", "1b2785bd-20f0-50a2-ae96-6a1f7bad74b9"),
-        ("1d", "PT24H", "eddfb2d4-8586-5260-8fc9-9c8125990270"),
+        ("basic-elements:2026-08-08", "30m", "PT30M", "4b1c6801-0259-5176-a857-0e5ea923d898"),
+        ("basic-elements:2026-08-08", "1h", "PT1H", "2e18c093-5d4e-5d9a-bd22-b7e5679f1a3e"),
+        ("basic-elements:2026-08-08", "4h", "PT4H", "1b2785bd-20f0-50a2-ae96-6a1f7bad74b9"),
+        ("basic-elements:2026-08-08", "1d", "PT24H", "eddfb2d4-8586-5260-8fc9-9c8125990270"),
+        ("basic-elements:2026-08-25", "30m", "PT30M", "ec37984b-6605-5560-8ea0-774c5b8e9626"),
+        ("basic-elements:2026-08-25", "1h", "PT1H", "85f4f80f-be4e-d9dc-bd52-d4781ba5f30f"),
+        ("basic-elements:2026-08-25", "4h", "PT4H", "65a5aaf5-f536-820f-119a-239b0aec0de7"),
+        ("basic-elements:2026-08-25", "1d", "PT24H", "647a5fd6-98ed-0617-d4b2-844748d54fac"),
     ],
 )
 def test_rsi_cross_requires_the_exact_selected_resolution_feature_definition(
-    resolution: str, wire_resolution: str, feature_id: str
+    catalog_version: str, resolution: str, wire_resolution: str, feature_id: str
 ) -> None:
     def rsi_cross(document: dict[str, Any]) -> None:
-        catalog = element_catalog("basic-elements:2026-08-08")
+        catalog = element_catalog(catalog_version)
         terminal = catalog.spec("EMIT_ORDER_CANDIDATE")
         terminal_arguments = {
             name: values[0] for name, values in terminal.enumerations.items()
@@ -330,6 +334,8 @@ def test_rsi_cross_requires_the_exact_selected_resolution_feature_definition(
         terminal_arguments.update(
             {"orderPercent": "50", "waitInterval": "1", "maxExecutions": "1"}
         )
+        if "maxPositionPercent" in terminal.required_arguments:
+            terminal_arguments["maxPositionPercent"] = "100"
         document["elementCatalogVersion"] = catalog.version
         document["requiredFeatures"] = [
             {
