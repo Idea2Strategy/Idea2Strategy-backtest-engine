@@ -799,7 +799,7 @@ class BacktestOrchestrator:
                         event
                         for event in combined_events
                         if event.occurred_at >= min(requirement.warmup_from for requirement in job.requirements)
-                        and (job.evaluation_through is None or event.occurred_at < job.evaluation_through)
+                        and (job.evaluation_through is None or event.occurred_at <= job.evaluation_through)
                     ),
                     start=1,
                 )

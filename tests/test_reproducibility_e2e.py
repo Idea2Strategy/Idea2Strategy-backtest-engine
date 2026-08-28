@@ -116,11 +116,11 @@ EXPECTED_INPUT_BUNDLE_FINGERPRINT = (
 EXPECTED_RUN_SNAPSHOT_ID = "75fd83d0c9cd6356a9c0ed1db9833881f19a0a136042bf96d82617085ba64348"
 
 #: `backtest.performance_summaries.result_hash`.
-EXPECTED_RESULT_HASH = "ce53f523451e506c2ec8264043b9221729eefe8c2040088883a30dc922d56c08"
+EXPECTED_RESULT_HASH = "d32135e1775553edc037d17fea01afc1e04f30844653741b77b235cf3677470b"
 
 #: `storage.objects.content_hash` of the TRADE_DETAIL Parquet part.
 EXPECTED_TRADE_DETAIL_CONTENT_HASH = (
-    "28977f43a1a3cb811538affd6a2a98903641060089b24e2de48d84d925be5629"
+    "054779480a7c8f4cd4a1d16cebd67455fe141529ac242f57cec81039031d9188"
 )
 
 
@@ -235,8 +235,9 @@ def test_an_official_request_traverses_http_sqs_worker_postgres_and_the_object_s
         id=run_id,
     )
     assert [item["et_year_month"] for item in monthly] == ["2024-01"]
-    # 20 one-minute bars -> 20 evaluation instants; exactly one of them decided.
-    assert monthly[0]["evaluation_count"] == len(CLOSES)
+    # RSI_14 needs 15 prior closes, so only bars 15..19 are executable
+    # evaluation instants; exactly one of those five instants decided.
+    assert monthly[0]["evaluation_count"] == len(CLOSES) - 15
     assert monthly[0]["triggered_count"] == 1
     assert monthly[0]["data_gap_count"] == 0
     assert monthly[0]["trade_event_count"] == 2  # the accepted order and its fill
@@ -666,7 +667,7 @@ def test_a_dataset_too_short_for_the_warmup_fails_the_run_and_dead_letters_the_j
     handled = stack.worker.poll_once()
 
     assert [item.disposition for item in handled] == [MessageDisposition.DEAD_LETTERED]
-    assert [item.reason_code for item in handled] == ["REQUIRED_DATA_UNAVAILABLE"]
+    assert [item.reason_code for item in handled] == ["REQUIRED_INPUT_UNAVAILABLE"]
     assert stack.visible(stack.dead_letter_queue) == 1
 
     row = sql_one(
@@ -675,7 +676,7 @@ def test_a_dataset_too_short_for_the_warmup_fails_the_run_and_dead_letters_the_j
         id=run_id,
     )
     assert row["status"] == "FAILED"
-    assert row["failure_code"] == "REQUIRED_DATA_UNAVAILABLE"
+    assert row["failure_code"] == "REQUIRED_INPUT_UNAVAILABLE"
     assert sql_all(
         admin_engine, "SELECT run_id FROM backtest.performance_summaries WHERE run_id = :id", id=run_id
     ) == []
