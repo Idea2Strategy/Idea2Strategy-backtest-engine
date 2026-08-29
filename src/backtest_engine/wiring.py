@@ -1634,6 +1634,46 @@ def segmented_dataset_coverage(
     return start, end
 
 
+def _segmented_coverage_by_resolution(
+    manifests_by_resolution: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> dict[str, tuple[datetime, datetime]]:
+    """Join shared segments onto every explicit instrument scope before intersecting."""
+    coverage: dict[str, tuple[datetime, datetime]] = {}
+    for resolution, manifests in manifests_by_resolution.items():
+        manifests_by_scope: dict[str, list[Mapping[str, Any]]] = {}
+        for manifest in manifests:
+            manifests_by_scope.setdefault(
+                str(manifest.get("instrument_id") or "*"), []
+            ).append(manifest)
+        shared = manifests_by_scope.pop("*", [])
+
+        shared_by_scope = {
+            scope: [
+                manifest
+                for manifest in shared
+                if any(
+                    str(obj.get("shard_key")) == scope
+                    for obj in manifest.get("objects", ())
+                )
+            ]
+            for scope in manifests_by_scope
+        }
+
+        scoped_windows = (
+            [
+                segmented_dataset_coverage([*scoped, *shared_by_scope[scope]])
+                for scope, scoped in manifests_by_scope.items()
+            ]
+            if manifests_by_scope
+            else [segmented_dataset_coverage(shared)]
+        )
+        coverage[resolution] = (
+            max(window[0] for window in scoped_windows),
+            min(window[1] for window in scoped_windows),
+        )
+    return coverage
+
+
 def _dataset_cover_contains_evaluation(
     schedule: OfficialSessionSchedule,
     coverage_start: datetime,
@@ -2061,19 +2101,9 @@ class OrchestratorJobHandler:
                     reason_code="REQUIRED_INPUT_UNAVAILABLE",
                 )
             manifests_by_resolution.setdefault(resolution, []).append(resolved)
-        coverage_by_resolution: dict[str, tuple[datetime, datetime]] = {}
-        for resolution, manifests in manifests_by_resolution.items():
-            manifests_by_scope: dict[str, list[Mapping[str, Any]]] = {}
-            for resolved in manifests:
-                manifests_by_scope.setdefault(str(resolved.get("instrument_id") or "*"), []).append(resolved)
-            scoped_windows = [
-                segmented_dataset_coverage(scoped)
-                for scoped in manifests_by_scope.values()
-            ]
-            coverage_by_resolution[resolution] = (
-                max(window[0] for window in scoped_windows),
-                min(window[1] for window in scoped_windows),
-            )
+        coverage_by_resolution = _segmented_coverage_by_resolution(
+            manifests_by_resolution
+        )
         position_only_fallback: str | None = None
         if plan.reference_series[1] == "$DATASET":
             primary_pins = [

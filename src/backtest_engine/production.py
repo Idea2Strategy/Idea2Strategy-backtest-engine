@@ -453,7 +453,7 @@ class S3VersionedFeatureObjectReader:
         self._client = client
 
     def read_version(self, provider: str, bucket: str, key: str, version_id: str) -> bytes:
-        if provider != "S3_COMPATIBLE":
+        if provider not in {"S3", "S3_COMPATIBLE"}:
             raise ConfigurationError(f"S3 feature reader cannot read storage provider {provider!r}")
         response = self._client.get_object(
             Bucket=bucket,

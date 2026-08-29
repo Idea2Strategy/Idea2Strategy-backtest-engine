@@ -453,7 +453,10 @@ def test_feature_materialization_source_returns_definition_manifest_and_object_e
     assert source._engine.connection.params == {"materialization_id": materialization_id}  # type: ignore[attr-defined]
 
 
-def test_feature_object_reader_requests_the_exact_s3_version_and_closes_the_body() -> None:
+@pytest.mark.parametrize("provider", ["S3", "S3_COMPATIBLE"])
+def test_feature_object_reader_requests_the_exact_s3_version_and_closes_the_body(
+    provider: str,
+) -> None:
     class Body:
         closed = False
 
@@ -474,9 +477,7 @@ def test_feature_object_reader_requests_the_exact_s3_version_and_closes_the_body
     s3 = S3()
     reader = S3VersionedFeatureObjectReader(s3)
 
-    body = reader.read_version(
-        "S3_COMPATIBLE", "feature-bucket", "features/rsi.parquet", "version-7"
-    )
+    body = reader.read_version(provider, "feature-bucket", "features/rsi.parquet", "version-7")
 
     assert body == b"versioned-feature-bytes"
     assert s3.kwargs == {

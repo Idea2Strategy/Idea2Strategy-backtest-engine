@@ -72,6 +72,7 @@ from backtest_engine.wiring import (
     _metric_percent,
     _required_feature_through,
     _resolve_position_only_flow_clocks,
+    _segmented_coverage_by_resolution,
     dataset_coverage,
     evaluation_window,
     segmented_dataset_coverage,
@@ -696,6 +697,64 @@ def test_adjacent_manifests_of_the_same_resolution_form_one_cover() -> None:
         datetime(2024, 1, 1, tzinfo=UTC),
         datetime(2026, 1, 1, tzinfo=UTC),
     )
+
+
+def test_shared_tail_segment_extends_every_instrument_scope() -> None:
+    scoped_a = dataset_manifest("1" * 64, row_count=1, coverage_end=FIRST_BAR_START + BAR)
+    scoped_b = dataset_manifest("2" * 64, row_count=1, coverage_end=FIRST_BAR_START + BAR)
+    shared_tail = dataset_manifest("3" * 64, row_count=1, coverage_end=FIRST_BAR_START + BAR)
+    for manifest in (scoped_a, scoped_b, shared_tail):
+        manifest["resolution"] = "4h"
+    scoped_a["instrument_id"] = "00000000-0000-4000-8000-000000000001"
+    scoped_b["instrument_id"] = "00000000-0000-4000-8000-000000000002"
+    shared_tail["instrument_id"] = None
+    shared_tail["objects"][0]["shard_key"] = scoped_a["instrument_id"]
+    second_shared_object = copy.deepcopy(shared_tail["objects"][0])
+    second_shared_object["shard_key"] = scoped_b["instrument_id"]
+    shared_tail["objects"].append(second_shared_object)
+    for scoped in (scoped_a, scoped_b):
+        scoped["objects"][0]["period_start"] = "2016-01-01T00:00:00Z"
+        scoped["objects"][0]["period_end"] = "2026-01-01T00:00:00Z"
+    for obj in shared_tail["objects"]:
+        obj["period_start"] = "2026-01-01T00:00:00Z"
+        obj["period_end"] = "2026-07-30T00:00:00Z"
+
+    assert _segmented_coverage_by_resolution({
+        "4h": [scoped_a, scoped_b, shared_tail]
+    }) == {
+        "4h": (
+            datetime(2016, 1, 1, tzinfo=UTC),
+            datetime(2026, 7, 30, tzinfo=UTC),
+        )
+    }
+
+
+def test_composite_tail_only_extends_instruments_proven_by_its_objects() -> None:
+    scoped_a = dataset_manifest("1" * 64, row_count=1, coverage_end=FIRST_BAR_START + BAR)
+    scoped_b = dataset_manifest("2" * 64, row_count=1, coverage_end=FIRST_BAR_START + BAR)
+    shared_tail = dataset_manifest("3" * 64, row_count=1, coverage_end=FIRST_BAR_START + BAR)
+    for manifest in (scoped_a, scoped_b, shared_tail):
+        manifest["resolution"] = "4h"
+    instrument_a = "00000000-0000-4000-8000-000000000001"
+    instrument_b = "00000000-0000-4000-8000-000000000002"
+    scoped_a["instrument_id"] = instrument_a
+    scoped_b["instrument_id"] = instrument_b
+    shared_tail["instrument_id"] = None
+    shared_tail["objects"][0]["shard_key"] = instrument_a
+    for scoped in (scoped_a, scoped_b):
+        scoped["objects"][0]["period_start"] = "2016-01-01T00:00:00Z"
+        scoped["objects"][0]["period_end"] = "2026-01-01T00:00:00Z"
+    shared_tail["objects"][0]["period_start"] = "2026-01-01T00:00:00Z"
+    shared_tail["objects"][0]["period_end"] = "2026-07-30T00:00:00Z"
+
+    assert _segmented_coverage_by_resolution({
+        "4h": [scoped_a, scoped_b, shared_tail]
+    }) == {
+        "4h": (
+            datetime(2016, 1, 1, tzinfo=UTC),
+            datetime(2026, 1, 1, tzinfo=UTC),
+        )
+    }
 
 
 def test_position_only_flow_inherits_its_own_instruments_clock_in_a_mixed_resolution_plan() -> None:
