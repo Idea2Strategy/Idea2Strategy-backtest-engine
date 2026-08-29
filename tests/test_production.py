@@ -61,6 +61,16 @@ def test_worker_wall_clock_advances_from_monotonic_elapsed_time() -> None:
     assert clock() == anchor.replace(second=4)
 
 
+def test_worker_wall_clock_observes_forward_wall_jump_after_host_resume_without_regressing() -> None:
+    anchor = datetime(2026, 8, 25, 13, 0, tzinfo=UTC)
+    wall_instants = iter((anchor, anchor.replace(hour=16), anchor.replace(hour=12)))
+    ticks = iter((100.0, 101.0, 102.0))
+    clock = MonotonicUtcClock(lambda: next(wall_instants), lambda: next(ticks))
+
+    assert clock() == anchor.replace(hour=16)
+    assert clock() == anchor.replace(hour=16)
+
+
 class _HttpResultResponse:
     status = 200
 

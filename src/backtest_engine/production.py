@@ -69,14 +69,18 @@ class MonotonicUtcClock:
         monotonic_clock: Callable[[], float] | None = None,
     ) -> None:
         source = wall_clock or (lambda: datetime.now(UTC))
+        self._wall_clock = source
         self._monotonic = monotonic_clock or monotonic
         self._anchor = source()
         self._started = self._monotonic()
         self._elapsed = 0.0
+        self._last = self._anchor
 
     def __call__(self) -> datetime:
         self._elapsed = max(self._monotonic() - self._started, self._elapsed)
-        return self._anchor + timedelta(seconds=self._elapsed)
+        monotonic_instant = self._anchor + timedelta(seconds=self._elapsed)
+        self._last = max(self._last, monotonic_instant, self._wall_clock())
+        return self._last
 
 
 def _required(environ: Mapping[str, str], name: str) -> str:

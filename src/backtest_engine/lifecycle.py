@@ -1232,7 +1232,7 @@ def _parse_timestamp(value: str) -> datetime:
 
 
 def _format_timestamp(value: datetime) -> str:
-    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _et_date(moment: datetime, policy: ExecutionPolicy) -> date:

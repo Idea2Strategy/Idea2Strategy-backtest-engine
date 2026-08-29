@@ -276,7 +276,7 @@ class JobNotSatisfiable(WiringError):
 
 def _utc_text(value: datetime) -> str:
     """The ``utcTimestamp`` form every `backtest.v1` field is validated against."""
-    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _prefixed(digest: str) -> str:

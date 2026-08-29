@@ -395,6 +395,13 @@ class RunRepository(_Repository):
         }:
             terminal_at = values.get("completed_at") or values.get("cancelled_at")
             if terminal_at is not None:
+                current = self.get(run_id)
+                lower_bound = current.started_at or current.queued_at
+                if terminal_at < lower_bound:
+                    raise ValueError(
+                        f"terminal timestamp {terminal_at.isoformat()} precedes "
+                        f"run start {lower_bound.isoformat()}"
+                    )
                 values.setdefault(
                     "deleted_at",
                     case(

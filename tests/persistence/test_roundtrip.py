@@ -314,6 +314,19 @@ def test_lifecycle_transitions_use_the_canonical_completed_label(
     assert completed.result_hash == "c" * 64
 
 
+def test_terminal_timestamp_cannot_precede_the_run_start(
+    persistence: BacktestPersistence,
+) -> None:
+    run = make_run(idempotency_key="ROUNDTRIP:terminal-time-order")
+    started = datetime(2026, 3, 2, 14, 0, 1, 500000, tzinfo=UTC)
+
+    with persistence.unit_of_work() as uow:
+        uow.runs.accept(run)
+        uow.runs.mark_running(run.id, started)
+        with pytest.raises(ValueError, match="terminal timestamp"):
+            uow.runs.mark_completed(run.id, started.replace(microsecond=0), "c" * 64)
+
+
 def test_attempt_completion_records_the_operations_work_status(
     persistence: BacktestPersistence,
 ) -> None:
