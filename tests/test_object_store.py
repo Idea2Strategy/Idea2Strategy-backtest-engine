@@ -618,6 +618,23 @@ def test_s3_rejects_invalid_construction() -> None:
         S3ObjectStore("bucket", client=_FakeS3(), retry_delay_seconds=-1)
 
 
+def test_default_s3_client_pool_supports_parallel_immutable_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    import boto3
+
+    captured: dict[str, Any] = {}
+
+    def client(service: str, **kwargs: Any) -> _FakeS3:
+        captured.update(service=service, **kwargs)
+        return _FakeS3()
+
+    monkeypatch.setattr(boto3, "client", client)
+
+    S3ObjectStore("bucket", endpoint_url="http://minio:9000")
+
+    assert captured["service"] == "s3"
+    assert captured["config"].max_pool_connections == 64
+
+
 def test_s3_adapter_also_rejects_a_traversing_key() -> None:
     store = S3ObjectStore("bucket", client=_FakeS3(), sleep=_no_sleep)
 

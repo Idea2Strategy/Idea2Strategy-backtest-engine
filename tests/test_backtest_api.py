@@ -379,6 +379,56 @@ def test_production_api_refuses_to_create_provider_owned_runs(
     assert "Backend provider transaction" in response.json()["detail"]
 
 
+def test_strategy_snapshot_returns_the_immutable_launch_document_pinned_by_the_run(
+    harness: Harness,
+    official_request: dict[str, Any],
+) -> None:
+    _accept(harness, official_request)
+    semantic = {
+        "schemaVersion": "basic-launch-snapshot.v1",
+        "mode": "BASIC",
+        "compiledPlan": {"flows": [{"key": "buy-aapl", "steps": []}]},
+    }
+    presentation = {
+        "schemaVersion": "basic-launch-snapshot.v1",
+        "name": "출시 당시 전략",
+        "strategyPresentation": {"sections": [{"id": "section-1"}]},
+    }
+
+    class SnapshotSource:
+        def get_owned(self, owner_account_id: UUID, run_id: UUID) -> dict[str, Any] | None:
+            assert owner_account_id == OWNER_ID
+            assert run_id == UUID(EXPECTED_RUN_ID)
+            return {
+                "botId": str(BOT_ID),
+                "snapshotSchemaVersion": "basic-launch-snapshot.v1",
+                "semanticSnapshot": semantic,
+                "presentationSnapshot": presentation,
+                "snapshotHash": SNAPSHOT_HASH,
+                "createdAt": "2026-07-31T12:00:00Z",
+            }
+
+    authenticator = StaticTokenAuthenticator({OWNER_TOKEN: Principal(account_id=OWNER_ID)})
+    app = create_app(harness.service, authenticator, strategy_snapshots=SnapshotSource())
+
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/v1/backtests/{EXPECTED_RUN_ID}/strategy-snapshot",
+            headers=harness.owner(),
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "backtestRunId": EXPECTED_RUN_ID,
+        "botId": str(BOT_ID),
+        "snapshotSchemaVersion": "basic-launch-snapshot.v1",
+        "semanticSnapshot": semantic,
+        "presentationSnapshot": presentation,
+        "snapshotHash": SNAPSHOT_HASH,
+        "createdAt": "2026-07-31T12:00:00Z",
+    }
+
+
 def _result(status: str, run_id: str = EXPECTED_RUN_ID, **detail: Any) -> dict[str, Any]:
     return build_backtest_result_event(
         status=status,
@@ -408,6 +458,7 @@ def _result(status: str, run_id: str = EXPECTED_RUN_ID, **detail: Any) -> dict[s
         ("GET", f"/api/v1/backtests/{EXPECTED_RUN_ID}/attempts"),
         ("GET", f"/api/v1/backtests/{EXPECTED_RUN_ID}/performance"),
         ("GET", f"/api/v1/backtests/{EXPECTED_RUN_ID}/performance-series"),
+        ("GET", f"/api/v1/backtests/{EXPECTED_RUN_ID}/strategy-snapshot"),
         ("GET", f"/api/v1/backtests/{EXPECTED_RUN_ID}/monthly-summaries"),
         ("GET", f"/api/v1/backtests/{EXPECTED_RUN_ID}/detail-manifests"),
         ("GET", f"/api/v1/backtests/{EXPECTED_RUN_ID}/monthly-trades?et_month=2026-07"),
@@ -1167,8 +1218,18 @@ def test_performance_series_is_served_from_official_equity_detail_rows(harness: 
     body = response.json()
     assert body["backtestRunId"] == EXPECTED_RUN_ID
     assert body["points"] == [
-        {"occurredAt": "2026-07-31T20:00:00Z", "equity": "100000.00000000"},
-        {"occurredAt": "2026-08-01T20:00:00Z", "equity": "100250.50000000"},
+        {
+            "occurredAt": "2026-07-31T20:00:00Z",
+            "equity": "100000.00000000",
+            "cash": None,
+            "positions": [],
+        },
+        {
+            "occurredAt": "2026-08-01T20:00:00Z",
+            "equity": "100250.50000000",
+            "cash": None,
+            "positions": [],
+        },
     ]
     assert body["resultHash"]
     assert body["sourceSetHash"]

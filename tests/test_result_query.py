@@ -206,6 +206,37 @@ def _artifacts(records: list[ResultRecord], built_at: str = "2025-11-02T04:10:00
             metric_id="equity",
             value=Decimal("10025.50000000"),
         ),
+        PerformancePoint(
+            point_id="00000000-0000-4000-8000-000000002932",
+            run_snapshot_id=_snapshot().snapshot_id,
+            occurred_at=_instant("2025-10-31T20:00:00Z"),
+            metric_id="cash",
+            value=Decimal("9897.80000000"),
+        ),
+        PerformancePoint(
+            point_id="00000000-0000-4000-8000-000000002933",
+            run_snapshot_id=_snapshot().snapshot_id,
+            occurred_at=_instant("2025-10-31T20:00:00Z"),
+            metric_id="position_quantity",
+            value=Decimal("1.00000000"),
+            instrument_id=INSTRUMENT_ID,
+        ),
+        PerformancePoint(
+            point_id="00000000-0000-4000-8000-000000002934",
+            run_snapshot_id=_snapshot().snapshot_id,
+            occurred_at=_instant("2025-10-31T20:00:00Z"),
+            metric_id="position_mark_price",
+            value=Decimal("127.70000000"),
+            instrument_id=INSTRUMENT_ID,
+        ),
+        PerformancePoint(
+            point_id="00000000-0000-4000-8000-000000002935",
+            run_snapshot_id=_snapshot().snapshot_id,
+            occurred_at=_instant("2025-10-31T20:00:00Z"),
+            metric_id="position_market_value",
+            value=Decimal("127.70000000"),
+            instrument_id=INSTRUMENT_ID,
+        ),
     ]
     details = DetailObjectBuilder().build(result, [], points, _instant(built_at))
     monthly = MonthlyJudgmentBuilder().build(
@@ -419,6 +450,18 @@ def test_performance_series_reads_the_official_equity_parquet_in_time_order() ->
         ("2025-10-30T20:00:00+00:00", Decimal("10000.00000000")),
         ("2025-10-31T20:00:00+00:00", Decimal("10025.50000000")),
     ]
+    assert series.points[0].cash is None
+    assert series.points[0].positions == ()
+    assert series.points[1].cash == Decimal("9897.80000000")
+    assert [
+        (
+            position.instrument_id,
+            position.quantity,
+            position.mark_price,
+            position.market_value,
+        )
+        for position in series.points[1].positions
+    ] == [(INSTRUMENT_ID, Decimal("1"), Decimal("127.7"), Decimal("127.7"))]
     assert series.result_hash == result.summary.result_hash
     assert series.source_set_hash == result.summary.source_set_hash
 

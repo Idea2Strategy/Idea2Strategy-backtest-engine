@@ -64,6 +64,18 @@ def test_legacy_manifest_may_be_one_segment_inside_a_longer_policy() -> None:
     require_compatible_execution_window(policy, _fixture(), XNYS_CALENDAR)
 
 
+def test_legacy_year_partition_may_extend_beyond_a_shorter_evaluation_policy() -> None:
+    policy = replace(
+        D17_EXECUTION_POLICY_FIXTURE,
+        version="development-official-backtest-2026-q3-v4",
+        period_start=datetime(2024, 1, 15, 5, tzinfo=timezone.utc),
+        period_end=datetime(2024, 1, 20, 5, tzinfo=timezone.utc),
+        market_data_schema_version="market-bars/1",
+    )
+
+    require_compatible_execution_window(policy, _fixture(), XNYS_CALENDAR)
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -178,6 +190,13 @@ def test_reader_consumes_one_legacy_segment_inside_a_longer_policy(tmp_path: Pat
     )
 
     assert ParquetMarketDataReader(tmp_path).read(manifest, policy).num_rows == 2
+
+    shorter_policy = replace(
+        policy,
+        period_start=datetime(2024, 1, 2, 5, tzinfo=timezone.utc),
+        period_end=datetime(2024, 1, 3, 5, tzinfo=timezone.utc),
+    )
+    assert ParquetMarketDataReader(tmp_path).read(manifest, shorter_policy).num_rows == 2
 
 
 def test_composite_legacy_manifest_hashes_and_validates_multiple_source_years() -> None:

@@ -118,7 +118,10 @@ FILL_INSTANT = FIRST_BAR_START + BAR * 16
 
 #: Wall-clock completion instant. Pinned because `result_hash` covers
 #: ``calculated_at``; the replay clock is 2024 market time and is untouched by it.
-COMPLETED_AT = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+# Keep deterministic publication time safely ahead of the real database clock.
+# PostgreSQL deliberately rejects terminal timestamps before a claimed run's
+# `started_at`; a near-future fixture silently expired when that date arrived.
+COMPLETED_AT = datetime(2099, 8, 1, 12, 0, tzinfo=UTC)
 
 
 _SCHEMA = pa.schema(

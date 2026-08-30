@@ -91,8 +91,13 @@ class S3ObjectStore:
             raise ValueError("retry_delay_seconds must not be negative")
         if client is None:
             import boto3
+            from botocore.config import Config
 
-            client = boto3.client("s3", endpoint_url=endpoint_url)
+            client = boto3.client(
+                "s3",
+                endpoint_url=endpoint_url,
+                config=Config(max_pool_connections=64),
+            )
         self.client = client
         self.bucket = bucket
         self.prefix = prefix.strip("/")

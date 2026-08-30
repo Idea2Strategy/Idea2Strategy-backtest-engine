@@ -82,6 +82,7 @@ import threading
 import uuid
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -137,6 +138,7 @@ __all__ = [
     "InMemoryBacktestResultQueryStore",
     "InputModelView",
     "PerformanceSeriesPoint",
+    "PerformanceSeriesPosition",
     "PerformanceSeriesView",
     "QueryIntegrityError",
     "QueryNotFound",
@@ -371,9 +373,19 @@ class InputModelView:
 
 
 @dataclass(frozen=True, slots=True)
+class PerformanceSeriesPosition:
+    instrument_id: str
+    quantity: Decimal
+    mark_price: Decimal
+    market_value: Decimal
+
+
+@dataclass(frozen=True, slots=True)
 class PerformanceSeriesPoint:
     occurred_at: datetime
     equity: Decimal
+    cash: Decimal | None = None
+    positions: tuple[PerformanceSeriesPosition, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,6 +454,12 @@ class BacktestResultQueryStore(Protocol):
     ) -> tuple[_QueryEntry, ...]: ...
 
     def get_owned_run(self, owner_account_id: str, run_id: str) -> RunProjection: ...
+
+    def get_owned_result(self, owner_account_id: str, run_id: str) -> _QueryEntry: ...
+
+    def get_owned_performance_series(
+        self, owner_account_id: str, run_id: str
+    ) -> _QueryEntry: ...
 
     def get_owned(self, owner_account_id: str, run_id: str) -> _QueryEntry: ...
 
@@ -520,6 +538,14 @@ class InMemoryBacktestResultQueryStore:
 
     def get_owned_run(self, owner_account_id: str, run_id: str) -> RunProjection:
         return self.get_owned(owner_account_id, run_id).run
+
+    def get_owned_result(self, owner_account_id: str, run_id: str) -> _QueryEntry:
+        return self.get_owned(owner_account_id, run_id)
+
+    def get_owned_performance_series(
+        self, owner_account_id: str, run_id: str
+    ) -> _QueryEntry:
+        return self.get_owned(owner_account_id, run_id)
 
     def get_owned(self, owner_account_id: str, run_id: str) -> _QueryEntry:
         owner_account_id = _uuid(owner_account_id, "owner_account_id")
@@ -636,6 +662,48 @@ class DurableBacktestResultQueryStore:
                 result=result,
                 details=details,
                 monthly=monthly,
+            )
+
+    def get_owned_result(self, owner_account_id: str, run_id: str) -> _QueryEntry:
+        """Read the immutable result JSON without loading weekly Parquet evidence."""
+
+        with self._read() as uow:
+            row = self._owned_run(uow, owner_account_id, run_id)
+            pin = self._require_pin(uow.pins.find(row.id), row)
+            if row.status.value != COMPLETED:
+                return _QueryEntry(run=self._projection(uow, row, pin))
+            performance = self._performance(uow, row)
+            result = self._load_result(uow, row, performance)
+            self._check_result_metadata_agrees(row, pin, result, performance, uow)
+            return _QueryEntry(
+                run=self._projection(uow, row, pin, result.manifest.result_manifest_id),
+                result=result,
+            )
+
+    def get_owned_performance_series(
+        self, owner_account_id: str, run_id: str
+    ) -> _QueryEntry:
+        """Read only the official calculation-series parts needed by the chart."""
+
+        with self._read() as uow:
+            row = self._owned_run(uow, owner_account_id, run_id)
+            pin = self._require_pin(uow.pins.find(row.id), row)
+            if row.status.value != COMPLETED:
+                return _QueryEntry(run=self._projection(uow, row, pin))
+            performance = self._performance(uow, row)
+            result = self._load_result(uow, row, performance)
+            details = self._load_details(
+                uow,
+                row,
+                result,
+                performance.calculated_at,
+                record_types=frozenset({DetailObjectKind.CALCULATION_SERIES}),
+            )
+            self._check_result_metadata_agrees(row, pin, result, performance, uow)
+            return _QueryEntry(
+                run=self._projection(uow, row, pin, result.manifest.result_manifest_id),
+                result=result,
+                details=details,
             )
 
     # -- reads -------------------------------------------------------------
@@ -866,8 +934,16 @@ class DurableBacktestResultQueryStore:
         row: RunRow,
         result: ResultSnapshot,
         created_at: datetime,
+        *,
+        record_types: frozenset[DetailObjectKind] | None = None,
     ) -> DetailObjectBundle:
         manifests: Sequence[DetailManifestRow] = uow.manifests.list_for_run(row.id)
+        if record_types is not None:
+            manifests = tuple(
+                manifest
+                for manifest in manifests
+                if DetailObjectKind(manifest.record_type) in record_types
+            )
         try:
             objects = {
                 stored.id: stored
@@ -880,10 +956,17 @@ class DurableBacktestResultQueryStore:
                 f"run {row.id} points at detail objects that are missing or not AVAILABLE: {exc}"
             ) from exc
 
-        parts: list[tuple[DetailObjectDescriptor, bytes]] = []
-        for manifest in manifests:
-            stored = objects[manifest.object_id]
-            parts.append((self._descriptor(manifest, stored), self._read_object(stored)))
+        descriptors = [
+            self._descriptor(manifest, objects[manifest.object_id]) for manifest in manifests
+        ]
+        stored_objects = [objects[manifest.object_id] for manifest in manifests]
+        worker_count = min(64, len(stored_objects))
+        if worker_count > 1:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                payloads = list(executor.map(self._read_object, stored_objects))
+        else:
+            payloads = [self._read_object(stored) for stored in stored_objects]
+        parts = list(zip(descriptors, payloads, strict=True))
         try:
             return reassemble_detail_bundle(
                 result_manifest_id=result.manifest.result_manifest_id,
@@ -992,6 +1075,25 @@ class DurableBacktestResultQueryStore:
         `publish_completed` asserts at write time are re-asserted here at read time.
         """
 
+        self._check_result_metadata_agrees(row, pin, result, performance, uow)
+        for summary in monthly:
+            if summary.run_snapshot_id != result.run_snapshot.snapshot_id:
+                raise QueryIntegrityError(
+                    f"monthly summary {summary.summary_id} names another run snapshot"
+                )
+            if summary.result_manifest_id != result.manifest.result_manifest_id:
+                raise QueryIntegrityError(
+                    f"monthly summary {summary.summary_id} names another result manifest"
+                )
+
+    def _check_result_metadata_agrees(
+        self,
+        row: RunRow,
+        pin: RunInputPinRow,
+        result: ResultSnapshot,
+        performance: PerformanceSummaryRow,
+        uow: Any,
+    ) -> None:
         if performance.metric_catalog_version != result.summary.metric_catalog_version:
             raise QueryIntegrityError(
                 f"run {row.id} performance summary was computed under "
@@ -1002,15 +1104,6 @@ class DurableBacktestResultQueryStore:
             raise QueryIntegrityError(f"run {row.id} performance source_set_hash does not match")
         if performance.input_hash != result.summary.input_hash:
             raise QueryIntegrityError(f"run {row.id} performance input_hash does not match")
-        for summary in monthly:
-            if summary.run_snapshot_id != result.run_snapshot.snapshot_id:
-                raise QueryIntegrityError(
-                    f"monthly summary {summary.summary_id} names another run snapshot"
-                )
-            if summary.result_manifest_id != result.manifest.result_manifest_id:
-                raise QueryIntegrityError(
-                    f"monthly summary {summary.summary_id} names another result manifest"
-                )
         if result.run_snapshot.input_bundle_fingerprint != pin.input_bundle_fingerprint.removeprefix("sha256:"):
             raise QueryIntegrityError(
                 f"run {row.id} pinned {pin.input_bundle_fingerprint} but the stored evidence was "
@@ -1083,7 +1176,7 @@ class BacktestResultQueryService:
         )
 
     def inputs_and_models(self, owner_account_id: str, run_id: str) -> InputModelView:
-        entry = self._store.get_owned(owner_account_id, run_id)
+        entry = self._store.get_owned_result(owner_account_id, run_id)
         inputs = entry.run.inputs
         snapshot = entry.result.run_snapshot if entry.result is not None else None
         return InputModelView(
@@ -1107,14 +1200,16 @@ class BacktestResultQueryService:
         )
 
     def performance(self, owner_account_id: str, run_id: str) -> PerformanceSummary:
-        entry = self._completed(owner_account_id, run_id)
+        entry = self._store.get_owned_result(owner_account_id, run_id)
+        self._require_completed_result(entry)
         assert entry.result is not None
         return entry.result.summary
 
     def performance_series(
         self, owner_account_id: str, run_id: str
     ) -> PerformanceSeriesView:
-        entry = self._completed(owner_account_id, run_id)
+        entry = self._store.get_owned_performance_series(owner_account_id, run_id)
+        self._require_completed_result(entry, require_details=True)
         assert entry.result is not None
         assert entry.details is not None
         points = _read_equity_series(entry.details)
@@ -1146,13 +1241,19 @@ class BacktestResultQueryService:
 
     def _completed(self, owner_account_id: str, run_id: str) -> _QueryEntry:
         entry = self._store.get_owned(owner_account_id, run_id)
+        self._require_completed_result(entry, require_details=True)
+        return entry
+
+    @staticmethod
+    def _require_completed_result(
+        entry: _QueryEntry, *, require_details: bool = False
+    ) -> None:
         if entry.run.status != COMPLETED:
             raise QueryNotReady(
                 f"backtest result is not available for status {entry.run.status}"
             )
-        if entry.result is None or entry.details is None:
+        if entry.result is None or (require_details and entry.details is None):
             raise QueryIntegrityError("completed run is missing immutable result artifacts")
-        return entry
 
 
 # --------------------------------------------------------------------------------
@@ -1289,13 +1390,54 @@ def _read_equity_series(details: DetailObjectBundle) -> tuple[PerformanceSeriesP
     instants = [row["occurred_at"] for row in equity_rows]
     if len(instants) != len(set(instants)):
         raise QueryIntegrityError("official equity series contains duplicate instants")
-    points = tuple(
-        PerformanceSeriesPoint(
-            occurred_at=row["occurred_at"],
-            equity=Decimal(str(row["value"])),
+    by_instant: dict[datetime, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_instant[row["occurred_at"]].append(row)
+    points_list: list[PerformanceSeriesPoint] = []
+    for equity_row in equity_rows:
+        occurred_at = equity_row["occurred_at"]
+        instant_rows = by_instant[occurred_at]
+        cash_rows = [row for row in instant_rows if row["metric_id"] == "cash"]
+        if len(cash_rows) > 1:
+            raise QueryIntegrityError("official performance series contains duplicate cash points")
+        cash = Decimal(str(cash_rows[0]["value"])) if cash_rows else None
+        per_instrument: dict[str, dict[str, Decimal]] = defaultdict(dict)
+        for row in instant_rows:
+            instrument_id = row.get("instrument_id")
+            metric_id = str(row["metric_id"])
+            if instrument_id is None or not metric_id.startswith("position_"):
+                continue
+            bucket = per_instrument[str(instrument_id)]
+            if metric_id in bucket:
+                raise QueryIntegrityError("official performance series contains duplicate position points")
+            bucket[metric_id] = Decimal(str(row["value"]))
+        positions: list[PerformanceSeriesPosition] = []
+        required = {"position_quantity", "position_mark_price", "position_market_value"}
+        for instrument_id, metrics in sorted(per_instrument.items()):
+            if set(metrics) != required:
+                raise QueryIntegrityError("official performance series contains an incomplete position point")
+            positions.append(
+                PerformanceSeriesPosition(
+                    instrument_id=instrument_id,
+                    quantity=metrics["position_quantity"],
+                    mark_price=metrics["position_mark_price"],
+                    market_value=metrics["position_market_value"],
+                )
+            )
+        equity = Decimal(str(equity_row["value"]))
+        if cash is not None and cash + sum(
+            (position.market_value for position in positions), Decimal("0")
+        ) != equity:
+            raise QueryIntegrityError("official performance positions do not reconcile to equity")
+        points_list.append(
+            PerformanceSeriesPoint(
+                occurred_at=occurred_at,
+                equity=equity,
+                cash=cash,
+                positions=tuple(positions),
+            )
         )
-        for row in equity_rows
-    )
+    points = tuple(points_list)
     if any(point.equity < 0 for point in points):
         raise QueryIntegrityError("official equity series contains negative equity")
     return points

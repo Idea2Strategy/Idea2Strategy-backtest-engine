@@ -143,6 +143,14 @@ class Authenticator(Protocol):
     def authenticate(self, token: str) -> Principal | None: ...
 
 
+class StrategySnapshotSource(Protocol):
+    """Reads the immutable bot launch snapshot pinned by an owned run."""
+
+    def get_owned(
+        self, owner_account_id: UUID, run_id: UUID
+    ) -> Mapping[str, Any] | None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class StaticTokenAuthenticator:
     """Explicit token to principal map.
@@ -292,7 +300,20 @@ def _performance_series_payload(view: PerformanceSeriesView) -> dict[str, Any]:
     return {
         "backtestRunId": view.run_id,
         "points": [
-            {"occurredAt": _iso(point.occurred_at), "equity": _amount(point.equity)}
+            {
+                "occurredAt": _iso(point.occurred_at),
+                "equity": _amount(point.equity),
+                "cash": _amount(point.cash),
+                "positions": [
+                    {
+                        "instrumentId": position.instrument_id,
+                        "quantity": _amount(position.quantity),
+                        "markPrice": _amount(position.mark_price),
+                        "marketValue": _amount(position.market_value),
+                    }
+                    for position in point.positions
+                ],
+            }
             for point in view.points
         ],
         "resultHash": view.result_hash,
@@ -403,6 +424,7 @@ def create_app(
     results: BacktestResultQueryService | None = None,
     *,
     allow_test_provider_creation: bool = False,
+    strategy_snapshots: StrategySnapshotSource | None = None,
 ) -> FastAPI:
     """Build the `/api/v1` application.
 
@@ -575,6 +597,28 @@ def create_app(
         _owned(lifecycle, run_id, principal)
         attempts = lifecycle.attempts_of(run_id, owner_account_id=principal.account_id)
         return {"items": [_attempt_payload(row) for row in attempts]}
+
+    @app.get(
+        f"{API_PREFIX}/backtests/{{run_id}}/strategy-snapshot", tags=["backtests"]
+    )
+    def get_strategy_snapshot(
+        run_id: UUID, principal: Principal = Auth
+    ) -> dict[str, Any]:
+        """The exact immutable strategy and layout used by this run."""
+
+        _owned(lifecycle, run_id, principal)
+        if strategy_snapshots is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="StrategySnapshotSource is not configured",
+            )
+        snapshot = strategy_snapshots.get_owned(principal.account_id, run_id)
+        if snapshot is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"backtest run {run_id} has no matching immutable launch snapshot",
+            )
+        return {"backtestRunId": str(run_id), **dict(snapshot)}
 
     @app.get(f"{API_PREFIX}/backtests/{{run_id}}/performance", tags=["backtests"])
     def get_performance(run_id: UUID, principal: Principal = Auth) -> dict[str, Any]:

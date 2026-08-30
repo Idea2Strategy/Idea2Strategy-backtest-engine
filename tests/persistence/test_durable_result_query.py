@@ -19,6 +19,8 @@ which is storage-adapter agnostic by construction.
 
 from __future__ import annotations
 
+import threading
+import time
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -32,6 +34,7 @@ from backtest_engine.detail_object_manifest import (
     DetailObjectBuilder,
     DetailObjectKind,
     DetailObjectPublisher,
+    PerformancePoint,
 )
 from backtest_engine.execution_model import OrderStatus
 from backtest_engine.monthly_judgment import EtMonth, MonthlyJudgmentBuilder
@@ -220,7 +223,23 @@ class Published:
     def publish(self) -> None:
         snapshot = _snapshot(self.run_id)
         self.result = ResultSnapshotBuilder().build(snapshot, _records(self.run_id), COMPLETED_AT)
-        self.details = DetailObjectBuilder().build(self.result, [], [], COMPLETED_AT)
+        points = [
+            PerformancePoint(
+                point_id="00000000-0000-4000-8000-0000000041b1",
+                run_snapshot_id=snapshot.snapshot_id,
+                occurred_at=_instant("2025-10-31T20:00:00Z"),
+                metric_id="equity",
+                value=Decimal("100000.00000000"),
+            ),
+            PerformancePoint(
+                point_id="00000000-0000-4000-8000-0000000041b2",
+                run_snapshot_id=snapshot.snapshot_id,
+                occurred_at=_instant("2025-11-01T20:00:00Z"),
+                metric_id="equity",
+                value=Decimal("100125.00000000"),
+            ),
+        ]
+        self.details = DetailObjectBuilder().build(self.result, [], points, COMPLETED_AT)
         self.monthly = MonthlyJudgmentBuilder().build(
             snapshot.snapshot_id, self.result.manifest.result_manifest_id, [], self.result.records
         )
@@ -450,7 +469,7 @@ def test_an_unavailable_run_reports_its_reason_from_runs_failure_code(
     service: BacktestResultQueryService, persistence: BacktestPersistence, store: LocalObjectStore
 ) -> None:
     run = Published(persistence, store)
-    run.accept()
+    run.accept(queued_at=datetime(2025, 10, 31, 12, 0, tzinfo=UTC))
     with persistence.unit_of_work() as uow:
         uow.runs.mark_unavailable(run.run_id, datetime(2025, 11, 1, 0, 0, tzinfo=UTC), "REQUIRED_DATA_UNAVAILABLE")
 
@@ -574,3 +593,84 @@ def test_a_run_store_reads_nothing_it_cannot_verify(
     assert entry.result is not None
     assert entry.details is not None
     assert entry.run.result_manifest_id == published.result.manifest.result_manifest_id
+
+
+def test_completed_result_detail_objects_are_read_concurrently(
+    persistence: BacktestPersistence, store: LocalObjectStore, published: Published
+) -> None:
+    """A decade-long run has thousands of immutable parts; serial object reads stall the UI."""
+
+    class ConcurrentReadProbe:
+        storage_provider = store.storage_provider
+        bucket_name = store.bucket_name
+
+        def __init__(self) -> None:
+            self.active_reads = 0
+            self.max_concurrent_reads = 0
+            self.lock = threading.Lock()
+
+        def open(self, object_key: str):
+            if object_key.endswith(".parquet"):
+                with self.lock:
+                    self.active_reads += 1
+                    self.max_concurrent_reads = max(
+                        self.max_concurrent_reads, self.active_reads
+                    )
+                time.sleep(0.05)
+                with self.lock:
+                    self.active_reads -= 1
+            return store.open(object_key)
+
+    probe = ConcurrentReadProbe()
+    service = build_result_query_service(persistence, probe)  # type: ignore[arg-type]
+
+    service.monthly_trades(str(ACCOUNT_ID), str(published.run_id), EtMonth(2025, 10))
+
+    assert probe.max_concurrent_reads >= 2
+
+
+def test_performance_series_reads_only_calculation_series_parts(
+    persistence: BacktestPersistence, store: LocalObjectStore, published: Published
+) -> None:
+    class RecordingStore:
+        storage_provider = store.storage_provider
+        bucket_name = store.bucket_name
+
+        def __init__(self) -> None:
+            self.keys: list[str] = []
+
+        def open(self, object_key: str):
+            self.keys.append(object_key)
+            return store.open(object_key)
+
+    recording = RecordingStore()
+    service = build_result_query_service(persistence, recording)  # type: ignore[arg-type]
+
+    service.performance_series(str(ACCOUNT_ID), str(published.run_id))
+
+    parquet_keys = [key for key in recording.keys if key.endswith(".parquet")]
+    assert parquet_keys
+    assert all("/CALCULATION_SERIES/" in key for key in parquet_keys)
+
+
+def test_input_models_do_not_read_weekly_detail_parts(
+    persistence: BacktestPersistence, store: LocalObjectStore, published: Published
+) -> None:
+    class RecordingStore:
+        storage_provider = store.storage_provider
+        bucket_name = store.bucket_name
+
+        def __init__(self) -> None:
+            self.keys: list[str] = []
+
+        def open(self, object_key: str):
+            self.keys.append(object_key)
+            return store.open(object_key)
+
+    recording = RecordingStore()
+    service = build_result_query_service(persistence, recording)  # type: ignore[arg-type]
+
+    models = service.inputs_and_models(str(ACCOUNT_ID), str(published.run_id))
+
+    assert models.calculation_model_version == "calculation-v9"
+    assert not [key for key in recording.keys if key.endswith(".parquet")]

@@ -24,6 +24,7 @@ from backtest_engine.production import (
     PostgresFeatureMaterializationSource,
     PostgresOwnerDirectory,
     PostgresQueuedRunSource,
+    PostgresStrategySnapshotSource,
     S3ParquetMarketDataReader,
     S3VersionedFeatureObjectReader,
     SqsExecutionJobQueue,
@@ -278,12 +279,42 @@ def test_compiled_plan_source_returns_the_immutable_launch_contract_document() -
     assert source.by_checksum(plan["planChecksum"]) == plan
 
 
+def test_strategy_snapshot_source_returns_only_the_hash_pinned_by_the_owned_run() -> None:
+    created_at = datetime(2026, 7, 31, 12, 0, tzinfo=UTC)
+    engine = _Engine(
+        {
+            "bot_id": BOT_ID,
+            "snapshot_schema_version": "basic-launch-snapshot.v1",
+            "semantic_snapshot": {"mode": "BASIC"},
+            "presentation_snapshot": {"name": "Frozen"},
+            "snapshot_hash": "a" * 64,
+            "created_at": created_at,
+        }
+    )
+    source = PostgresStrategySnapshotSource(engine)  # type: ignore[arg-type]
+    run_id = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+
+    assert source.get_owned(ACCOUNT_ID, run_id) == {
+        "botId": str(BOT_ID),
+        "snapshotSchemaVersion": "basic-launch-snapshot.v1",
+        "semanticSnapshot": {"mode": "BASIC"},
+        "presentationSnapshot": {"name": "Frozen"},
+        "snapshotHash": "sha256:" + "a" * 64,
+        "createdAt": "2026-07-31T12:00:00Z",
+    }
+    assert engine.connection.params == {
+        "run_id": run_id,
+        "owner_account_id": ACCOUNT_ID,
+    }
+
+
 def _dataset_manifest_source(
     manifest_id: UUID,
     object_keys: list[str],
     *,
     object_overrides: dict[str, object] | None = None,
     is_composite: bool = False,
+    source_instrument_ids: tuple[UUID, ...] = (),
 ) -> PostgresDatasetManifestSource:
     manifest = {
         "id": manifest_id,
@@ -299,6 +330,7 @@ def _dataset_manifest_source(
         "data_layer": "ADJUSTED",
         "feed_resolution": "30m",
         "is_composite": is_composite,
+        "source_instrument_ids": list(source_instrument_ids),
     }
     objects = [
         {
@@ -388,6 +420,10 @@ def test_dataset_manifest_source_accepts_explicit_composite_legacy_lineage() -> 
         UUID("11111111-1111-4111-8111-111111111111"),
         UUID("22222222-2222-4222-8222-222222222222"),
     )
+    source_instruments = (
+        UUID("aaaaaaaa-0000-4000-8000-000000000001"),
+        UUID("aaaaaaaa-0000-4000-8000-000000000002"),
+    )
     object_keys = [
         "historical/provider=alpaca/feed=sip/adjustment=all/session=regular/"
         f"resolution=30m/revision=00000001/year={2016 + index}/shard=00-of-01/"
@@ -399,11 +435,13 @@ def test_dataset_manifest_source_accepts_explicit_composite_legacy_lineage() -> 
         composite_id,
         object_keys,
         is_composite=True,
+        source_instrument_ids=source_instruments,
     ).by_id(composite_id)
 
     assert resolved is not None
     assert resolved["dataset_id"] == str(composite_id)
     assert resolved["composite"] is True
+    assert resolved["source_instrument_ids"] == [str(item) for item in source_instruments]
 
 
 @pytest.mark.parametrize(

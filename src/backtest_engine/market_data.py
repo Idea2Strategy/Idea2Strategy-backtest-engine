@@ -36,7 +36,7 @@ from .execution_policy import ExecutionPolicy
 from .legacy_market_data import (
     LEGACY_MARKET_SCHEMA_ID,
     is_legacy_market_loader_manifest,
-    legacy_period_within_policy,
+    legacy_period_overlaps_policy,
     validate_legacy_market_loader_manifest,
 )
 from .object_store.paths import long_path
@@ -318,7 +318,7 @@ class ParquetMarketDataReader:
         if manifest.get("schema_id") != policy.market_data_schema_version:
             raise MarketDataValidationError("manifest schema_id does not match policy")
         if legacy:
-            if not legacy_period_within_policy(
+            if not legacy_period_overlaps_policy(
                 manifest,
                 policy.period_start,
                 policy.period_end,
@@ -328,7 +328,7 @@ class ParquetMarketDataReader:
         else:
             manifest_start = _utc_timestamp(manifest.get("period_start"), "manifest.period_start")
             manifest_end = _utc_timestamp(manifest.get("period_end"), "manifest.period_end")
-            if not policy.period_start <= manifest_start < manifest_end <= policy.period_end:
+            if not (manifest_start < policy.period_end and manifest_end > policy.period_start):
                 raise MarketDataValidationError("manifest period is outside policy")
 
     def iter_batches(
@@ -402,6 +402,22 @@ class ParquetMarketDataReader:
                     batch_size=self._batch_size,
                     row_groups=candidate_row_groups,
                 ):
+                    timestamp_column = batch.column(
+                        batch.schema.get_field_index("bar_start_at")
+                    )
+                    period_mask = pc.and_(
+                        pc.greater_equal(
+                            timestamp_column,
+                            pa.scalar(policy.period_start, type=timestamp_column.type),
+                        ),
+                        pc.less(
+                            timestamp_column,
+                            pa.scalar(policy.period_end, type=timestamp_column.type),
+                        ),
+                    )
+                    batch = batch.filter(period_mask)
+                    if batch.num_rows == 0:
+                        continue
                     if requested_values is not None:
                         mask = pc.is_in(
                             batch.column(batch.schema.get_field_index("instrument_id")),

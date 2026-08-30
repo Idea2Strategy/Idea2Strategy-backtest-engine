@@ -120,7 +120,7 @@ from .feature_outputs import (
 )
 from .legacy_market_data import (
     is_legacy_market_loader_manifest,
-    legacy_period_within_policy,
+    legacy_period_overlaps_policy,
     validate_legacy_market_loader_manifest,
 )
 from .lifecycle import BacktestLifecycleService, PersistenceRunGateway, SqsBacktestJobQueue
@@ -153,6 +153,7 @@ from .orchestrator import (
 )
 from .performance.equity_curve import (
     OPENING_INSTANT_LEAD,
+    EquityCurve,
     MarkPrice,
     ValuationBasis,
     ValuationInstant,
@@ -1238,6 +1239,35 @@ class JobBinding:
         return self.envelope.dataset_manifest_id
 
 
+def _performance_points(
+    run_snapshot_id: str, equity_curve: EquityCurve
+) -> tuple[PerformancePoint, ...]:
+    points: list[PerformancePoint] = []
+    for point in equity_curve.points:
+        values = [("equity", None, point.equity), ("cash", None, point.cash)]
+        for holding in point.holdings:
+            values.extend(
+                (
+                    ("position_market_value", holding.instrument_id, holding.market_value),
+                    ("position_quantity", holding.instrument_id, holding.quantity),
+                    ("position_mark_price", holding.instrument_id, holding.mark_price),
+                )
+            )
+        for metric_id, instrument_id, value in values:
+            identity = f"{run_snapshot_id}|{metric_id}|{instrument_id or ''}|{point.as_of.isoformat()}"
+            points.append(
+                PerformancePoint(
+                    point_id=str(uuid.uuid5(_POINT_ID_NAMESPACE, identity)),
+                    run_snapshot_id=run_snapshot_id,
+                    occurred_at=point.as_of,
+                    metric_id=metric_id,
+                    value=value,
+                    instrument_id=instrument_id,
+                )
+            )
+    return tuple(points)
+
+
 class DurableResultPublisher:
     """Writes one completed run's evidence to the object store and PostgreSQL.
 
@@ -1326,21 +1356,7 @@ class DurableResultPublisher:
         ledger = tuple(
             ReplayLedgerDetail(snapshot.snapshot_id, transaction) for transaction in self._engine.ledger_transactions
         )
-        points = tuple(
-            PerformancePoint(
-                point_id=str(
-                    uuid.uuid5(
-                        _POINT_ID_NAMESPACE,
-                        f"{snapshot.snapshot_id}|equity|{point.as_of.isoformat()}",
-                    )
-                ),
-                run_snapshot_id=snapshot.snapshot_id,
-                occurred_at=point.as_of,
-                metric_id="equity",
-                value=point.equity,
-            )
-            for point in result.summary.equity_curve.points
-        )
+        points = _performance_points(snapshot.snapshot_id, result.summary.equity_curve)
         bundle = DetailObjectBuilder().build(result, ledger, points, request.completed_at)
 
         self._publish_result_object(result, request.completed_at)
@@ -1651,10 +1667,11 @@ def _segmented_coverage_by_resolution(
             scope: [
                 manifest
                 for manifest in shared
-                if any(
-                    str(obj.get("shard_key")) == scope
-                    for obj in manifest.get("objects", ())
-                )
+                if not manifest.get("source_instrument_ids")
+                or scope in {
+                    str(instrument_id)
+                    for instrument_id in manifest.get("source_instrument_ids", ())
+                }
             ]
             for scope in manifests_by_scope
         }
@@ -1789,7 +1806,7 @@ def require_compatible_execution_window(
     if legacy:
         try:
             validate_legacy_market_loader_manifest(manifest)
-            period_matches = legacy_period_within_policy(
+            period_matches = legacy_period_overlaps_policy(
                 manifest,
                 policy.period_start,
                 policy.period_end,
@@ -1799,9 +1816,7 @@ def require_compatible_execution_window(
             problems.append(f"legacy dataset manifest is invalid: {exc}")
             period_matches = False
     else:
-        period_matches = (
-            policy.period_start <= manifest_start < manifest_end <= policy.period_end
-        )
+        period_matches = manifest_start < policy.period_end and manifest_end > policy.period_start
     if not period_matches:
         problems.append(
             "dataset manifest period "
@@ -2499,7 +2514,8 @@ def build_api_runtime(environ: Mapping[str, str]) -> ApiRuntime:
             f"BACKTEST_OBJECT_STORE must produce an object_store.ObjectStore, got {type(object_store).__name__}"
         )
 
-    persistence = BacktestPersistence(create_backtest_engine(environ["BACKTEST_DATABASE_URL"]))
+    database_engine = create_backtest_engine(environ["BACKTEST_DATABASE_URL"])
+    persistence = BacktestPersistence(database_engine)
 
     import boto3
 
@@ -2524,11 +2540,17 @@ def build_api_runtime(environ: Mapping[str, str]) -> ApiRuntime:
         policies=resolved["BACKTEST_EXECUTION_POLICY_CATALOG"],
         dead_letters=resolved["BACKTEST_DEAD_LETTER_SINK"],
     )
+    # Imported here to avoid a module cycle: production adapters import this
+    # module's worker wiring, while the API runtime only needs this read adapter
+    # once construction actually begins.
+    from .production import PostgresStrategySnapshotSource
+
     return ApiRuntime(
         app=create_app(
             lifecycle,
             resolved["BACKTEST_AUTHENTICATOR"],
             build_result_query_service(persistence, object_store),
+            strategy_snapshots=PostgresStrategySnapshotSource(database_engine),
         ),
         persistence=persistence,
         object_store=object_store,

@@ -99,6 +99,7 @@ def _request(
     limit_price: str | None = None,
     stop_price: str | None = None,
     trail_percent: str | None = None,
+    max_instrument_position_notional: str | None = None,
 ) -> OrderRequest:
     return OrderRequest(
         order_id=order_id,
@@ -117,6 +118,11 @@ def _request(
         limit_price=Decimal(limit_price) if limit_price else None,
         stop_price=Decimal(stop_price) if stop_price else None,
         trail_percent=Decimal(trail_percent) if trail_percent else None,
+        max_instrument_position_notional=(
+            Decimal(max_instrument_position_notional)
+            if max_instrument_position_notional is not None
+            else None
+        ),
     )
 
 
@@ -782,6 +788,64 @@ def test_fill_rechecks_instrument_risk_at_the_actual_bar_price() -> None:
 
     assert fill.quantity == Decimal("5")
     assert model.order(fill.order_id).status is OrderStatus.PARTIALLY_FILLED
+
+
+def test_order_larger_than_position_cap_reserves_only_the_fillable_exposure() -> None:
+    """A position cap must resize an order before global risk admission.
+
+    The literal oracle is three whole shares: at the policy's 100.05 execution
+    price, four shares would cost 400.20 and exceed the 400 position cap.
+    The old admission path compared the full 1,000.50 request with the 500
+    instrument-risk limit and rejected it before the fill-time cap could apply.
+    """
+
+    model = _model(
+        cash="10000", strategy_budget="10000", gross_limit="10000", instrument_limit="500"
+    )
+
+    accepted = model.submit(
+        _request(
+            quantity="10",
+            reference_price="100",
+            max_instrument_position_notional="400",
+        )
+    )
+
+    assert accepted.status is OrderStatus.ACCEPTED
+    fill = model.process_bar(_bar(open_price="100", high="101", low="99"))[0]
+    assert fill.quantity == Decimal("3")
+    assert model.position(INSTRUMENT).quantity == Decimal("3")
+    assert model.position(INSTRUMENT).cost_basis == Decimal("300.15000000")
+
+
+def test_position_capped_partial_fill_does_not_reserve_the_unfillable_remainder() -> None:
+    """A capped remainder must not starve an unrelated instrument of buying power."""
+
+    model = _model(
+        cash="1000", strategy_budget="10000", gross_limit="10000", instrument_limit="10000"
+    )
+    first = model.submit(
+        _request(
+            quantity="10",
+            reference_price="100",
+            max_instrument_position_notional="400",
+        )
+    )
+    fill = model.process_bar(_bar(open_price="100", high="101", low="99"))[0]
+
+    assert fill.quantity == Decimal("3")
+    assert model.order(first.order_id).status is OrderStatus.PARTIALLY_FILLED
+
+    unrelated = model.submit(
+        _request(
+            order_id="00000000-0000-4000-8000-000000000504",
+            instrument_id=OTHER_INSTRUMENT,
+            quantity="5",
+            reference_price="100",
+        )
+    )
+
+    assert unrelated.status is OrderStatus.ACCEPTED
 
 
 def test_budget_and_instrument_risk_rejections_are_explicit() -> None:

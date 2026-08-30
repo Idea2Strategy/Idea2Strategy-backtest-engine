@@ -57,6 +57,13 @@ from backtest_engine.orchestrator import (
     ReplayStatus,
     bar_events_from_table,
 )
+from backtest_engine.performance.equity_curve import (
+    EquityCurve,
+    EquityPoint,
+    Holding,
+    ValuationBasis,
+    ValuationPeriodicity,
+)
 from backtest_engine.result_snapshot import ResultRecordKind, ResultSnapshotBuilder, RunSnapshot
 from backtest_engine.wiring import (
     COST_MODEL_VERSION,
@@ -70,6 +77,7 @@ from backtest_engine.wiring import (
     _CancellationAwareMonitor,
     _dataset_cover_contains_evaluation,
     _metric_percent,
+    _performance_points,
     _required_feature_through,
     _resolve_position_only_flow_clocks,
     _segmented_coverage_by_resolution,
@@ -97,6 +105,40 @@ from d_reproducibility_testkit import (
 
 SESSION_CLOSE = datetime(2024, 1, 2, 21, 0, tzinfo=UTC)
 INITIAL_CASH = Decimal("100000.00000000")
+
+
+def test_performance_points_preserve_each_position_behind_an_equity_move() -> None:
+    opening = datetime(2024, 1, 1, 20, 0, tzinfo=UTC)
+    closing = datetime(2024, 1, 2, 20, 0, tzinfo=UTC)
+    curve = EquityCurve(
+        basis=ValuationBasis.MARK_TO_MARKET,
+        periodicity=ValuationPeriodicity.DAILY,
+        points=(
+            EquityPoint(opening, Decimal("100"), (), Decimal("0"), Decimal("100")),
+            EquityPoint(
+                closing,
+                Decimal("50"),
+                (Holding(INSTRUMENT_ID, Decimal("1"), Decimal("60"), Decimal("60")),),
+                Decimal("60"),
+                Decimal("110"),
+            ),
+        ),
+    )
+
+    points = _performance_points(_run_snapshot().snapshot_id, curve)
+    closing_points = {
+        (point.metric_id, point.instrument_id): point.value
+        for point in points
+        if point.occurred_at == closing
+    }
+
+    assert closing_points == {
+        ("equity", None): Decimal("110"),
+        ("cash", None): Decimal("50"),
+        ("position_market_value", INSTRUMENT_ID): Decimal("60"),
+        ("position_quantity", INSTRUMENT_ID): Decimal("1"),
+        ("position_mark_price", INSTRUMENT_ID): Decimal("60"),
+    }
 
 
 def test_feature_coverage_ends_at_the_last_market_close_not_the_local_date_boundary() -> None:
@@ -708,9 +750,9 @@ def test_shared_tail_segment_extends_every_instrument_scope() -> None:
     scoped_a["instrument_id"] = "00000000-0000-4000-8000-000000000001"
     scoped_b["instrument_id"] = "00000000-0000-4000-8000-000000000002"
     shared_tail["instrument_id"] = None
-    shared_tail["objects"][0]["shard_key"] = scoped_a["instrument_id"]
+    shared_tail["objects"][0]["shard_key"] = "s00-of-8"
     second_shared_object = copy.deepcopy(shared_tail["objects"][0])
-    second_shared_object["shard_key"] = scoped_b["instrument_id"]
+    second_shared_object["shard_key"] = "s01-of-8"
     shared_tail["objects"].append(second_shared_object)
     for scoped in (scoped_a, scoped_b):
         scoped["objects"][0]["period_start"] = "2016-01-01T00:00:00Z"
@@ -740,7 +782,8 @@ def test_composite_tail_only_extends_instruments_proven_by_its_objects() -> None
     scoped_a["instrument_id"] = instrument_a
     scoped_b["instrument_id"] = instrument_b
     shared_tail["instrument_id"] = None
-    shared_tail["objects"][0]["shard_key"] = instrument_a
+    shared_tail["source_instrument_ids"] = [instrument_a]
+    shared_tail["objects"][0]["shard_key"] = "s00-of-8"
     for scoped in (scoped_a, scoped_b):
         scoped["objects"][0]["period_start"] = "2016-01-01T00:00:00Z"
         scoped["objects"][0]["period_end"] = "2026-01-01T00:00:00Z"

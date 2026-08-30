@@ -1021,21 +1021,13 @@ class BacktestExecutionModel:
             state.reserved_quantity = state.remaining_quantity
             return
 
-        estimated_notional, estimated_cash = self._estimated_commitment(state)
-        if request.max_instrument_position_notional is not None:
-            estimated_price = self._estimated_price(
-                OrderSide.BUY, request.reference_price
-            )
-            marked_position = quantize_money(
-                self.position(request.instrument_id).quantity * estimated_price,
-                "marked_position",
-            )
-            reserved = self._instrument_reserved_notional(
-                request.instrument_id, excluding=state
-            )
-            if marked_position + reserved >= request.max_instrument_position_notional:
-                self._reject(state, "MAX_INSTRUMENT_POSITION_PERCENT")
-                return
+        estimated_notional, estimated_cash = self._position_capped_commitment(state)
+        if (
+            request.max_instrument_position_notional is not None
+            and estimated_notional <= ZERO
+        ):
+            self._reject(state, "MAX_INSTRUMENT_POSITION_PERCENT")
+            return
         available_cash = self.buying_power - self._reserved_cash(excluding=state)
         if estimated_cash > available_cash:
             self._reject(state, "INSUFFICIENT_AVAILABLE_CASH")
@@ -1084,12 +1076,39 @@ class BacktestExecutionModel:
         fee = apply_rate(notional, self._policy.fee_rate, "estimated_fee")
         return notional, quantize_money(notional + fee, "estimated_cash")
 
+    def _position_capped_commitment(
+        self, state: _OrderState
+    ) -> tuple[Decimal, Decimal]:
+        """Remaining BUY commitment after the order's live per-symbol cap."""
+
+        notional, cash = self._estimated_commitment(state)
+        request = state.request
+        cap = request.max_instrument_position_notional
+        if cap is None:
+            return notional, cash
+        estimated_price = self._estimated_price(OrderSide.BUY, request.reference_price)
+        marked_position = quantize_money(
+            self.position(request.instrument_id).quantity * estimated_price,
+            "marked_position",
+        )
+        other_reserved = self._instrument_reserved_notional(
+            request.instrument_id, excluding=state
+        )
+        available = quantize_money(
+            max(cap - marked_position - other_reserved, ZERO),
+            "remaining_position_notional",
+        )
+        if notional <= available:
+            return notional, cash
+        fee = apply_rate(available, self._policy.fee_rate, "estimated_fee")
+        return available, quantize_money(available + fee, "estimated_cash")
+
     def _refresh_reservation(self, state: _OrderState) -> None:
         if state.request.side is OrderSide.SELL:
             assert state.remaining_quantity is not None
             state.reserved_quantity = state.remaining_quantity
             return
-        state.reserved_notional, state.reserved_cash = self._estimated_commitment(state)
+        state.reserved_notional, state.reserved_cash = self._position_capped_commitment(state)
 
     @staticmethod
     def _release_reservation(state: _OrderState) -> None:

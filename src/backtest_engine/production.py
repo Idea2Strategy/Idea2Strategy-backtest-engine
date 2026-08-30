@@ -186,6 +186,54 @@ class PostgresCompiledPlanSource:
         return dict(document)
 
 
+class PostgresStrategySnapshotSource:
+    """Read the immutable launch snapshot whose hash the owned run pins."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def get_owned(
+        self, owner_account_id: uuid.UUID, run_id: uuid.UUID
+    ) -> Mapping[str, Any] | None:
+        statement = text(
+            """
+            SELECT r.bot_id, s.snapshot_schema_version, s.semantic_snapshot,
+                   s.presentation_snapshot, s.snapshot_hash, s.created_at
+              FROM backtest.runs r
+              JOIN backtest.run_input_pins p ON p.run_id = r.id
+              JOIN bot.launch_snapshots s ON s.bot_id = r.bot_id
+             WHERE r.id = :run_id
+               AND r.owner_account_id = :owner_account_id
+               AND ('sha256:' || s.snapshot_hash) = p.strategy_snapshot_hash
+            """
+        )
+        with self._engine.connect() as connection:
+            row = connection.execute(
+                statement,
+                {"run_id": run_id, "owner_account_id": owner_account_id},
+            ).mappings().first()
+        if row is None:
+            return None
+
+        def document(value: Any, label: str) -> Mapping[str, Any]:
+            if isinstance(value, str):
+                value = json.loads(value)
+            if not isinstance(value, Mapping):
+                raise ConfigurationError(f"launch snapshot {label} is not a JSON object")
+            return dict(value)
+
+        return {
+            "botId": str(row["bot_id"]),
+            "snapshotSchemaVersion": str(row["snapshot_schema_version"]),
+            "semanticSnapshot": document(row["semantic_snapshot"], "semantic_snapshot"),
+            "presentationSnapshot": document(
+                row["presentation_snapshot"], "presentation_snapshot"
+            ),
+            "snapshotHash": "sha256:" + str(row["snapshot_hash"]),
+            "createdAt": _utc_text(row["created_at"]),
+        }
+
+
 def _unavailable_manifest(message: str) -> JobNotSatisfiable:
     return JobNotSatisfiable(message, reason_code="REQUIRED_INPUT_UNAVAILABLE")
 
@@ -255,6 +303,16 @@ class PostgresDatasetManifestSource:
                    manifest.period_start, manifest.period_end, manifest.available_at,
                    provider.code AS provider_code, feed.code AS feed_code,
                    manifest.data_layer, feed.resolution AS feed_resolution,
+                   ARRAY(
+                       SELECT DISTINCT source.instrument_id::text
+                         FROM market_data.dataset_lineage lineage
+                         JOIN market_data.dataset_manifests source
+                           ON source.id = lineage.source_manifest_id
+                        WHERE lineage.derived_manifest_id = manifest.id
+                          AND lineage.relation_type = 'COMPOSED_FROM'
+                          AND source.instrument_id IS NOT NULL
+                        ORDER BY source.instrument_id::text
+                   ) AS source_instrument_ids,
                    EXISTS (
                        SELECT 1 FROM market_data.dataset_lineage lineage
                         WHERE lineage.derived_manifest_id = manifest.id
@@ -349,6 +407,7 @@ class PostgresDatasetManifestSource:
                 is_composite=is_composite,
             ),
             "composite": is_composite,
+            "source_instrument_ids": [str(item) for item in (row.get("source_instrument_ids") or ())],
             "revision": int(row["revision_number"]),
             "status": str(row["status"]),
             "dataset_hash": str(row["dataset_hash"]),

@@ -28,6 +28,7 @@ __all__ = [
     "is_legacy_market_loader_manifest",
     "legacy_dataset_hash",
     "legacy_period_matches",
+    "legacy_period_overlaps_policy",
     "legacy_period_within_policy",
     "validate_legacy_market_loader_manifest",
 ]
@@ -325,4 +326,33 @@ def legacy_period_within_policy(
         (local_start.hour, local_start.minute, local_start.second, local_start.microsecond) == midnight
         and (local_end.hour, local_end.minute, local_end.second, local_end.microsecond) == midnight
         and local_start.date() <= manifest_start < manifest_end <= local_end.date()
+    )
+
+
+def legacy_period_overlaps_policy(
+    manifest: Mapping[str, Any],
+    period_start: datetime,
+    period_end: datetime,
+    timezone_name: str,
+) -> bool:
+    """Accept a loader partition that contributes rows to a policy-local window.
+
+    Immutable Parquet partitions are commonly calendar-year sized while a locked
+    evaluation policy can end mid-year. The replay layer applies the explicit
+    evaluation interval after binding, so requiring every partition boundary to
+    equal or sit inside the policy would reject correct, immutable source data.
+    """
+    zone = ZoneInfo(timezone_name)
+    local_start = period_start.astimezone(zone)
+    local_end = period_end.astimezone(zone)
+    midnight = (0, 0, 0, 0)
+    manifest_start = _period_date(manifest.get("period_start"), "period_start")
+    manifest_end = _period_date(manifest.get("period_end"), "period_end")
+    return (
+        (local_start.hour, local_start.minute, local_start.second, local_start.microsecond)
+        == midnight
+        and (local_end.hour, local_end.minute, local_end.second, local_end.microsecond)
+        == midnight
+        and manifest_start < local_end.date()
+        and manifest_end > local_start.date()
     )
