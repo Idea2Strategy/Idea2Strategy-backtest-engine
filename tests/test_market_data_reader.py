@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from copy import deepcopy
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -41,9 +42,7 @@ PINNED_OBJECT: dict[str, object] = {
     "row_count": 2,
     "schema_version": "market-bars-v2",
 }
-PINNED_DATASET_HASH = (
-    "48874949cee30d4c87de042d94ee2e8db70c667a2334780e08430c91e9a422cc"
-)
+PINNED_DATASET_HASH = "48874949cee30d4c87de042d94ee2e8db70c667a2334780e08430c91e9a422cc"
 
 
 def _manifest_for(path: Path) -> dict[str, object]:
@@ -88,6 +87,22 @@ def test_reader_loads_verified_manifest_objects_in_event_order(tmp_path: Path) -
         1_704_205_800_000_000,
         1_704_207_600_000_000,
     ]
+
+
+def test_reader_validates_rows_against_the_manifest_not_a_shorter_run_window(
+    tmp_path: Path,
+) -> None:
+    """Boundary partition rows outside this run remain valid immutable source data."""
+    fixture = write_small_market_bars(tmp_path / "market-bars.parquet")
+    manifest = _manifest_for(fixture.path)
+    shorter_run = replace(
+        D17_EXECUTION_POLICY_FIXTURE,
+        period_end=datetime(2024, 1, 2, 5, 0, tzinfo=timezone.utc),
+    )
+
+    batches = list(ParquetMarketDataReader(tmp_path).iter_batches(manifest, shorter_run))
+
+    assert batches == []
 
 
 def test_reader_streams_hashing_and_parquet_batches_without_whole_file_helpers(
@@ -141,9 +156,7 @@ def test_reader_filters_verified_batches_to_requested_plan_instruments(tmp_path:
     )
 
     assert sum(batch.num_rows for batch in batches) == source.num_rows
-    assert {row["instrument_id"] for batch in batches for row in batch.to_pylist()} == {
-        requested_id
-    }
+    assert {row["instrument_id"] for batch in batches for row in batch.to_pylist()} == {requested_id}
 
 
 def test_reader_decodes_full_columns_only_for_objects_containing_requested_instruments(
@@ -163,13 +176,15 @@ def test_reader_decodes_full_columns_only_for_objects_containing_requested_instr
 
     manifest = _manifest_for(target_fixture.path)
     unrelated_object = deepcopy(manifest["objects"][0])
-    unrelated_object.update({
-        "storage_object_id": "99999999-9999-4999-8999-999999999999",
-        "object_key": unrelated_path.name,
-        "content_hash": hashlib.sha256(unrelated_path.read_bytes()).hexdigest(),
-        "row_count": unrelated.num_rows,
-        "shard_key": "s01-of-2",
-    })
+    unrelated_object.update(
+        {
+            "storage_object_id": "99999999-9999-4999-8999-999999999999",
+            "object_key": unrelated_path.name,
+            "content_hash": hashlib.sha256(unrelated_path.read_bytes()).hexdigest(),
+            "row_count": unrelated.num_rows,
+            "shard_key": "s01-of-2",
+        }
+    )
     manifest["objects"][0]["shard_key"] = "s00-of-2"
     manifest["objects"] = [unrelated_object, manifest["objects"][0]]
     manifest["dataset_hash"] = canonical_dataset_hash(manifest["objects"])
@@ -184,11 +199,13 @@ def test_reader_decodes_full_columns_only_for_objects_containing_requested_instr
 
     monkeypatch.setattr(pq.ParquetFile, "iter_batches", record_column_reads)
 
-    batches = list(ParquetMarketDataReader(tmp_path).iter_batches(
-        manifest,
-        D17_EXECUTION_POLICY_FIXTURE,
-        instrument_ids=frozenset({requested_id}),
-    ))
+    batches = list(
+        ParquetMarketDataReader(tmp_path).iter_batches(
+            manifest,
+            D17_EXECUTION_POLICY_FIXTURE,
+            instrument_ids=frozenset({requested_id}),
+        )
+    )
 
     assert sum(batch.num_rows for batch in batches) == target.num_rows
 
@@ -202,12 +219,14 @@ def test_reader_hashes_only_canonical_shards_consumed_by_requested_instruments(
     pq.write_table(target, unrelated_path, compression="zstd", version="2.6")
     manifest = _manifest_for(target_fixture.path)
     unrelated_object = deepcopy(manifest["objects"][0])
-    unrelated_object.update({
-        "storage_object_id": "99999999-9999-4999-8999-999999999999",
-        "object_key": unrelated_path.name,
-        "content_hash": hashlib.sha256(unrelated_path.read_bytes()).hexdigest(),
-        "shard_key": "s01-of-2",
-    })
+    unrelated_object.update(
+        {
+            "storage_object_id": "99999999-9999-4999-8999-999999999999",
+            "object_key": unrelated_path.name,
+            "content_hash": hashlib.sha256(unrelated_path.read_bytes()).hexdigest(),
+            "shard_key": "s01-of-2",
+        }
+    )
     manifest["objects"][0]["shard_key"] = "s00-of-2"
     manifest["objects"] = [unrelated_object, manifest["objects"][0]]
     manifest["dataset_hash"] = canonical_dataset_hash(manifest["objects"])
@@ -221,11 +240,13 @@ def test_reader_hashes_only_canonical_shards_consumed_by_requested_instruments(
 
     monkeypatch.setattr(ParquetMarketDataReader, "_content_hash", staticmethod(record_hash))
 
-    batches = list(ParquetMarketDataReader(tmp_path).iter_batches(
-        manifest,
-        D17_EXECUTION_POLICY_FIXTURE,
-        instrument_ids=frozenset({requested_id}),
-    ))
+    batches = list(
+        ParquetMarketDataReader(tmp_path).iter_batches(
+            manifest,
+            D17_EXECUTION_POLICY_FIXTURE,
+            instrument_ids=frozenset({requested_id}),
+        )
+    )
 
     assert sum(batch.num_rows for batch in batches) == target.num_rows
     assert hashed == [target_fixture.path.name]
@@ -243,9 +264,7 @@ def test_reader_decodes_only_row_groups_whose_statistics_cover_requested_instrum
         pa.array([other_id] * target.num_rows, type=pa.string()),
     )
     combined = pa.concat_tables([target, other])
-    pq.write_table(
-        combined, fixture.path, compression="zstd", version="2.6", row_group_size=2
-    )
+    pq.write_table(combined, fixture.path, compression="zstd", version="2.6", row_group_size=2)
     manifest = _manifest_for(fixture.path)
     manifest["objects"][0]["row_count"] = combined.num_rows  # type: ignore[index]
     manifest["dataset_hash"] = canonical_dataset_hash(manifest["objects"])  # type: ignore[arg-type]
@@ -260,11 +279,13 @@ def test_reader_decodes_only_row_groups_whose_statistics_cover_requested_instrum
 
     monkeypatch.setattr(pq.ParquetFile, "iter_batches", record_row_groups)
 
-    batches = list(ParquetMarketDataReader(tmp_path).iter_batches(
-        manifest,
-        D17_EXECUTION_POLICY_FIXTURE,
-        instrument_ids=frozenset({requested_id}),
-    ))
+    batches = list(
+        ParquetMarketDataReader(tmp_path).iter_batches(
+            manifest,
+            D17_EXECUTION_POLICY_FIXTURE,
+            instrument_ids=frozenset({requested_id}),
+        )
+    )
 
     assert sum(batch.num_rows for batch in batches) == target.num_rows
     assert full_column_row_groups == [[0]]
@@ -348,12 +369,8 @@ def test_reader_accepts_eight_shard_instrument_major_data_and_clock_orders_event
     assert table["provider_symbol"].to_pylist() == ["AAPL", "AAPL", "MSFT", "MSFT"]
     assert len(events) == 4
     schedule = XNYS_CALENDAR.session_schedule(date(2024, 1, 1), date(2024, 3, 31))
-    released = MarketEventClock(schedule, events).advance_to(
-        datetime(2024, 1, 3, tzinfo=timezone.utc)
-    ).released_events
-    assert [event.occurred_at for event in released] == sorted(
-        event.occurred_at for event in released
-    )
+    released = MarketEventClock(schedule, events).advance_to(datetime(2024, 1, 3, tzinfo=timezone.utc)).released_events
+    assert [event.occurred_at for event in released] == sorted(event.occurred_at for event in released)
 
 
 def test_reader_still_rejects_rows_out_of_order_inside_one_shard(tmp_path: Path) -> None:

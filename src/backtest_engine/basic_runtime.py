@@ -1145,12 +1145,8 @@ def _allocate_equally(decisions: list[BasicInstrumentDecision], side: str) -> tu
     )
 
 
-def _reference_price(
-    plan: BasicCompiledPlan, flow: BasicPlanFlow, evaluation: ElementEvaluation
-) -> Decimal:
-    data_kind, resolution = (
-        plan.reference_series if flow.reference_series[1] == "$DATASET" else flow.reference_series
-    )
+def _reference_price(plan: BasicCompiledPlan, flow: BasicPlanFlow, evaluation: ElementEvaluation) -> Decimal:
+    data_kind, resolution = plan.reference_series if flow.reference_series[1] == "$DATASET" else flow.reference_series
     series = evaluation.inputs.series_for(data_kind, resolution)
     completed = series.completed_through(evaluation.as_of) if series else ()
     if not completed:  # pragma: no cover - a candidate loaded a feature from it
@@ -1488,6 +1484,7 @@ class _ReplayExecutionState:
     executions: int = 0
     bars_since_execution: int = 0
     last_session_date: date | None = None
+    last_session_index: int | None = None
     condition_rearmed: bool = True
 
     def observe_non_candidate(self, status: BasicDecisionStatus) -> None:
@@ -1496,7 +1493,7 @@ class _ReplayExecutionState:
         if status is BasicDecisionStatus.CONDITION_NOT_MET:
             self.condition_rearmed = True
 
-    def accepts(self, candidate: OrderCandidate) -> bool:
+    def accepts(self, candidate: OrderCandidate, *, session_index: int | None = None) -> bool:
         if self.executions:
             self.bars_since_execution += 1
         limit = 1 if candidate.execution_mode == "1회만" else candidate.max_executions
@@ -1510,9 +1507,9 @@ class _ReplayExecutionState:
             eligible = self.bars_since_execution >= candidate.wait_interval
         elif candidate.wait_mode == "N거래일 이후":
             eligible = (
-                self.last_session_date is not None
-                and _weekdays_between_dates(self.last_session_date, candidate.session_date_et)
-                >= candidate.wait_interval
+                self.last_session_index is not None
+                and session_index is not None
+                and session_index - self.last_session_index >= candidate.wait_interval
             )
         else:
             eligible = False
@@ -1521,18 +1518,9 @@ class _ReplayExecutionState:
         self.executions += 1
         self.bars_since_execution = 0
         self.last_session_date = candidate.session_date_et
+        self.last_session_index = session_index
         self.condition_rearmed = False
         return True
-
-
-def _weekdays_between_dates(start: date, end: date) -> int:
-    count = 0
-    cursor = start
-    while cursor < end:
-        cursor += timedelta(days=1)
-        if cursor.weekday() < 5:
-            count += 1
-    return count
 
 
 class BasicPlanReplay:
@@ -1577,8 +1565,7 @@ class BasicPlanReplay:
         if isinstance(plan, BasicCompiledPlan):
             self.visible_event_limit = _plan_visible_event_limit(plan)
         self._session_index_by_date = {
-            session.trading_date_et: index
-            for index, session in enumerate(clock.schedule.sessions)
+            session.trading_date_et: index for index, session in enumerate(clock.schedule.sessions)
         }
         self._last_schedule_session_date: date | None = None
         self._evaluations: tuple[PlanEvaluation, ...] | None = None
@@ -1642,11 +1629,7 @@ class BasicPlanReplay:
             # open without using the signal bar's own prices.
             session_index = self._session_index_by_date[session.trading_date_et]
             sessions = self.clock.schedule.sessions
-            candidate_session = (
-                sessions[session_index + 1]
-                if session_index + 1 < len(sessions)
-                else None
-            )
+            candidate_session = sessions[session_index + 1] if session_index + 1 < len(sessions) else None
             eligible_at = None if candidate_session is None else candidate_session.opens_at
         if candidate_session is not None:
             candidates = self.runtime.order_candidates(
@@ -1667,25 +1650,23 @@ class BasicPlanReplay:
             candidates=candidates,
         )
 
-    def _retire_closed_position_gates(
-        self, runtime_values: Mapping[str, Mapping[str, str]] | None
-    ) -> None:
+    def _retire_closed_position_gates(self, runtime_values: Mapping[str, Mapping[str, str]] | None) -> None:
         """Scope the execution gate to one position cycle, as the live runtime does.
 
         ``1회만`` means once per position, not once per bot lifetime: a strategy that buys, sells,
         and buys again is the ordinary case the mode exists for. Live gets this from
         ``EvaluatingBotRuntime``, which drops an instrument's gates whenever its position snapshot
-        stops matching -- a close, or a re-entry at a different average. Counting for the whole
-        replay instead would backtest that strategy as a single trade while it traded repeatedly in
-        production, which is the one thing an official backtest may not do.
+        stops matching -- a close followed by a re-entry with a new ``openedAt``. Counting for the
+        whole replay instead would backtest that strategy as a single trade while it traded
+        repeatedly in production, which is the one thing an official backtest may not do.
 
         The published position metrics carry the same signal: an instrument appears with an
-        ``averageEntryPrice`` only while it holds a position, so both a close and a re-entry change
-        the identity observed here.
+        ``openedAt`` only while it holds a position and keeps it stable while quantity or average
+        entry price changes inside that position cycle. A close removes it and a later re-entry
+        receives a new value.
         """
         observed = {
-            instrument_id: values.get("position.averageEntryPrice")
-            for instrument_id, values in (runtime_values or {}).items()
+            instrument_id: values.get("position.openedAt") for instrument_id, values in (runtime_values or {}).items()
         }
         for instrument_id in set(self._position_identities) | set(observed):
             current = observed.get(instrument_id)
@@ -1700,10 +1681,8 @@ class BasicPlanReplay:
         decisions: tuple[BasicInstrumentDecision, ...],
         candidates: tuple[OrderCandidate, ...],
     ) -> tuple[OrderCandidate, ...]:
-        if (
-            getattr(self.plan, "element_catalog_version", None)
-            != "basic-elements:2026-08-08"
-        ):
+        catalog = getattr(self.plan, "catalog", None)
+        if catalog is None or not catalog.execution_gate:
             return candidates
         candidate_keys = {(item.flow_id, item.instrument_id) for item in candidates}
         for decision in decisions:
@@ -1716,7 +1695,10 @@ class BasicPlanReplay:
             for candidate in candidates
             if self._execution_states.setdefault(
                 (candidate.flow_id, candidate.instrument_id), _ReplayExecutionState()
-            ).accepts(candidate)
+            ).accepts(
+                candidate,
+                session_index=self._session_index_by_date.get(candidate.session_date_et),
+            )
         )
 
     def evaluate_at(
@@ -1742,10 +1724,12 @@ class BasicPlanReplay:
                     for trace in decision.trace
                 )
                 if decision.status is BasicDecisionStatus.INPUT_MISSING and not decision.trace:
-                    outcomes.append((
-                        f"{decision.flow_id}|{decision.instrument_id}|{decision.first_failure_step_id}",
-                        False,
-                    ))
+                    outcomes.append(
+                        (
+                            f"{decision.flow_id}|{decision.instrument_id}|{decision.first_failure_step_id}",
+                            False,
+                        )
+                    )
         return CompactPlanEvaluation(
             evaluation_id=evaluation.evaluation_id,
             occurred_at=evaluation.occurred_at,
@@ -1761,10 +1745,7 @@ class BasicPlanReplay:
         sessions = self.clock.schedule.sessions
         session_positions = getattr(self, "_session_index_by_date", None)
         if session_positions is None:
-            session_positions = {
-                item.trading_date_et: position
-                for position, item in enumerate(sessions)
-            }
+            session_positions = {item.trading_date_et: position for position, item in enumerate(sessions)}
             self._session_index_by_date = session_positions
         index = session_positions[session.trading_date_et]
         previous = sessions[index - 1] if index else None
@@ -1781,8 +1762,7 @@ class BasicPlanReplay:
             # Direct conformance drivers call this method without constructing a
             # replay; retain their stateless result while production stays O(1).
             new_trading_day = not any(
-                event.occurred_at < instant
-                and self.clock.schedule.session_at(event.occurred_at) == session
+                event.occurred_at < instant and self.clock.schedule.session_at(event.occurred_at) == session
                 for event in visible_events
             )
         # Every "first/last trading day of the period" flag is a property of the day, so it is
@@ -1795,17 +1775,13 @@ class BasicPlanReplay:
             "schedule.tradingDayIndex": str(index + 1),
             "schedule.weekFirstTradingDay": str(
                 new_trading_day
-                and (
-                    previous is None
-                    or previous.trading_date_et.isocalendar()[:2] != current.isocalendar()[:2]
-                )
+                and (previous is None or previous.trading_date_et.isocalendar()[:2] != current.isocalendar()[:2])
             ).lower(),
             "schedule.monthFirstTradingDay": str(
                 new_trading_day
                 and (
                     previous is None
-                    or (previous.trading_date_et.year, previous.trading_date_et.month)
-                    != (current.year, current.month)
+                    or (previous.trading_date_et.year, previous.trading_date_et.month) != (current.year, current.month)
                 )
             ).lower(),
             "schedule.monthLastTradingDay": str(

@@ -128,27 +128,21 @@ class ParquetMarketDataReader:
                 raise MarketDataValidationError(f"Parquet schema missing field: {name}")
             field = schema.field(field_index)
             if field.type != expected_type or field.nullable:
-                raise MarketDataValidationError(
-                    f"Parquet field {name} must be non-nullable {expected_type}"
-                )
+                raise MarketDataValidationError(f"Parquet field {name} must be non-nullable {expected_type}")
 
     @staticmethod
     def _verify_batch_rows(
         batch: pa.RecordBatch,
         policy: ExecutionPolicy,
+        manifest_start: datetime,
+        manifest_end: datetime,
         order_state: _OrderState | None,
     ) -> _OrderState | None:
-        instrument_values = batch.column(
-            batch.schema.get_field_index("instrument_id")
-        ).to_pylist()
-        timestamp_values = batch.column(
-            batch.schema.get_field_index("bar_start_at")
-        ).cast(pa.int64()).to_pylist()
-        session_dates = batch.column(
-            batch.schema.get_field_index("session_date_et")
-        ).to_pylist()
-        period_start_micros = int(policy.period_start.timestamp() * 1_000_000)
-        period_end_micros = int(policy.period_end.timestamp() * 1_000_000)
+        instrument_values = batch.column(batch.schema.get_field_index("instrument_id")).to_pylist()
+        timestamp_values = batch.column(batch.schema.get_field_index("bar_start_at")).cast(pa.int64()).to_pylist()
+        session_dates = batch.column(batch.schema.get_field_index("session_date_et")).to_pylist()
+        period_start_micros = int(manifest_start.timestamp() * 1_000_000)
+        period_end_micros = int(manifest_end.timestamp() * 1_000_000)
         zone = ZoneInfo(policy.timezone)
         if order_state is None:
             previous_instrument_key = None
@@ -173,19 +167,16 @@ class ParquetMarketDataReader:
                 time_major = False
             if not instrument_major and not time_major:
                 raise MarketDataValidationError(
-                    "rows must be uniquely ordered by instrument_id, bar_start_at "
-                    "or by bar_start_at, instrument_id"
+                    "rows must be uniquely ordered by instrument_id, bar_start_at or by bar_start_at, instrument_id"
                 )
             if not period_start_micros <= timestamp_micros < period_end_micros:
-                raise MarketDataValidationError("bar_start_at is outside the pinned period")
+                raise MarketDataValidationError("bar_start_at is outside the manifest period")
             timestamp = datetime.fromtimestamp(
                 timestamp_micros / 1_000_000,
                 tz=policy.period_start.tzinfo,
             )
             if timestamp.astimezone(zone).date() != session_date:
-                raise MarketDataValidationError(
-                    "session_date_et does not match bar_start_at in policy timezone"
-                )
+                raise MarketDataValidationError("session_date_et does not match bar_start_at in policy timezone")
             previous_instrument_key = instrument_key
             previous_time_key = time_key
         if previous_instrument_key is None or previous_time_key is None:
@@ -206,9 +197,7 @@ class ParquetMarketDataReader:
         return digest.hexdigest()
 
     @staticmethod
-    def _object_can_contain(
-        metadata: Mapping[str, Any], instrument_ids: frozenset[str]
-    ) -> bool:
+    def _object_can_contain(metadata: Mapping[str, Any], instrument_ids: frozenset[str]) -> bool:
         """Use the producer's stable UUID shard contract when it is declared.
 
         Unknown legacy shard labels deliberately fall back to scanning. A canonical
@@ -233,17 +222,13 @@ class ParquetMarketDataReader:
         return False
 
     @staticmethod
-    def _candidate_row_groups(
-        parquet: pq.ParquetFile, instrument_ids: frozenset[str]
-    ) -> list[int]:
+    def _candidate_row_groups(parquet: pq.ParquetFile, instrument_ids: frozenset[str]) -> list[int]:
         """Prune sorted producer row groups with their embedded UUID bounds."""
         column_index = parquet.schema_arrow.get_field_index("instrument_id")
         candidates: list[int] = []
         for row_group_index in range(parquet.metadata.num_row_groups):
             try:
-                statistics = parquet.metadata.row_group(row_group_index).column(
-                    column_index
-                ).statistics
+                statistics = parquet.metadata.row_group(row_group_index).column(column_index).statistics
                 if statistics is None or not statistics.has_min_max:
                     candidates.append(row_group_index)
                     continue
@@ -266,11 +251,7 @@ class ParquetMarketDataReader:
         metadata: Mapping[str, Any],
         policy: ExecutionPolicy,
     ) -> pq.ParquetFile:
-        expected_kind = (
-            "MARKET_BARS"
-            if policy.market_data_schema_version == LEGACY_MARKET_SCHEMA_ID
-            else "PARQUET"
-        )
+        expected_kind = "MARKET_BARS" if policy.market_data_schema_version == LEGACY_MARKET_SCHEMA_ID else "PARQUET"
         if metadata.get("object_kind") != expected_kind:
             raise MarketDataValidationError(f"object_kind must be {expected_kind}")
         if metadata.get("schema_version") != policy.market_data_schema_version:
@@ -328,8 +309,12 @@ class ParquetMarketDataReader:
         else:
             manifest_start = _utc_timestamp(manifest.get("period_start"), "manifest.period_start")
             manifest_end = _utc_timestamp(manifest.get("period_end"), "manifest.period_end")
-            if not policy.period_start <= manifest_start < manifest_end <= policy.period_end:
-                raise MarketDataValidationError("manifest period is outside policy")
+            if not (
+                manifest_start < manifest_end
+                and manifest_start < policy.period_end
+                and manifest_end > policy.period_start
+            ):
+                raise MarketDataValidationError("manifest period does not overlap policy")
 
     def iter_batches(
         self,
@@ -350,9 +335,7 @@ class ParquetMarketDataReader:
         schema: pa.Schema | None = None
         parquets: list[tuple[Mapping[str, Any], pq.ParquetFile]] = []
         for metadata in manifest["objects"]:
-            if instrument_ids is not None and not self._object_can_contain(
-                metadata, instrument_ids
-            ):
+            if instrument_ids is not None and not self._object_can_contain(metadata, instrument_ids):
                 continue
             parquet = self._parquet_file(metadata, policy)
             object_schema = parquet.schema_arrow
@@ -368,17 +351,19 @@ class ParquetMarketDataReader:
         if schema is None:  # pragma: no cover - both manifest contracts require objects
             return
 
-        requested_values = (
-            pa.array(sorted(instrument_ids), type=pa.string())
-            if instrument_ids is not None
-            else None
-        )
+        requested_values = pa.array(sorted(instrument_ids), type=pa.string()) if instrument_ids is not None else None
+        try:
+            manifest_start = datetime.fromisoformat(str(manifest["period_start"]).replace("Z", "+00:00"))
+            manifest_end = datetime.fromisoformat(str(manifest["period_end"]).replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MarketDataValidationError("manifest period is not a valid UTC interval") from exc
+        if manifest_start.tzinfo is None or manifest_end.tzinfo is None or manifest_start >= manifest_end:
+            raise MarketDataValidationError("manifest period is not a valid UTC interval")
+
         for metadata, parquet in parquets:
             order_state: _OrderState | None = None
             try:
-                if instrument_ids is not None and not self._object_can_contain(
-                    metadata, instrument_ids
-                ):
+                if instrument_ids is not None and not self._object_can_contain(metadata, instrument_ids):
                     continue
                 candidate_row_groups = (
                     self._candidate_row_groups(parquet, instrument_ids)
@@ -387,14 +372,16 @@ class ParquetMarketDataReader:
                 )
                 if not candidate_row_groups:
                     continue
-                if requested_values is not None and not _CANONICAL_SHARD_KEY.fullmatch(
-                    str(metadata.get("shard_key", ""))
-                ) and not any(
-                    bool(pc.any(pc.is_in(batch.column(0), value_set=requested_values)).as_py())
-                    for batch in parquet.iter_batches(
-                        batch_size=self._batch_size,
-                        columns=["instrument_id"],
-                        row_groups=candidate_row_groups,
+                if (
+                    requested_values is not None
+                    and not _CANONICAL_SHARD_KEY.fullmatch(str(metadata.get("shard_key", "")))
+                    and not any(
+                        bool(pc.any(pc.is_in(batch.column(0), value_set=requested_values)).as_py())
+                        for batch in parquet.iter_batches(
+                            batch_size=self._batch_size,
+                            columns=["instrument_id"],
+                            row_groups=candidate_row_groups,
+                        )
                     )
                 ):
                     continue
@@ -410,7 +397,23 @@ class ParquetMarketDataReader:
                         batch = batch.filter(mask)
                         if batch.num_rows == 0:
                             continue
-                    order_state = self._verify_batch_rows(batch, policy, order_state)
+                    order_state = self._verify_batch_rows(
+                        batch,
+                        policy,
+                        manifest_start,
+                        manifest_end,
+                        order_state,
+                    )
+                    timestamps = batch.column(batch.schema.get_field_index("bar_start_at")).cast(pa.int64())
+                    policy_start = int(policy.period_start.timestamp() * 1_000_000)
+                    policy_end = int(policy.period_end.timestamp() * 1_000_000)
+                    in_policy = pc.and_(
+                        pc.greater_equal(timestamps, pa.scalar(policy_start, pa.int64())),
+                        pc.less(timestamps, pa.scalar(policy_end, pa.int64())),
+                    )
+                    batch = batch.filter(in_policy)
+                    if batch.num_rows == 0:
+                        continue
                     yield batch
             except MarketDataValidationError:
                 raise

@@ -14,6 +14,7 @@ from backtest_engine.calendar import XNYS_CALENDAR
 from backtest_engine.execution_policy import D17_EXECUTION_POLICY_FIXTURE
 from backtest_engine.legacy_market_data import (
     legacy_dataset_hash,
+    legacy_period_within_policy,
     validate_legacy_market_loader_manifest,
 )
 from backtest_engine.market_data import MarketDataValidationError, ParquetMarketDataReader
@@ -62,6 +63,15 @@ def test_legacy_manifest_may_be_one_segment_inside_a_longer_policy() -> None:
     )
 
     require_compatible_execution_window(policy, _fixture(), XNYS_CALENDAR)
+
+
+def test_legacy_year_segment_may_extend_past_the_policy_end() -> None:
+    assert legacy_period_within_policy(
+        {"period_start": "2026-01-01T00:00:00Z", "period_end": "2027-01-01T00:00:00Z"},
+        datetime(2016, 1, 1, 5, tzinfo=timezone.utc),
+        datetime(2026, 7, 30, 4, tzinfo=timezone.utc),
+        "America/New_York",
+    )
 
 
 @pytest.mark.parametrize(
