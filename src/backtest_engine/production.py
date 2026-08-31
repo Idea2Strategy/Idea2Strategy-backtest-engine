@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from threading import Lock
 from time import monotonic, sleep
 from typing import Any, BinaryIO
 from urllib.error import HTTPError, URLError
@@ -69,14 +70,23 @@ class MonotonicUtcClock:
         monotonic_clock: Callable[[], float] | None = None,
     ) -> None:
         source = wall_clock or (lambda: datetime.now(UTC))
+        self._wall_clock = source
         self._monotonic = monotonic_clock or monotonic
         self._anchor = source()
         self._started = self._monotonic()
         self._elapsed = 0.0
+        self._last = self._anchor
+        self._lock = Lock()
 
     def __call__(self) -> datetime:
-        self._elapsed = max(self._monotonic() - self._started, self._elapsed)
-        return self._anchor + timedelta(seconds=self._elapsed)
+        with self._lock:
+            self._elapsed = max(self._monotonic() - self._started, self._elapsed)
+            self._last = max(
+                self._anchor + timedelta(seconds=self._elapsed),
+                self._wall_clock(),
+                self._last,
+            )
+            return self._last
 
 
 def _required(environ: Mapping[str, str], name: str) -> str:
@@ -449,7 +459,7 @@ class S3VersionedFeatureObjectReader:
         self._client = client
 
     def read_version(self, provider: str, bucket: str, key: str, version_id: str) -> bytes:
-        if provider != "S3_COMPATIBLE":
+        if provider not in {"S3", "S3_COMPATIBLE"}:
             raise ConfigurationError(f"S3 feature reader cannot read storage provider {provider!r}")
         response = self._client.get_object(
             Bucket=bucket,
