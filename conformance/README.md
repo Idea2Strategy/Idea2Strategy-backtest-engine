@@ -13,12 +13,9 @@ supposed to check.
 
 ## Why here and not in `contracts/`
 
-The root `contracts/` tree is a protected path and `stackcord governance check`
-currently reports `unknown` (fail-closed), so nothing can be registered there. This
-directory is the isolated, unregistered home in the meantime. **It is not an approved
-root contract.** The right long-term location is the root superproject, alongside the
-other cross-repository artefacts, once governance permits registration; moving it is a
-separate change and needs owner A.
+The fixture lives with its Python consumer so the package can run independently. The
+root `contracts/` tree remains the source of cross-service obligations; update it and
+both language bindings together whenever the fixture changes product behavior.
 
 ## Integrity
 
