@@ -67,13 +67,16 @@ from backtest_engine.wiring import (
     JobNotSatisfiable,
     OrchestratorJobHandler,
     WiringError,
+    _average_entry_price,
     _CancellationAwareMonitor,
     _dataset_cover_contains_evaluation,
     _metric_percent,
     _required_feature_through,
     _resolve_position_only_flow_clocks,
+    _trading_sessions_between,
     dataset_coverage,
     evaluation_window,
+    require_compatible_execution_window,
     segmented_dataset_coverage,
 )
 from backtest_engine.worker import JobContext, JobResult
@@ -144,6 +147,7 @@ def _engine(
         run_snapshot=_run_snapshot(),
         policy=E2E_EXECUTION_POLICY,
         fractional_policy=E2E_FRACTIONAL_POLICY,
+        session_schedule=XNYS_CALENDAR.session_schedule(date(2024, 1, 2), date(2024, 1, 3)),
     )
 
 
@@ -224,9 +228,7 @@ def test_replay_factory_produces_something_the_orchestrator_will_accept(tmp_path
         instrument_id=INSTRUMENT_ID,
         data_kind="ADJUSTED_BAR",
         resolution="1m",
-        available_intervals=(
-            TimeInterval(FIRST_BAR_START, FIRST_BAR_START + BAR * len(CLOSES)),
-        ),
+        available_intervals=(TimeInterval(FIRST_BAR_START, FIRST_BAR_START + BAR * len(CLOSES)),),
         verified=True,
     )
     assessment = DataAvailabilityAssessor().assess(requirements, [observation])
@@ -235,9 +237,7 @@ def test_replay_factory_produces_something_the_orchestrator_will_accept(tmp_path
         [_bar_event(index) for index in range(len(CLOSES))],
     )
 
-    replay = BasicPlanReplayFactory(BasicPlanRuntime(), plan)(
-        clock=clock, assessment=assessment
-    )
+    replay = BasicPlanReplayFactory(BasicPlanRuntime(), plan)(clock=clock, assessment=assessment)
 
     assert isinstance(replay, BasicPlanReplay)
     assert isinstance(replay, PlanReplay)
@@ -290,9 +290,7 @@ def test_allocation_and_budget_cap_both_move_the_size(
     """Two independent inputs; a sizing rule that ignored either would tie."""
     engine = _engine()
 
-    order_id = engine.place(
-        _candidate(allocation=allocation, budget_cap_bps=budget_cap_bps)
-    )
+    order_id = engine.place(_candidate(allocation=allocation, budget_cap_bps=budget_cap_bps))
 
     assert order_id is not None
     # The reservation is the sized notional at the slipped reference price, which
@@ -371,16 +369,26 @@ def test_position_caps_are_isolated_between_instruments() -> None:
     engine = _engine()
     other_instrument = "00000000-0000-4000-8000-000000000302"
 
-    assert engine.place(_candidate(
-        budget_cap_bps=2000,
-        max_position_percent=Decimal("20"),
-    )) is not None
-    assert engine.place(_candidate(
-        instrument_id=other_instrument,
-        budget_cap_bps=2000,
-        max_position_percent=Decimal("20"),
-        decided_at=datetime(2024, 1, 2, 14, 47, tzinfo=UTC),
-    )) is not None
+    assert (
+        engine.place(
+            _candidate(
+                budget_cap_bps=2000,
+                max_position_percent=Decimal("20"),
+            )
+        )
+        is not None
+    )
+    assert (
+        engine.place(
+            _candidate(
+                instrument_id=other_instrument,
+                budget_cap_bps=2000,
+                max_position_percent=Decimal("20"),
+                decided_at=datetime(2024, 1, 2, 14, 47, tzinfo=UTC),
+            )
+        )
+        is not None
+    )
 
 
 def test_a_sell_candidate_is_sized_from_the_held_position() -> None:
@@ -528,11 +536,11 @@ def test_durable_worker_cancellation_is_applied_at_the_next_replay_checkpoint() 
     )
     coordinator = AttemptCoordinator("cancel-run", policy, COMPLETED_AT)
     lease = coordinator.acquire("worker-1", COMPLETED_AT)
-    delegate = SimpleNamespace(sample=lambda: ResourceSample(
-        cpu_time=timedelta(seconds=1), memory_bytes=1024
-    ))
+    delegate = SimpleNamespace(sample=lambda: ResourceSample(cpu_time=timedelta(seconds=1), memory_bytes=1024))
     monitor = _CancellationAwareMonitor(
-        delegate, coordinator, lambda: "USER_CANCELLED",
+        delegate,
+        coordinator,
+        lambda: "USER_CANCELLED",
         lambda: COMPLETED_AT + timedelta(seconds=1),
     )
 
@@ -922,8 +930,7 @@ def test_a_new_position_restarts_the_count_at_one() -> None:
     _holding_bars(engine, 15)
     _holding_bars(engine, 16)
 
-    engine.place(_candidate(side="SELL", allocation=None,
-                            decided_at=datetime(2024, 1, 2, 14, 47, tzinfo=UTC)))
+    engine.place(_candidate(side="SELL", allocation=None, decided_at=datetime(2024, 1, 2, 14, 47, tzinfo=UTC)))
     _settle(engine, 17)
     assert engine.summary().positions[INSTRUMENT_ID] == Decimal(0)
 
@@ -946,6 +953,41 @@ def test_a_published_position_metric_rounds_half_even() -> None:
     assert _metric_percent(Decimal("0.00000000025"), Decimal("1")) == Decimal("0.00000002")
 
 
+def test_average_entry_price_uses_the_same_half_even_precision_rule() -> None:
+    # 40.00000100 / 40 = 1.000000025, an exact tie at the ninth decimal.
+    assert _average_entry_price(Decimal("40.00000100"), Decimal("40.00000000")) == Decimal("1.00000002")
+
+
+def test_scale_in_updates_strategy_metrics_without_starting_a_new_position_cycle() -> None:
+    """Adding to an open position changes its basis, not its identity or peak history."""
+    engine = _engine()
+    engine.place(_candidate(allocation=Fraction(1, 2)))
+    first = _bar_event(15, resolution=STRATEGY_RESOLUTION)
+    engine.settle(first)
+    first_values = engine.runtime_values(first.occurred_at, (first,))[INSTRUMENT_ID]
+
+    engine.place(
+        _candidate(
+            allocation=Fraction(1, 10),
+            decided_at=datetime(2024, 1, 2, 14, 46, tzinfo=UTC),
+        )
+    )
+    second = _bar_event(17, resolution=STRATEGY_RESOLUTION)
+    engine.settle(second)
+    second_values = engine.runtime_values(second.occurred_at, (second,))[INSTRUMENT_ID]
+    position = engine._model.position(INSTRUMENT_ID)
+    average = _average_entry_price(position.cost_basis, position.quantity)
+    current_price = Decimal(CLOSES[17])
+    first_price = Decimal(CLOSES[15])
+
+    assert second_values["position.openedAt"] == first_values["position.openedAt"]
+    assert Decimal(second_values["position.averageEntryPrice"]) == average
+    assert Decimal(second_values["position.returnPercent"]) == _metric_percent(current_price - average, average)
+    assert Decimal(second_values["position.peakReturnPercent"]) == _metric_percent(
+        max(first_price, current_price) - average, average
+    )
+
+
 def test_a_published_position_metric_ignores_the_ambient_rounding_mode() -> None:
     """Quantizing without naming a mode would inherit whatever the process last set."""
     with localcontext() as context:
@@ -956,3 +998,26 @@ def test_a_published_position_metric_ignores_the_ambient_rounding_mode() -> None
 
 def test_a_zero_denominator_publishes_zero_rather_than_raising() -> None:
     assert _metric_percent(Decimal("1"), Decimal("0")) == Decimal("0")
+
+
+def test_holding_days_count_pinned_sessions_not_weekday_holidays() -> None:
+    schedule = XNYS_CALENDAR.session_schedule(date(2025, 12, 24), date(2025, 12, 29))
+    positions = {session.trading_date_et: index for index, session in enumerate(schedule.sessions)}
+
+    assert _trading_sessions_between(positions, date(2025, 12, 24), date(2025, 12, 26)) == 1
+    assert _trading_sessions_between(positions, date(2025, 12, 24), date(2025, 12, 29)) == 2
+
+
+def test_year_segment_may_extend_past_an_explicit_policy_end() -> None:
+    """A yearly immutable object is clipped to the run, not rejected for containing later bars."""
+    manifest = {
+        "period_start": "2026-01-01T00:00:00+00:00",
+        "period_end": "2027-01-01T00:00:00+00:00",
+    }
+    policy = replace(
+        E2E_EXECUTION_POLICY,
+        period_start=datetime(2026, 1, 1, 5, tzinfo=UTC),
+        period_end=datetime(2026, 7, 30, 4, tzinfo=UTC),
+    )
+
+    require_compatible_execution_window(policy, manifest, XNYS_CALENDAR)

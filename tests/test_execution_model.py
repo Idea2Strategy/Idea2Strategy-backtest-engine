@@ -17,6 +17,7 @@ from backtest_engine.execution_model import (
     CHART_OF_ACCOUNTS_VERSION,
     D23_MICROSTRUCTURE_POLICY_V1,
     BacktestExecutionModel,
+    BacktestOrder,
     ExecutionBar,
     ExecutionMicrostructurePolicy,
     ExecutionModelValidationError,
@@ -151,15 +152,23 @@ def test_overlapping_multi_resolution_bars_do_not_reverse_the_execution_clock() 
         instrument_id=INSTRUMENT,
         starts_at=_utc("2025-11-28T17:00:00Z"),
         ends_at=_utc("2025-11-28T18:00:00Z"),
-        open=Decimal("100"), high=Decimal("101"), low=Decimal("99"),
-        close=Decimal("100"), volume=Decimal("1000"), resolution="1h",
+        open=Decimal("100"),
+        high=Decimal("101"),
+        low=Decimal("99"),
+        close=Decimal("100"),
+        volume=Decimal("1000"),
+        resolution="1h",
     )
     four_hour = ExecutionBar(
         instrument_id=OTHER_INSTRUMENT,
         starts_at=_utc("2025-11-28T14:00:00Z"),
         ends_at=_utc("2025-11-28T18:00:00Z"),
-        open=Decimal("200"), high=Decimal("202"), low=Decimal("198"),
-        close=Decimal("200"), volume=Decimal("1000"), resolution="4h",
+        open=Decimal("200"),
+        high=Decimal("202"),
+        low=Decimal("198"),
+        close=Decimal("200"),
+        volume=Decimal("1000"),
+        resolution="4h",
     )
 
     assert model.process_bar(one_hour) == ()
@@ -233,9 +242,7 @@ def test_the_microstructure_policy_has_no_defaults_at_all() -> None:
         ({"buying_power_buffer_policy_id": "not-a-uuid"}, "UUID"),
     ],
 )
-def test_microstructure_policy_rejects_unusable_values(
-    overrides: dict[str, object], message: str
-) -> None:
+def test_microstructure_policy_rejects_unusable_values(overrides: dict[str, object], message: str) -> None:
     with pytest.raises(ExecutionModelValidationError, match=message):
         replace(D23_MICROSTRUCTURE_POLICY_V1, **overrides)
 
@@ -325,9 +332,7 @@ def test_fractional_fill_quantizes_products_that_would_otherwise_overflow_scale(
     """
 
     model = _model()
-    model.submit(
-        _request(quantity="0.33333333", quantity_mode=QuantityMode.FRACTIONAL_SHARES)
-    )
+    model.submit(_request(quantity="0.33333333", quantity_mode=QuantityMode.FRACTIONAL_SHARES))
 
     fill = model.process_bar(_bar())[0]
 
@@ -351,9 +356,7 @@ def test_non_finite_and_unrepresentable_money_is_refused_by_the_shared_rule() ->
 def test_bar_volume_caps_the_fill_at_the_declared_participation_limit() -> None:
     """1000 traded shares x 10.00% participation = 100 fillable shares."""
 
-    model = _model(
-        cash="100000", strategy_budget="100000", gross_limit="100000", instrument_limit="100000"
-    )
+    model = _model(cash="100000", strategy_budget="100000", gross_limit="100000", instrument_limit="100000")
     model.submit(_request(quantity="250"))
 
     fill = model.process_bar(_bar(volume="1000"))[0]
@@ -367,27 +370,18 @@ def test_bar_volume_caps_the_fill_at_the_declared_participation_limit() -> None:
 def test_participation_capacity_is_shared_by_every_order_on_the_same_bar() -> None:
     """Capacity 100 is consumed in submission order, not granted to each order."""
 
-    model = _model(
-        cash="100000", strategy_budget="100000", gross_limit="100000", instrument_limit="100000"
-    )
+    model = _model(cash="100000", strategy_budget="100000", gross_limit="100000", instrument_limit="100000")
     model.submit(_request(quantity="80"))
-    model.submit(
-        _request(order_id="00000000-0000-4000-8000-000000000502", quantity="80")
-    )
+    model.submit(_request(order_id="00000000-0000-4000-8000-000000000502", quantity="80"))
 
     fills = model.process_bar(_bar(volume="1000"))
 
     assert [fill.quantity for fill in fills] == [Decimal("80"), Decimal("20")]
-    assert (
-        model.order("00000000-0000-4000-8000-000000000502").remaining_quantity
-        == Decimal("60")
-    )
+    assert model.order("00000000-0000-4000-8000-000000000502").remaining_quantity == Decimal("60")
 
 
 def test_participation_capacity_is_replenished_by_the_next_bar() -> None:
-    model = _model(
-        cash="100000", strategy_budget="100000", gross_limit="100000", instrument_limit="100000"
-    )
+    model = _model(cash="100000", strategy_budget="100000", gross_limit="100000", instrument_limit="100000")
     model.submit(_request(quantity="150"))
 
     first = model.process_bar(_bar(volume="1000"))[0]
@@ -459,9 +453,7 @@ def test_sell_limit_price_is_protected_on_the_other_side() -> None:
 
     model = _model()
     model.seed_long_position(INSTRUMENT, Decimal("10"), Decimal("80"))
-    model.submit(
-        _request(side=OrderSide.SELL, order_type=OrderType.LIMIT, limit_price="100", quantity="10")
-    )
+    model.submit(_request(side=OrderSide.SELL, order_type=OrderType.LIMIT, limit_price="100", quantity="10"))
 
     fill = model.process_bar(_bar(open_price="100", high="101", low="99"))[0]
 
@@ -517,16 +509,12 @@ def test_stop_limit_that_triggers_above_its_limit_waits_as_a_plain_limit_order()
     """Gap through the stop: trigger base 105 > limit 102, so no fill on that bar."""
 
     model = _model()
-    model.submit(
-        _request(order_type=OrderType.STOP_LIMIT, stop_price="101", limit_price="102")
-    )
+    model.submit(_request(order_type=OrderType.STOP_LIMIT, stop_price="101", limit_price="102"))
 
     assert model.process_bar(_bar(open_price="105", high="106", low="104", close="105")) == ()
     assert model.order("00000000-0000-4000-8000-000000000501").status is OrderStatus.ACCEPTED
 
-    fill = model.process_bar(
-        _bar("2025-11-28T14:32:00Z", open_price="101", high="103", low="100", close="102")
-    )[0]
+    fill = model.process_bar(_bar("2025-11-28T14:32:00Z", open_price="101", high="103", low="100", close="102"))[0]
     assert fill.base_price == Decimal("101.00000000")
     assert fill.price == Decimal("101.05050000")
 
@@ -546,9 +534,7 @@ def test_trailing_sell_updates_its_reference_then_triggers_on_a_later_bar() -> N
     )
 
     assert model.process_bar(_bar(open_price="100", high="110", low="95", close="108")) == ()
-    fill = model.process_bar(
-        _bar("2025-11-28T14:32:00Z", open_price="98", high="100", low="97", close="99")
-    )[0]
+    fill = model.process_bar(_bar("2025-11-28T14:32:00Z", open_price="98", high="100", low="97", close="99"))[0]
 
     assert fill.base_price == Decimal("98.00000000")
     assert fill.price == Decimal("97.95100000")
@@ -568,9 +554,7 @@ def test_trailing_buy_ratchets_down_then_triggers_on_a_later_bar() -> None:
     )
 
     assert model.process_bar(_bar(open_price="95", high="96", low="90", close="92")) == ()
-    fill = model.process_bar(
-        _bar("2025-11-28T14:32:00Z", open_price="95", high="100", low="94", close="99")
-    )[0]
+    fill = model.process_bar(_bar("2025-11-28T14:32:00Z", open_price="95", high="100", low="94", close="99"))[0]
 
     assert fill.base_price == Decimal("99.00000000")
     assert fill.price == Decimal("99.04950000")
@@ -582,9 +566,7 @@ def test_trailing_buy_ratchets_down_then_triggers_on_a_later_bar() -> None:
 
 
 def test_day_gtd_and_gtc_orders_expire_at_their_policy_pinned_boundaries() -> None:
-    model = _model(
-        cash="100000", strategy_budget="100000", gross_limit="100000", instrument_limit="100000"
-    )
+    model = _model(cash="100000", strategy_budget="100000", gross_limit="100000", instrument_limit="100000")
     day = model.submit(_request(order_type=OrderType.LIMIT, limit_price="50"))
     gtd = model.submit(
         _request(
@@ -629,9 +611,11 @@ def test_gtc_horizon_is_read_from_the_execution_policy_and_is_not_hardcoded() ->
     two different expiries off the same request.
     """
 
-    default_expiry = _model().submit(
-        _request(order_type=OrderType.LIMIT, limit_price="50", time_in_force=TimeInForce.GTC)
-    ).expires_at
+    default_expiry = (
+        _model()
+        .submit(_request(order_type=OrderType.LIMIT, limit_price="50", time_in_force=TimeInForce.GTC))
+        .expires_at
+    )
     assert default_expiry == _utc("2026-02-26T14:31:00Z")
 
     short_horizon = replace(
@@ -706,9 +690,7 @@ def test_buying_power_buffer_withholds_the_declared_basis_points_of_cash() -> No
 def test_buying_power_buffer_is_what_rejects_a_marginal_order() -> None:
     """cost 9999.00450000 fits 10000.00 cash but not the 9999.00 buying power."""
 
-    model = _model(
-        cash="10000", strategy_budget="100000", gross_limit="100000", instrument_limit="100000"
-    )
+    model = _model(cash="10000", strategy_budget="100000", gross_limit="100000", instrument_limit="100000")
 
     rejected = model.submit(_request(quantity="99.75", quantity_mode=QuantityMode.FRACTIONAL_SHARES))
 
@@ -722,9 +704,7 @@ def test_buying_power_buffer_is_what_rejects_a_marginal_order() -> None:
         instrument_limit="100000",
         microstructure=replace(D23_MICROSTRUCTURE_POLICY_V1, buying_power_buffer_bps=0),
     )
-    accepted = unbuffered.submit(
-        _request(quantity="99.75", quantity_mode=QuantityMode.FRACTIONAL_SHARES)
-    )
+    accepted = unbuffered.submit(_request(quantity="99.75", quantity_mode=QuantityMode.FRACTIONAL_SHARES))
     assert accepted.status is OrderStatus.ACCEPTED
 
 
@@ -770,12 +750,109 @@ def test_fill_rechecks_cash_and_keeps_the_unfilled_remainder_open() -> None:
     assert model.cash == Decimal("49.74990000")
 
 
+def test_fillable_quantity_subtracts_cash_reserved_by_other_open_orders() -> None:
+    """A fill must not spend cash already promised to another accepted order.
+
+    The first order was admitted at a $50 reference price.  The second order
+    reserves 3 * 100.2501 = 300.7503.  When the first order meets a $100 bar,
+    only $699.2497 remains for it; at $100.2501 per share exactly six whole
+    shares can fill.
+    """
+
+    model = _model(cash="1000", strategy_budget="10000", gross_limit="10000")
+    first = model.submit(_request(quantity="10", reference_price="50"))
+    second = model.submit(
+        _request(
+            order_id="00000000-0000-4000-8000-000000000502",
+            instrument_id=OTHER_INSTRUMENT,
+            quantity="3",
+        )
+    )
+
+    assert first.status is OrderStatus.ACCEPTED
+    assert second.status is OrderStatus.ACCEPTED
+
+    fill = model.process_bar(_bar())[0]
+
+    assert fill.order_id == first.order_id
+    assert fill.quantity == Decimal("6")
+    assert model.order(first.order_id).status is OrderStatus.PARTIALLY_FILLED
+    assert model.order(second.order_id).status is OrderStatus.ACCEPTED
+    assert model.cash == Decimal("398.49940000")
+
+
+def _submit_competing_buy_orders(
+    model: BacktestExecutionModel, *, first_max_position: str | None = None
+) -> tuple[BacktestOrder, BacktestOrder]:
+    """Seed $100 of exposure, then reserve another order beside the one filled."""
+
+    model.seed_long_position(INSTRUMENT, Decimal("1"), Decimal("100"))
+    first_request = _request(quantity="10", reference_price="50")
+    if first_max_position is not None:
+        first_request = replace(
+            first_request,
+            max_instrument_position_notional=Decimal(first_max_position),
+        )
+    first = model.submit(first_request)
+    second = model.submit(
+        _request(
+            order_id="00000000-0000-4000-8000-000000000502",
+            instrument_id=INSTRUMENT,
+            quantity="5",
+            reference_price="50",
+        )
+    )
+    assert first.status is OrderStatus.ACCEPTED
+    assert second.status is OrderStatus.ACCEPTED
+    return first, second
+
+
+def test_fillable_quantity_enforces_strategy_budget_against_positions_and_reservations() -> None:
+    model = _model(cash="10000", strategy_budget="1000", gross_limit="10000")
+    first, _ = _submit_competing_buy_orders(model)
+
+    fill = model.process_bar(_bar())[0]
+
+    # (1000 - 100 position - 250.62525 reserved cash) / 100.2501 = 6.47...
+    assert fill.order_id == first.order_id
+    assert fill.quantity == Decimal("6")
+
+
+def test_fillable_quantity_enforces_gross_limit_against_positions_and_reservations() -> None:
+    model = _model(cash="10000", strategy_budget="10000", gross_limit="1000")
+    first, _ = _submit_competing_buy_orders(model)
+
+    fill = model.process_bar(_bar())[0]
+
+    # (1000 - 100 position - 250.125 reserved notional) / 100.05 = 6.49...
+    assert fill.order_id == first.order_id
+    assert fill.quantity == Decimal("6")
+
+
+def test_fillable_quantity_enforces_request_position_cap_against_other_reservations() -> None:
+    model = _model(cash="10000", strategy_budget="10000", gross_limit="10000")
+    first, _ = _submit_competing_buy_orders(model, first_max_position="1000")
+
+    fill = model.process_bar(_bar())[0]
+
+    assert fill.order_id == first.order_id
+    assert fill.quantity == Decimal("6")
+
+
+def test_fillable_quantity_enforces_instrument_limit_against_positions_and_reservations() -> None:
+    model = _model(cash="10000", strategy_budget="10000", gross_limit="10000", instrument_limit="1000")
+    first, _ = _submit_competing_buy_orders(model)
+
+    fill = model.process_bar(_bar())[0]
+
+    assert fill.order_id == first.order_id
+    assert fill.quantity == Decimal("6")
+
+
 def test_fill_rechecks_instrument_risk_at_the_actual_bar_price() -> None:
     """600 headroom / 100.05 = 5.997 -> five whole shares."""
 
-    model = _model(
-        cash="10000", strategy_budget="10000", gross_limit="10000", instrument_limit="600"
-    )
+    model = _model(cash="10000", strategy_budget="10000", gross_limit="10000", instrument_limit="600")
     model.submit(_request(quantity="10", reference_price="50"))
 
     fill = model.process_bar(_bar(open_price="100", high="101", low="99"))[0]
@@ -799,9 +876,7 @@ def test_budget_and_instrument_risk_rejections_are_explicit() -> None:
 def test_gross_exposure_limit_rejects_independently_of_the_strategy_budget() -> None:
     """notional 1000.50 > gross 1000, while cost 1002.501 stays under budget 2000."""
 
-    model = _model(
-        cash="10000", strategy_budget="2000", gross_limit="1000", instrument_limit="10000"
-    )
+    model = _model(cash="10000", strategy_budget="2000", gross_limit="1000", instrument_limit="10000")
 
     rejected = model.submit(_request(quantity="10", reference_price="100"))
 
@@ -842,12 +917,23 @@ def test_a_second_sell_cannot_reserve_the_same_shares() -> None:
 
 def test_fractional_long_market_day_on_an_enabled_instrument_is_allowed() -> None:
     model = _model()
-    accepted = model.submit(
-        _request(quantity="0.5", quantity_mode=QuantityMode.FRACTIONAL_SHARES)
-    )
+    accepted = model.submit(_request(quantity="0.5", quantity_mode=QuantityMode.FRACTIONAL_SHARES))
 
     assert accepted.status is OrderStatus.ACCEPTED
     assert model.process_bar(_bar())[0].quantity == Decimal("0.5")
+
+
+def test_recorded_fractional_fill_preserves_order_progress_and_auditable_identity() -> None:
+    model = _model()
+    accepted = model.submit(_request(quantity="0.5", quantity_mode=QuantityMode.FRACTIONAL_SHARES))
+
+    fill = model.process_bar(_bar())[0]
+    order = model.order(accepted.order_id)
+
+    assert order.filled_quantity == Decimal("0.50000000")
+    assert fill is model.fills[0]
+    assert fill.instrument_id == INSTRUMENT
+    assert fill.occurred_at == _utc("2025-11-28T14:32:00Z")
 
 
 @pytest.mark.parametrize(
@@ -868,9 +954,7 @@ def test_fractional_scope_violations_are_rejected_with_f08a_reason_codes(
 ) -> None:
     model = _model()
 
-    rejected = model.submit(
-        _request(quantity="0.5", quantity_mode=QuantityMode.FRACTIONAL_SHARES, **overrides)
-    )
+    rejected = model.submit(_request(quantity="0.5", quantity_mode=QuantityMode.FRACTIONAL_SHARES, **overrides))
 
     assert rejected.status is OrderStatus.REJECTED
     assert rejected.reason_code == reason_code
@@ -990,9 +1074,7 @@ def test_the_requested_measure_is_exactly_one_of_quantity_or_notional(
     message: str,
 ) -> None:
     with pytest.raises(ExecutionModelValidationError, match=message):
-        _request(
-            quantity=quantity, notional_amount=notional_amount, quantity_mode=quantity_mode
-        )
+        _request(quantity=quantity, notional_amount=notional_amount, quantity_mode=quantity_mode)
 
 
 # ---------------------------------------------------------------------------
@@ -1003,9 +1085,7 @@ def test_the_requested_measure_is_exactly_one_of_quantity_or_notional(
 def test_fifo_sale_records_realized_profit_and_a_balanced_double_entry() -> None:
     """Sell 4 at 120 - 0.06 = 119.94; gross 479.76; basis 2*90 + 2*100 = 380."""
 
-    model = _model(
-        cash="10000", strategy_budget="20000", gross_limit="20000", instrument_limit="20000"
-    )
+    model = _model(cash="10000", strategy_budget="20000", gross_limit="20000", instrument_limit="20000")
     model.seed_long_position(INSTRUMENT, Decimal("2"), Decimal("90"))
     model.seed_long_position(INSTRUMENT, Decimal("3"), Decimal("100"))
     model.submit(_request(side=OrderSide.SELL, quantity="4", reference_price="120"))
@@ -1022,9 +1102,7 @@ def test_fifo_sale_records_realized_profit_and_a_balanced_double_entry() -> None
     assert model.position(INSTRUMENT).cost_basis == Decimal("100.00000000")
 
     transaction = model.ledger_transactions[0]
-    posted = {
-        (entry.account_code, entry.direction): entry.amount for entry in transaction.entries
-    }
+    posted = {(entry.account_code, entry.direction): entry.amount for entry in transaction.entries}
     assert posted == {
         (LedgerAccount.CASH, LedgerDirection.DEBIT): Decimal("478.80048000"),
         (LedgerAccount.FEE_EXPENSE, LedgerDirection.DEBIT): Decimal("0.95952000"),
@@ -1043,10 +1121,7 @@ def test_fifo_sale_loss_debits_the_same_realized_pnl_account() -> None:
     fill = model.process_bar(_bar())[0]
 
     assert fill.realized_pnl == Decimal("-20.05000000")
-    posted = {
-        (entry.account_code, entry.direction): entry.amount
-        for entry in model.ledger_transactions[0].entries
-    }
+    posted = {(entry.account_code, entry.direction): entry.amount for entry in model.ledger_transactions[0].entries}
     assert posted == {
         (LedgerAccount.CASH, LedgerDirection.DEBIT): Decimal("99.75010000"),
         (LedgerAccount.FEE_EXPENSE, LedgerDirection.DEBIT): Decimal("0.19990000"),
@@ -1058,15 +1133,11 @@ def test_fifo_sale_loss_debits_the_same_realized_pnl_account() -> None:
 def test_fifo_consumes_a_partial_lot_without_leaving_cost_basis_dust() -> None:
     """3 shares costing 100.00000001 -> selling 1 must not strand 1e-8 of basis."""
 
-    model = _model(
-        cash="10000", strategy_budget="20000", gross_limit="20000", instrument_limit="20000"
-    )
+    model = _model(cash="10000", strategy_budget="20000", gross_limit="20000", instrument_limit="20000")
     model.seed_long_position(INSTRUMENT, Decimal("3"), Decimal("33.33333334"))
     model.submit(_request(side=OrderSide.SELL, quantity="3", reference_price="120"))
 
-    fills = model.process_bars(
-        [_bar(open_price="120", high="121", low="119", close="120", volume="10")]
-    )
+    fills = model.process_bars([_bar(open_price="120", high="121", low="119", close="120", volume="10")])
 
     assert fills[0].quantity == Decimal("1")
     assert fills[0].cost_basis == Decimal("33.33333334")
@@ -1143,9 +1214,7 @@ def test_ledger_entry_amount_must_already_be_quantized() -> None:
         ),
     ],
 )
-def test_ledger_transaction_validators(
-    entries: tuple[LedgerEntry, ...], message: str
-) -> None:
+def test_ledger_transaction_validators(entries: tuple[LedgerEntry, ...], message: str) -> None:
     with pytest.raises(ExecutionModelValidationError, match=message):
         LedgerTransaction(
             transaction_id="00000000-0000-4000-8000-000000000801",
@@ -1189,9 +1258,7 @@ def test_fill_transaction_and_entry_identifiers_are_pinned_literals() -> None:
 
 
 def test_a_second_fill_of_the_same_order_gets_the_pinned_sequence_two_identity() -> None:
-    model = _model(
-        cash="100000", strategy_budget="100000", gross_limit="100000", instrument_limit="100000"
-    )
+    model = _model(cash="100000", strategy_budget="100000", gross_limit="100000", instrument_limit="100000")
     model.submit(_request(quantity="150"))
 
     model.process_bar(_bar(volume="1000"))
@@ -1202,9 +1269,7 @@ def test_a_second_fill_of_the_same_order_gets_the_pinned_sequence_two_identity()
 
 
 def test_bars_are_replayed_in_a_pinned_deterministic_order() -> None:
-    model = _model(
-        cash="100000", strategy_budget="100000", gross_limit="100000", instrument_limit="100000"
-    )
+    model = _model(cash="100000", strategy_budget="100000", gross_limit="100000", instrument_limit="100000")
     model.submit(
         _request(
             order_id="00000000-0000-4000-8000-000000000502",
@@ -1213,9 +1278,7 @@ def test_bars_are_replayed_in_a_pinned_deterministic_order() -> None:
         )
     )
     model.submit(_request(quantity="1"))
-    fills = model.process_bars(
-        [_bar(instrument_id=OTHER_INSTRUMENT), _bar(instrument_id=INSTRUMENT)]
-    )
+    fills = model.process_bars([_bar(instrument_id=OTHER_INSTRUMENT), _bar(instrument_id=INSTRUMENT)])
 
     assert [(fill.order_id, fill.fill_id) for fill in fills] == [
         (
@@ -1266,9 +1329,7 @@ def test_cancelling_an_open_order_records_the_explicit_reason() -> None:
     model = _model()
     model.submit(_request())
 
-    cancelled = model.cancel(
-        "00000000-0000-4000-8000-000000000501", _utc("2025-11-28T14:32:00Z")
-    )
+    cancelled = model.cancel("00000000-0000-4000-8000-000000000501", _utc("2025-11-28T14:32:00Z"))
 
     assert cancelled.status is OrderStatus.CANCELLED
     assert cancelled.reason_code == "EXPLICITLY_CANCELLED"

@@ -26,6 +26,7 @@ dependencies = [
 # `httpx` (not the non-existent `httpx2`) is what starlette.testclient imports.
 test = [
   "freezegun==1.5.5",
+  "hypothesis==6.138.15",
   "httpx==0.28.1",
   "psutil==7.2.2",
   "pytest==9.1.1",
@@ -38,6 +39,7 @@ test = [
 dev = [
   "idea2strategy-backtest-engine[test]",
   "mypy==2.3.0",
+  "mutmut==3.3.1",
   "ruff==0.16.1",
   # Stubs, not runtime dependencies: without these mypy reports the import itself
   # as an error and the module's real type errors stay hidden behind it.
@@ -61,6 +63,21 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 markers = [
   "docker: integration test requiring a running Docker daemon (Testcontainers PostgreSQL 16).",
+]
+
+[tool.mutmut]
+paths_to_mutate = [
+  "src/backtest_engine/basic_runtime.py",
+  "src/backtest_engine/execution_model.py",
+]
+tests_dir = [
+  "tests/test_live_parity.py::TestExecutionGateMatchesLive",
+  "tests/test_live_parity.py::TestExecutionGateIsScopedToOnePositionCycle",
+  "tests/test_legacy_market_data.py",
+  "tests/test_market_data_reader.py",
+  "tests/test_execution_model.py",
+  "tests/test_execution_properties.py",
+  "tests/test_wiring.py",
 ]
 
 [tool.coverage.run]

@@ -21,6 +21,8 @@ import pytest
 
 from backtest_engine.basic_runtime import (
     LIVE_SERIES_BARS,
+    BasicDecisionStatus,
+    BasicInstrumentDecision,
     BasicPlanReplay,
     _published_values,
     _ReplayExecutionState,
@@ -51,8 +53,7 @@ def _series(resolution: str, *bar_starts: str) -> PinnedFeatureSeries:
         instrument_id=INSTRUMENT,
         resolution=resolution,
         values=tuple(
-            PinnedFeatureValue(bar_start_at=_utc(moment), value=Decimal("55.00000000"))
-            for moment in bar_starts
+            PinnedFeatureValue(bar_start_at=_utc(moment), value=Decimal("55.00000000")) for moment in bar_starts
         ),
     )
 
@@ -122,9 +123,7 @@ class TestPinnedSeriesStillReportsGaps:
             series.value_at(_utc("2025-12-01T21:00:00+00:00"))
 
 
-def _schedule_values(
-    trading_date: date, instant: str, earlier_bars: tuple[str, ...] = ()
-) -> dict[str, str]:
+def _schedule_values(trading_date: date, instant: str, earlier_bars: tuple[str, ...] = ()) -> dict[str, str]:
     """The schedule inputs the replay publishes at one instant.
 
     ``_schedule_values`` reads nothing but the pinned schedule, so a stub carrying one is a
@@ -132,9 +131,7 @@ def _schedule_values(
     """
     schedule = XNYS_CALENDAR.session_schedule(date(2025, 11, 24), date(2025, 12, 31))
     replay = SimpleNamespace(clock=SimpleNamespace(schedule=schedule))
-    events = tuple(
-        SimpleNamespace(occurred_at=_utc(moment), payload={}) for moment in earlier_bars
-    )
+    events = tuple(SimpleNamespace(occurred_at=_utc(moment), payload={}) for moment in earlier_bars)
     return BasicPlanReplay._schedule_values(replay, _utc(instant), events)
 
 
@@ -216,6 +213,8 @@ class TestSessionCloseFollowsTheCalendar:
 
 def _candidate(
     *,
+    flow_id: str = "flow-1",
+    instrument_id: str = INSTRUMENT,
     execution_mode: str = "1회만",
     wait_mode: str = "조건 재충족",
     wait_interval: int = 1,
@@ -224,9 +223,9 @@ def _candidate(
 ) -> OrderCandidate:
     return OrderCandidate(
         evaluation_id="00000000-0000-4000-8000-000000000001",
-        instrument_id=INSTRUMENT,
+        instrument_id=instrument_id,
         partition_key="partition-1",
-        flow_id="flow-1",
+        flow_id=flow_id,
         side="BUY",
         order_type="MARKET",
         allocation=Fraction(1, 1),
@@ -252,6 +251,113 @@ class TestExecutionGateMatchesLive:
 
         assert [state.accepts(_candidate()) for _ in range(2)] == [True, False]
 
+    def test_an_admitted_attempt_is_not_refunded_by_a_downstream_non_fill(self) -> None:
+        """The durable live gate restores immutable intents, not broker fill outcomes."""
+        state = _ReplayExecutionState()
+
+        assert state.accepts(_candidate()) is True
+        # Risk rejection, expiry, cancellation and partial fill occur after this boundary.
+        # There is deliberately no rollback transition: retrying the same signal would create a
+        # second order attempt and make worker redelivery alter strategy meaning.
+        assert state.executions == 1
+        assert state.accepts(_candidate()) is False
+
+    def test_active_catalog_applies_one_shot_at_the_replay_boundary(self) -> None:
+        """A catalog publication must not silently turn off an execution semantic."""
+        replay = BasicPlanReplay.__new__(BasicPlanReplay)
+        replay.plan = SimpleNamespace(catalog=SimpleNamespace(execution_gate=True))
+        replay._execution_states = {}
+        candidate = _candidate()
+        replay._session_index_by_date = {candidate.session_date_et: 0}
+
+        assert replay._apply_execution_policy((), (candidate,)) == (candidate,)
+        assert replay._apply_execution_policy((), (candidate,)) == ()
+
+    def test_plan_without_gate_capability_bypasses_the_execution_gate(self) -> None:
+        replay = BasicPlanReplay.__new__(BasicPlanReplay)
+        replay.plan = SimpleNamespace()
+        replay._execution_states = {}
+        replay._session_index_by_date = {}
+        candidate = _candidate()
+
+        assert replay._apply_execution_policy((), (candidate,)) == (candidate,)
+        assert replay._execution_states == {}
+
+    def test_non_candidate_decision_rearms_the_matching_condition_gate(self) -> None:
+        replay = BasicPlanReplay.__new__(BasicPlanReplay)
+        replay.plan = SimpleNamespace(catalog=SimpleNamespace(execution_gate=True))
+        replay._execution_states = {}
+        candidate = _candidate(execution_mode="대기 후 재진입", max_executions=3)
+        replay._session_index_by_date = {candidate.session_date_et: 0}
+
+        assert replay._apply_execution_policy((), (candidate,)) == (candidate,)
+        assert replay._apply_execution_policy((), (candidate,)) == ()
+
+        missed = BasicInstrumentDecision(
+            flow_id=candidate.flow_id,
+            instrument_id=candidate.instrument_id,
+            side="BUY",
+            status=BasicDecisionStatus.CONDITION_NOT_MET,
+            trace=(),
+        )
+        assert replay._apply_execution_policy((missed,), ()) == ()
+        assert replay._apply_execution_policy((), (candidate,)) == (candidate,)
+
+    def test_condition_can_be_false_before_its_first_candidate(self) -> None:
+        replay = BasicPlanReplay.__new__(BasicPlanReplay)
+        replay.plan = SimpleNamespace(catalog=SimpleNamespace(execution_gate=True))
+        replay._execution_states = {}
+        replay._session_index_by_date = {REGULAR_DAY: 0}
+        candidate = _candidate(execution_mode="대기 후 재진입", max_executions=3)
+        missed = BasicInstrumentDecision(
+            flow_id=candidate.flow_id,
+            instrument_id=candidate.instrument_id,
+            side="BUY",
+            status=BasicDecisionStatus.CONDITION_NOT_MET,
+            trace=(),
+        )
+
+        assert replay._apply_execution_policy((missed,), ()) == ()
+        assert replay._apply_execution_policy((), (candidate,)) == (candidate,)
+
+    def test_gate_state_is_scoped_by_flow_and_instrument(self) -> None:
+        replay = BasicPlanReplay.__new__(BasicPlanReplay)
+        replay.plan = SimpleNamespace(catalog=SimpleNamespace(execution_gate=True))
+        replay._execution_states = {}
+        replay._session_index_by_date = {REGULAR_DAY: 0}
+        other = _candidate(flow_id="flow-2", instrument_id="00000000-0000-4000-8000-000000000302")
+        first = _candidate()
+
+        assert replay._apply_execution_policy((), (first, other)) == (first, other)
+        assert set(replay._execution_states) == {
+            (first.flow_id, first.instrument_id),
+            (other.flow_id, other.instrument_id),
+        }
+
+    def test_replay_gate_receives_the_official_session_index(self) -> None:
+        replay = BasicPlanReplay.__new__(BasicPlanReplay)
+        replay.plan = SimpleNamespace(catalog=SimpleNamespace(execution_gate=True))
+        replay._execution_states = {}
+        replay._session_index_by_date = {
+            date(2025, 12, 1): 0,
+            date(2025, 12, 2): 1,
+            date(2025, 12, 3): 2,
+        }
+
+        def at(day: int) -> OrderCandidate:
+            return _candidate(
+                execution_mode="대기 후 재진입",
+                wait_mode="N거래일 이후",
+                wait_interval=2,
+                max_executions=3,
+                session_date_et=date(2025, 12, day),
+            )
+
+        first, second, third = at(1), at(2), at(3)
+        assert replay._apply_execution_policy((), (first,)) == (first,)
+        assert replay._apply_execution_policy((), (second,)) == ()
+        assert replay._apply_execution_policy((), (third,)) == (third,)
+
     def test_cycle_mode_admits_up_to_the_declared_limit(self) -> None:
         state = _ReplayExecutionState()
         candidate = _candidate(execution_mode="주기마다", max_executions=3)
@@ -273,6 +379,12 @@ class TestExecutionGateMatchesLive:
 
     def test_trading_day_wait_counts_weekdays_between_sessions(self) -> None:
         state = _ReplayExecutionState()
+        session_index = {
+            session.trading_date_et: index
+            for index, session in enumerate(
+                XNYS_CALENDAR.session_schedule(date(2025, 12, 1), date(2025, 12, 3)).sessions
+            )
+        }
 
         def at(session_date: date) -> OrderCandidate:
             return _candidate(
@@ -283,10 +395,35 @@ class TestExecutionGateMatchesLive:
                 session_date_et=session_date,
             )
 
-        state.accepts(at(date(2025, 12, 1)))
+        state.accepts(at(date(2025, 12, 1)), session_index=session_index[date(2025, 12, 1)])
 
-        assert state.accepts(at(date(2025, 12, 2))) is False
-        assert state.accepts(at(date(2025, 12, 3))) is True
+        assert state.accepts(at(date(2025, 12, 2)), session_index=session_index[date(2025, 12, 2)]) is False
+        assert state.accepts(at(date(2025, 12, 3)), session_index=session_index[date(2025, 12, 3)]) is True
+
+    def test_trading_day_wait_does_not_count_a_weekday_exchange_holiday(self) -> None:
+        state = _ReplayExecutionState()
+        session_index = {
+            session.trading_date_et: index
+            for index, session in enumerate(
+                XNYS_CALENDAR.session_schedule(date(2025, 12, 24), date(2025, 12, 29)).sessions
+            )
+        }
+
+        def at(session_date: date) -> OrderCandidate:
+            return _candidate(
+                execution_mode="대기 후 재진입",
+                wait_mode="N거래일 이후",
+                wait_interval=2,
+                max_executions=3,
+                session_date_et=session_date,
+            )
+
+        state.accepts(at(date(2025, 12, 24)), session_index=session_index[date(2025, 12, 24)])
+
+        # Christmas is a Thursday but XNYS is closed. Friday is only the first
+        # elapsed trading session; Monday is the second.
+        assert state.accepts(at(date(2025, 12, 26)), session_index=session_index[date(2025, 12, 26)]) is False
+        assert state.accepts(at(date(2025, 12, 29)), session_index=session_index[date(2025, 12, 29)]) is True
 
     def test_condition_rearm_requires_the_condition_to_fail_first(self) -> None:
         state = _ReplayExecutionState()
@@ -316,8 +453,13 @@ class TestExecutionGateIsScopedToOnePositionCycle:
         return replay
 
     @staticmethod
-    def _holding(average: str) -> dict[str, dict[str, str]]:
-        return {INSTRUMENT: {"position.averageEntryPrice": average}}
+    def _holding(average: str, opened_at: str = "2025-12-01T14:30:00+00:00") -> dict[str, dict[str, str]]:
+        return {
+            INSTRUMENT: {
+                "position.averageEntryPrice": average,
+                "position.openedAt": opened_at,
+            }
+        }
 
     def test_closing_the_position_releases_the_gate(self) -> None:
         replay = self._replay()
@@ -328,14 +470,24 @@ class TestExecutionGateIsScopedToOnePositionCycle:
 
         assert replay._execution_states == {}
 
-    def test_re_entering_at_a_different_average_releases_the_gate(self) -> None:
+    def test_re_entering_in_a_new_position_cycle_releases_the_gate(self) -> None:
         replay = self._replay()
         replay._retire_closed_position_gates(self._holding("100"))
         replay._execution_states[("flow-1", INSTRUMENT)] = _ReplayExecutionState(executions=1)
 
-        replay._retire_closed_position_gates(self._holding("104"))
+        replay._retire_closed_position_gates(self._holding("104", opened_at="2025-12-02T14:30:00+00:00"))
 
         assert replay._execution_states == {}
+
+    def test_adding_to_the_same_position_cycle_keeps_the_gate(self) -> None:
+        replay = self._replay()
+        replay._retire_closed_position_gates(self._holding("100"))
+        state = _ReplayExecutionState(executions=1)
+        replay._execution_states[("flow-1", INSTRUMENT)] = state
+
+        replay._retire_closed_position_gates(self._holding("104"))
+
+        assert replay._execution_states == {("flow-1", INSTRUMENT): state}
 
     def test_holding_the_same_position_keeps_the_gate(self) -> None:
         replay = self._replay()
@@ -352,15 +504,28 @@ class TestExecutionGateIsScopedToOnePositionCycle:
         replay = self._replay()
         replay._retire_closed_position_gates(
             {
-                INSTRUMENT: {"position.averageEntryPrice": "100"},
-                other: {"position.averageEntryPrice": "200"},
+                INSTRUMENT: {
+                    "position.averageEntryPrice": "100",
+                    "position.openedAt": "2025-12-01T14:30:00+00:00",
+                },
+                other: {
+                    "position.averageEntryPrice": "200",
+                    "position.openedAt": "2025-12-01T14:30:00+00:00",
+                },
             }
         )
         kept = _ReplayExecutionState(executions=1)
         replay._execution_states[("flow-1", INSTRUMENT)] = _ReplayExecutionState(executions=1)
         replay._execution_states[("flow-1", other)] = kept
 
-        replay._retire_closed_position_gates({other: {"position.averageEntryPrice": "200"}})
+        replay._retire_closed_position_gates(
+            {
+                other: {
+                    "position.averageEntryPrice": "200",
+                    "position.openedAt": "2025-12-01T14:30:00+00:00",
+                }
+            }
+        )
 
         assert replay._execution_states == {("flow-1", other): kept}
 
@@ -402,9 +567,7 @@ class TestTheVisibleWindowMatchesLive:
         return cls._values(count)["closes.30m"]
 
     def test_only_catalog_consumed_series_are_materialized(self) -> None:
-        assert set(self._values(2)) == {
-            "closes.30m", "volumes.30m", "bar.closed.30m"
-        }
+        assert set(self._values(2)) == {"closes.30m", "volumes.30m", "bar.closed.30m"}
 
     def test_a_short_history_is_shown_whole(self) -> None:
         assert len(self._closes(40).split(",")) == 40

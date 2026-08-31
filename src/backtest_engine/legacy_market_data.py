@@ -127,13 +127,9 @@ def _legacy_objects(manifest: Mapping[str, Any]) -> list[dict[str, object]]:
                 object_start = date.fromisoformat(
                     _text(item.get("partition_start"), f"objects[{index}].partition_start")
                 )
-                object_end = date.fromisoformat(
-                    _text(item.get("partition_end"), f"objects[{index}].partition_end")
-                )
+                object_end = date.fromisoformat(_text(item.get("partition_end"), f"objects[{index}].partition_end"))
             except ValueError as exc:
-                raise LegacyMarketDataError(
-                    f"objects[{index}] has an invalid partition boundary"
-                ) from exc
+                raise LegacyMarketDataError(f"objects[{index}] has an invalid partition boundary") from exc
         else:
             object_start, object_end = period_start, period_end
         if int(match["year"]) != object_start.year:
@@ -190,13 +186,13 @@ def _legacy_objects(manifest: Mapping[str, Any]) -> list[dict[str, object]]:
             _text(item.get("provider_version_id"), f"objects[{index}].provider_version_id")
 
         hashed_item: dict[str, object] = {
-                "content_sha256": content_hash,
-                "row_count": row_count,
-                "period_start": object_start.isoformat(),
-                "period_end": object_end.isoformat(),
-                "shard": shard,
-                "part": part,
-            }
+            "content_sha256": content_hash,
+            "row_count": row_count,
+            "period_start": object_start.isoformat(),
+            "period_end": object_end.isoformat(),
+            "shard": shard,
+            "part": part,
+        }
         if composite:
             hashed_item["source_manifest_id"] = source_manifest_id
         hashed.append(hashed_item)
@@ -210,9 +206,7 @@ def _legacy_objects(manifest: Mapping[str, Any]) -> list[dict[str, object]]:
         for shard in range(shard_count)
     }
     if seen != expected:
-        raise LegacyMarketDataError(
-            "legacy manifest must contain exactly one part for every shard and partition"
-        )
+        raise LegacyMarketDataError("legacy manifest must contain exactly one part for every shard and partition")
     if composite:
         ordered_partitions = sorted(covered_partitions)
         if (
@@ -314,7 +308,11 @@ def legacy_period_within_policy(
     period_end: datetime,
     timezone_name: str,
 ) -> bool:
-    """Accept one loader date-labelled segment contained by policy-local dates."""
+    """Accept one loader date-labelled segment overlapping policy-local dates.
+
+    Loader objects are immutable calendar partitions. Boundary partitions may extend beyond an
+    explicit run; aggregate coverage validation clips the read and rejects gaps later.
+    """
     zone = ZoneInfo(timezone_name)
     local_start = period_start.astimezone(zone)
     local_end = period_end.astimezone(zone)
@@ -324,5 +322,7 @@ def legacy_period_within_policy(
     return (
         (local_start.hour, local_start.minute, local_start.second, local_start.microsecond) == midnight
         and (local_end.hour, local_end.minute, local_end.second, local_end.microsecond) == midnight
-        and local_start.date() <= manifest_start < manifest_end <= local_end.date()
+        and manifest_start < manifest_end
+        and manifest_start < local_end.date()
+        and manifest_end > local_start.date()
     )

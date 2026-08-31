@@ -603,6 +603,8 @@ class ElementCatalog:
     """
     canonical_feature_resolutions: Mapping[str, str]
     """Canonical feature UUID -> exact bar resolution pinned by that definition."""
+    execution_gate: bool = False
+    """Whether terminal executionMode/wait/maxExecutions semantics are declared."""
 
     @property
     def operations(self) -> tuple[str, ...]:
@@ -793,6 +795,7 @@ def _production_spec(
 
 _BASIC_ELEMENTS_2026_08_07 = ElementCatalog(
     version="basic-elements:2026-08-07",
+    execution_gate=True,
     specs=MappingProxyType(
         {
             "PRICE_COMPARE": _production_spec(
@@ -970,6 +973,7 @@ _BASIC_ELEMENTS_2026_08_07 = ElementCatalog(
 # immutable for historical replay only.
 _BASIC_ELEMENTS_2026_08_08 = ElementCatalog(
     version="basic-elements:2026-08-08",
+    execution_gate=True,
     specs=_BASIC_ELEMENTS_2026_08_07.specs,
     feature_versions=MappingProxyType({"RSI_14": FEATURE_REGISTRY["RSI_14"].definition_version}),
     canonical_feature_ids=MappingProxyType(
@@ -1090,6 +1094,7 @@ def _v2_specs() -> Mapping[str, ElementSpec]:
 
 _BASIC_ELEMENTS_2026_08_25 = ElementCatalog(
     version="basic-elements:2026-08-25",
+    execution_gate=True,
     specs=_v2_specs(),
     feature_versions=_BASIC_ELEMENTS_2026_08_08.feature_versions,
     canonical_feature_ids=MappingProxyType(

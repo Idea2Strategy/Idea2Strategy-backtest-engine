@@ -380,16 +380,20 @@ class ExecutionModelEngine:
         run_snapshot: RunSnapshot,
         policy: ExecutionPolicy,
         fractional_policy: InstrumentFractionalPolicy,
+        session_schedule: OfficialSessionSchedule,
     ) -> None:
         self._model = model
         self._run = run_snapshot
         self._policy = policy
         self._fractional = fractional_policy
+        self._session_index_by_date = {
+            session.trading_date_et: index for index, session in enumerate(session_schedule.sessions)
+        }
         self._records: list[ResultRecord] = []
         self._instruments: set[str] = set()
         self._declined: list[str] = []
         self._opened_at: dict[str, datetime] = {}
-        self._tracked_average: dict[str, Decimal] = {}
+        self._tracked_position_cycle: dict[str, datetime] = {}
         self._peak_price: dict[str, Decimal] = {}
         self._holding_bars: dict[tuple[str, str], int] = {}
         self._last_runtime_instant: datetime | None = None
@@ -484,9 +488,7 @@ class ExecutionModelEngine:
                 order_result_record(self._run, expired, bar.starts_at, self._model.cash, self._positions())
             )
         cash_after_fill = self._model.cash
-        positions_after_fill = {
-            item.instrument_id: item for item in self._positions()
-        }
+        positions_after_fill = {item.instrument_id: item for item in self._positions()}
         fills = self._model.process_bar(bar)
         for fill in fills:
             current = positions_after_fill.get(fill.instrument_id)
@@ -498,28 +500,18 @@ class ExecutionModelEngine:
                     fractional_eligible=True,
                     label="position.quantity",
                 )
-                next_basis = quantize_money(
-                    current_basis + fill.cost_basis, "position.cost_basis"
-                )
-                cash_after_fill = quantize_money(
-                    cash_after_fill - fill.gross_amount - fill.fee, "cash_after"
-                )
+                next_basis = quantize_money(current_basis + fill.cost_basis, "position.cost_basis")
+                cash_after_fill = quantize_money(cash_after_fill - fill.gross_amount - fill.fee, "cash_after")
             else:
                 next_quantity = quantize_quantity(
                     current_quantity - fill.quantity,
                     fractional_eligible=True,
                     label="position.quantity",
                 )
-                next_basis = quantize_money(
-                    current_basis - fill.cost_basis, "position.cost_basis"
-                )
-                cash_after_fill = quantize_money(
-                    cash_after_fill + fill.gross_amount - fill.fee, "cash_after"
-                )
+                next_basis = quantize_money(current_basis - fill.cost_basis, "position.cost_basis")
+                cash_after_fill = quantize_money(cash_after_fill + fill.gross_amount - fill.fee, "cash_after")
             if next_quantity > _ZERO:
-                positions_after_fill[fill.instrument_id] = PositionAfter(
-                    fill.instrument_id, next_quantity, next_basis
-                )
+                positions_after_fill[fill.instrument_id] = PositionAfter(fill.instrument_id, next_quantity, next_basis)
             else:
                 positions_after_fill.pop(fill.instrument_id, None)
             self._records.append(
@@ -538,13 +530,9 @@ class ExecutionModelEngine:
             self._clear_position_runtime(event.instrument_id)
         return len(fills)
 
-    def runtime_values(
-        self, instant: datetime, events: tuple[MarketDataEvent, ...]
-    ) -> Mapping[str, Mapping[str, str]]:
+    def runtime_values(self, instant: datetime, events: tuple[MarketDataEvent, ...]) -> Mapping[str, Mapping[str, str]]:
         """Publish the same position metrics the live Basic runtime evaluates."""
-        current_prices = {
-            event.instrument_id: event.payload["bar"].close for event in events
-        }
+        current_prices = {event.instrument_id: event.payload["bar"].close for event in events}
         if self._valuation_opening_at is None:
             self._valuation_opening_at = instant
         self._latest_prices.update(current_prices)
@@ -564,9 +552,10 @@ class ExecutionModelEngine:
             position = self._model.position(instrument_id)
             if position.quantity <= _ZERO:
                 continue
-            average = position.cost_basis / position.quantity
-            if self._tracked_average.get(instrument_id) != average:
-                self._tracked_average[instrument_id] = average
+            average = _average_entry_price(position.cost_basis, position.quantity)
+            opened_at = self._opened_at.get(instrument_id, instant)
+            if self._tracked_position_cycle.get(instrument_id) != opened_at:
+                self._tracked_position_cycle[instrument_id] = opened_at
                 self._peak_price[instrument_id] = average
                 self._holding_bars = {
                     key: value for key, value in self._holding_bars.items() if key[0] != instrument_id
@@ -587,7 +576,7 @@ class ExecutionModelEngine:
             price = current_prices.get(instrument_id)
             if position.quantity <= _ZERO or price is None:
                 continue
-            average = position.cost_basis / position.quantity
+            average = _average_entry_price(position.cost_basis, position.quantity)
             peak = max(self._peak_price.get(instrument_id, average), price)
             self._peak_price[instrument_id] = peak
             opened_at = self._opened_at.get(instrument_id, instant)
@@ -595,10 +584,13 @@ class ExecutionModelEngine:
             current = instant.astimezone(market_zone).date()
             values = {
                 "position.averageEntryPrice": str(average),
+                "position.openedAt": opened_at.isoformat(),
                 "position.returnPercent": str(_metric_percent(price - average, average)),
                 "position.peakReturnPercent": str(_metric_percent(peak - average, average)),
                 "position.drawdownPercent": str(_metric_percent(peak - price, peak)),
-                "position.holdingTradingDays": str(_weekdays_between(opened, current)),
+                "position.holdingTradingDays": str(
+                    _trading_sessions_between(self._session_index_by_date, opened, current)
+                ),
             }
             for resolution in ("30m", "1h", "4h", "1d"):
                 values[f"position.holdingBars.{resolution}"] = str(
@@ -620,11 +612,9 @@ class ExecutionModelEngine:
 
     def _clear_position_runtime(self, instrument_id: str) -> None:
         self._opened_at.pop(instrument_id, None)
-        self._tracked_average.pop(instrument_id, None)
+        self._tracked_position_cycle.pop(instrument_id, None)
         self._peak_price.pop(instrument_id, None)
-        self._holding_bars = {
-            key: value for key, value in self._holding_bars.items() if key[0] != instrument_id
-        }
+        self._holding_bars = {key: value for key, value in self._holding_bars.items() if key[0] != instrument_id}
 
     # -- internals ---------------------------------------------------------
 
@@ -634,9 +624,7 @@ class ExecutionModelEngine:
         if side is OrderSide.SELL:
             # A disposal is sized by the held position, never by a cash budget.
             held = self._model.position(str(candidate.instrument_id)).quantity
-            return _floor_to_quantum(
-                held * Decimal(candidate.order_percent) / Decimal(100), quantum
-            )
+            return _floor_to_quantum(held * Decimal(candidate.order_percent) / Decimal(100), quantum)
 
         allocation = candidate.allocation
         if allocation is None:
@@ -712,19 +700,25 @@ def _metric_percent(numerator: Decimal, denominator: Decimal) -> Decimal:
     """
     if denominator == _ZERO:
         return _ZERO
-    return (numerator * Decimal(100) / denominator).quantize(
-        Decimal("0.00000001"), rounding=ROUND_HALF_EVEN
-    )
+    return (numerator * Decimal(100) / denominator).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_EVEN)
 
 
-def _weekdays_between(start: date, end: date) -> int:
-    count = 0
-    cursor = start
-    while cursor <= end:
-        if cursor.weekday() < 5:
-            count += 1
-        cursor += timedelta(days=1)
-    return max(0, count - 1)
+def _average_entry_price(cost_basis: Decimal, quantity: Decimal) -> Decimal:
+    """Canonical position average under ``precision:1.0.0``."""
+    if quantity <= _ZERO:
+        raise WiringError("position quantity must be positive when publishing its average price")
+    return (cost_basis / quantity).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_EVEN)
+
+
+def _trading_sessions_between(session_index_by_date: Mapping[date, int], start: date, end: date) -> int:
+    """Elapsed official sessions, with the opening session treated as day zero."""
+    try:
+        start_index = session_index_by_date[start]
+        end_index = session_index_by_date[end]
+    except KeyError as exc:
+        raise WiringError(f"position metric date {exc.args[0]} is absent from the pinned session schedule") from exc
+    return max(0, end_index - start_index)
+
 
 # ==========================================================================
 # object_store.StorageObjectWritePort
@@ -875,14 +869,10 @@ class PersistenceExecutionKeyStore:
             raise ValueError("persistent execution mutation requires its fencing claim")
         return uuid.UUID(claim.attempt_id), uuid.UUID(claim.claim_token)
 
-    def heartbeat(
-        self, key: str, claim: ExecutionClaim, *, lease_duration: timedelta
-    ) -> str | None:
-        attempt_id, claim_token = self._claim_ids(claim)
+    def heartbeat(self, key: str, claim: ExecutionClaim, *, lease_duration: timedelta) -> str | None:
+        attempt_id, fence_token = self._claim_ids(claim)
         with self._persistence.unit_of_work() as uow:
-            attempt = uow.attempts.heartbeat_fenced(
-                attempt_id, claim_token, lease_duration=lease_duration
-            )
+            attempt = uow.attempts.heartbeat_fenced(attempt_id, fence_token, lease_duration=lease_duration)
             run = uow.runs.get(attempt.run_id)
             if run.cancellation_requested_at is None:
                 return None
@@ -896,11 +886,11 @@ class PersistenceExecutionKeyStore:
         claim: ExecutionClaim | None = None,
         reason_code: str | None = None,
     ) -> None:
-        attempt_id, claim_token = self._claim_ids(claim)
+        attempt_id, fence_token = self._claim_ids(claim)
         with self._persistence.unit_of_work() as uow:
             uow.attempts.release_fenced(
                 attempt_id,
-                claim_token,
+                fence_token,
                 terminal_reason_code="RETRY_RELEASED",
                 failure_code=reason_code or "RETRY_REQUESTED",
             )
@@ -918,7 +908,7 @@ class PersistenceExecutionKeyStore:
     ) -> None:
         if status is ExecutionRecordStatus.IN_PROGRESS:
             raise ValueError("finish requires a terminal status")
-        attempt_id, claim_token = self._claim_ids(claim)
+        attempt_id, fence_token = self._claim_ids(claim)
         work_status = {
             ExecutionRecordStatus.SUCCEEDED: WorkStatus.SUCCEEDED,
             ExecutionRecordStatus.CANCELLED: WorkStatus.CANCELLED,
@@ -927,7 +917,7 @@ class PersistenceExecutionKeyStore:
         with self._persistence.unit_of_work() as uow:
             uow.attempts.close_fenced(
                 attempt_id,
-                claim_token,
+                fence_token,
                 status=work_status,
                 terminal_reason_code=reason_code or status.value,
                 failure_code=(
@@ -942,26 +932,31 @@ class PersistenceExecutionKeyStore:
                 current = uow.runs.get(uuid.UUID(run_id))
                 if current.status in (RunStatus.QUEUED, RunStatus.RUNNING):
                     uow.runs.mark_failed(
-                        current.id, now, run_failure_code or reason_code or "EXECUTION_FAILED",
+                        current.id,
+                        now,
+                        run_failure_code or reason_code or "EXECUTION_FAILED",
                         retryable=False,
                     )
             elif status is ExecutionRecordStatus.CANCELLED and run_id is not None:
                 current = uow.runs.get(uuid.UUID(run_id))
                 if current.status in (RunStatus.QUEUED, RunStatus.RUNNING):
-                    uow.runs.mark_cancelled(
-                        current.id, now, reason_code or "EXECUTION_CANCELLED"
-                    )
+                    uow.runs.mark_cancelled(current.id, now, reason_code or "EXECUTION_CANCELLED")
 
-    def record_run_failure(
-        self, key: str, run_id: str, failure_code: str, *, now: datetime
-    ) -> ExecutionRecordStatus:
+    def record_run_failure(self, key: str, run_id: str, failure_code: str, *, now: datetime) -> ExecutionRecordStatus:
         del key
         with self._persistence.unit_of_work() as uow:
             run_uuid = uuid.UUID(run_id)
-            current = uow.connection.execute(text("""
+            current = (
+                uow.connection.execute(
+                    text("""
                 SELECT status, cancellation_requested_at, cancellation_reason_code
                   FROM backtest.runs WHERE id=:id FOR UPDATE
-            """), {"id": run_uuid}).mappings().one()
+            """),
+                    {"id": run_uuid},
+                )
+                .mappings()
+                .one()
+            )
             run_status = RunStatus(current["status"])
             if run_status is RunStatus.COMPLETED:
                 return ExecutionRecordStatus.SUCCEEDED
@@ -970,25 +965,35 @@ class PersistenceExecutionKeyStore:
             if run_status in (RunStatus.FAILED, RunStatus.UNAVAILABLE):
                 return ExecutionRecordStatus.FAILED
             database_now = uow.connection.scalar(text("SELECT clock_timestamp()"))
-            latest = uow.connection.execute(text("""
+            latest = (
+                uow.connection.execute(
+                    text("""
                 SELECT id, status, claim_expires_at
                   FROM backtest.run_attempts
                  WHERE run_id=:id
                  ORDER BY attempt_number DESC
                  LIMIT 1
                  FOR UPDATE
-            """), {"id": run_uuid}).mappings().first()
+            """),
+                    {"id": run_uuid},
+                )
+                .mappings()
+                .first()
+            )
             if current["cancellation_requested_at"] is not None:
                 if latest is not None and latest["status"] == WorkStatus.RUNNING.value:
                     if latest["claim_expires_at"] is not None and latest["claim_expires_at"] > database_now:
                         return ExecutionRecordStatus.IN_PROGRESS
-                    uow.connection.execute(text("""
+                    uow.connection.execute(
+                        text("""
                         UPDATE backtest.run_attempts
                            SET status='CANCELLED', completed_at=:now,
                                failure_code=NULL, terminal_reason_code='CANCELLED_BY_REQUEST'
                          WHERE id=:attempt_id AND status='RUNNING'
                            AND (claim_expires_at IS NULL OR claim_expires_at <= :now)
-                    """), {"attempt_id": latest["id"], "now": database_now})
+                    """),
+                        {"attempt_id": latest["id"], "now": database_now},
+                    )
                 uow.runs.mark_cancelled(
                     run_uuid,
                     database_now,
@@ -998,15 +1003,20 @@ class PersistenceExecutionKeyStore:
             if latest is not None and latest["status"] == WorkStatus.RUNNING.value:
                 if latest["claim_expires_at"] is not None and latest["claim_expires_at"] > database_now:
                     return ExecutionRecordStatus.IN_PROGRESS
-                uow.connection.execute(text("""
+                uow.connection.execute(
+                    text("""
                     UPDATE backtest.run_attempts
                        SET status='FAILED', completed_at=:now,
                            failure_code=:reason, terminal_reason_code=:reason
                      WHERE id=:attempt_id AND status='RUNNING'
                        AND (claim_expires_at IS NULL OR claim_expires_at <= :now)
-                """), {
-                    "attempt_id": latest["id"], "now": database_now, "reason": failure_code,
-                })
+                """),
+                    {
+                        "attempt_id": latest["id"],
+                        "now": database_now,
+                        "reason": failure_code,
+                    },
+                )
             uow.runs.mark_failed(run_uuid, database_now, failure_code, retryable=False)
             return ExecutionRecordStatus.FAILED
 
@@ -1062,9 +1072,7 @@ class FeatureMaterializationPin:
     locked_result_hash: str
 
 
-def verify_feature_materialization_pins(
-    pins: Sequence[FeatureMaterializationPin], source: Any | None
-) -> None:
+def verify_feature_materialization_pins(pins: Sequence[FeatureMaterializationPin], source: Any | None) -> None:
     """Verify every immutable feature output, then fail closed until consumption is defined."""
 
     if not pins:
@@ -1155,9 +1163,7 @@ class JobEnvelope:
                 raise ValueError("datasets must not be empty")
             representative_id = uuid.UUID(str(job["datasetManifestId"]))
             representative_hash = (
-                _pinned_hash(job["expectedDatasetHash"])
-                if job.get("expectedDatasetHash") is not None
-                else None
+                _pinned_hash(job["expectedDatasetHash"]) if job.get("expectedDatasetHash") is not None else None
             )
             representatives = [pin for pin in datasets if pin.manifest_id == representative_id]
             if len(representatives) != 1 or representatives[0].expected_hash != representative_hash:
@@ -1172,33 +1178,19 @@ class JobEnvelope:
                 execution_policy_version=str(job["executionPolicyVersion"]),
                 compiled_plan_checksum=_pinned_hash(job["compiledPlanChecksum"]),
                 dataset_manifest_id=representative_id,
-                expected_dataset_hash=(
-                    representative_hash
-                    if job.get("expectedDatasetHash") is not None
-                    else None
-                ),
+                expected_dataset_hash=(representative_hash if job.get("expectedDatasetHash") is not None else None),
                 expected_snapshot_hash=_pinned_hash(job["expectedSnapshotHash"]),
                 datasets=datasets,
                 feature_materializations=features,
                 evaluation_period_id=(
-                    uuid.UUID(str(job["evaluationPeriodId"]))
-                    if job.get("evaluationPeriodId") is not None
-                    else None
+                    uuid.UUID(str(job["evaluationPeriodId"])) if job.get("evaluationPeriodId") is not None else None
                 ),
-                input_set_hash=(
-                    _pinned_hash(job["inputSetHash"])
-                    if job.get("inputSetHash") is not None
-                    else None
-                ),
+                input_set_hash=(_pinned_hash(job["inputSetHash"]) if job.get("inputSetHash") is not None else None),
                 evaluation_start=(
-                    date.fromisoformat(str(job["evaluationStart"]))
-                    if job.get("evaluationStart") is not None
-                    else None
+                    date.fromisoformat(str(job["evaluationStart"])) if job.get("evaluationStart") is not None else None
                 ),
                 evaluation_end=(
-                    date.fromisoformat(str(job["evaluationEnd"]))
-                    if job.get("evaluationEnd") is not None
-                    else None
+                    date.fromisoformat(str(job["evaluationEnd"])) if job.get("evaluationEnd") is not None else None
                 ),
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -1223,6 +1215,7 @@ class JobBinding:
     job: BacktestJob
     correlation_id: str
     manifests: tuple[tuple[DatasetPin, Mapping[str, Any]], ...]
+    session_schedule: OfficialSessionSchedule
     feature_series: tuple[PinnedFeatureSeries, ...] = ()
 
     @property
@@ -1503,8 +1496,7 @@ def _judgment_evaluations(run_snapshot_id: str, evaluations: Sequence[Any]) -> t
                     trade_occurred=evaluation.trade_occurred,
                     data_gap=evaluation.data_gap,
                     basic_outcomes=tuple(
-                        ConditionOutcome(key, passed)
-                        for key, passed in evaluation.condition_outcomes
+                        ConditionOutcome(key, passed) for key, passed in evaluation.condition_outcomes
                     ),
                 )
             )
@@ -1620,8 +1612,7 @@ def segmented_dataset_coverage(
     for next_start, next_end in windows[1:]:
         if next_start < end:
             raise JobNotSatisfiable(
-                f"pinned {next(iter(resolutions))} dataset segments overlap at "
-                f"{next_start.isoformat()}",
+                f"pinned {next(iter(resolutions))} dataset segments overlap at {next_start.isoformat()}",
                 reason_code="REQUIRED_INPUT_UNAVAILABLE",
             )
         if next_start > end:
@@ -1666,9 +1657,7 @@ def _resolve_position_only_flow_clocks(
     plan: BasicCompiledPlan, *, fallback_resolution: str | None = None
 ) -> BasicCompiledPlan:
     """Bind each position-only flow to the unique market clock for its instruments."""
-    has_concrete_clock = any(
-        flow.reference_series[1] != "$DATASET" for flow in plan.flows
-    )
+    has_concrete_clock = any(flow.reference_series[1] != "$DATASET" for flow in plan.flows)
     if not has_concrete_clock:
         if fallback_resolution is None:
             raise JobNotSatisfiable(
@@ -1759,13 +1748,17 @@ def require_compatible_execution_window(
             problems.append(f"legacy dataset manifest is invalid: {exc}")
             period_matches = False
     else:
+        # Immutable market data is partitioned by calendar year. The first and last
+        # segments therefore normally extend beyond an explicit run interval; the
+        # aggregate coverage check below clips reads to that interval and rejects gaps.
+        # What is invalid here is a segment with no relationship to the policy at all.
         period_matches = (
-            policy.period_start <= manifest_start < manifest_end <= policy.period_end
+            manifest_start < manifest_end and manifest_start < policy.period_end and manifest_end > policy.period_start
         )
     if not period_matches:
         problems.append(
             "dataset manifest period "
-            f"{manifest_start.isoformat()}..{manifest_end.isoformat()} is outside "
+            f"{manifest_start.isoformat()}..{manifest_end.isoformat()} does not overlap "
             f"execution policy {policy.version} period "
             f"{policy.period_start.isoformat()}..{policy.period_end.isoformat()}"
         )
@@ -1824,17 +1817,13 @@ class _CancellationAwareMonitor:
     def sample(self) -> ResourceSample:
         reason = self._cancellation_reason()
         if reason == "WORKER_HEARTBEAT_UNAVAILABLE":
-            self._coordinator.cancel_by_system(
-                self._wall_clock(), reason_code=reason
-            )
+            self._coordinator.cancel_by_system(self._wall_clock(), reason_code=reason)
             raise AttemptFailure(
                 FailureKind.SYSTEM_CANCELLED,
                 "durable worker heartbeat became unavailable",
             )
         if reason is not None and self._coordinator.cancellation is None:
-            self._coordinator.request_cancellation(
-                self._wall_clock(), reason_code=reason, requested_by="DURABLE_RUN"
-            )
+            self._coordinator.request_cancellation(self._wall_clock(), reason_code=reason, requested_by="DURABLE_RUN")
         return self._delegate.sample()
 
 
@@ -1979,6 +1968,7 @@ class OrchestratorJobHandler:
             run_snapshot=binding.run_snapshot,
             policy=binding.policy,
             fractional_policy=self._fractional,
+            session_schedule=binding.session_schedule,
         )
         publisher = DurableResultPublisher(
             binding=binding,
@@ -2006,9 +1996,7 @@ class OrchestratorJobHandler:
         )
         monitor: ResourceMonitor = self._monitor
         if context.cancellation_reason is not None:
-            monitor = _CancellationAwareMonitor(
-                monitor, coordinator, context.cancellation_reason, self._wall_clock
-            )
+            monitor = _CancellationAwareMonitor(monitor, coordinator, context.cancellation_reason, self._wall_clock)
         outcome = orchestrator.run(binding.job, coordinator=coordinator, lease=lease, monitor=monitor)
         return self._report(binding, outcome, coordinator, context)
 
@@ -2036,8 +2024,7 @@ class OrchestratorJobHandler:
         for pin in envelope.datasets:
             resolved = self._manifests.by_id(pin.manifest_id)
             if resolved is None or (
-                pin.expected_hash is not None
-                and _prefixed(str(resolved["dataset_hash"])) != pin.expected_hash
+                pin.expected_hash is not None and _prefixed(str(resolved["dataset_hash"])) != pin.expected_hash
             ):
                 raise JobNotSatisfiable(
                     f"dataset manifest {pin.manifest_id} is missing or changed",
@@ -2066,21 +2053,14 @@ class OrchestratorJobHandler:
             manifests_by_scope: dict[str, list[Mapping[str, Any]]] = {}
             for resolved in manifests:
                 manifests_by_scope.setdefault(str(resolved.get("instrument_id") or "*"), []).append(resolved)
-            scoped_windows = [
-                segmented_dataset_coverage(scoped)
-                for scoped in manifests_by_scope.values()
-            ]
+            scoped_windows = [segmented_dataset_coverage(scoped) for scoped in manifests_by_scope.values()]
             coverage_by_resolution[resolution] = (
                 max(window[0] for window in scoped_windows),
                 min(window[1] for window in scoped_windows),
             )
         position_only_fallback: str | None = None
         if plan.reference_series[1] == "$DATASET":
-            primary_pins = [
-                item
-                for item in resolved_manifests
-                if item[0].manifest_id == envelope.dataset_manifest_id
-            ]
+            primary_pins = [item for item in resolved_manifests if item[0].manifest_id == envelope.dataset_manifest_id]
             if len(primary_pins) != 1:
                 raise JobNotSatisfiable(
                     "the representative dataset is not pinned exactly once",
@@ -2107,13 +2087,16 @@ class OrchestratorJobHandler:
                     reason_code="REQUIRED_INPUT_UNAVAILABLE",
                 )
             primary_manifests = [
-                resolved for pin, resolved in resolved_manifests
+                resolved
+                for pin, resolved in resolved_manifests
                 if pin.manifest_id == envelope.dataset_manifest_id
                 and str(resolved.get("resolution", "")) == reference_resolution
             ]
-            manifest = primary_manifests[0] if len(primary_manifests) == 1 else sorted(
-                reference_manifests, key=lambda item: dataset_coverage(item)
-            )[0]
+            manifest = (
+                primary_manifests[0]
+                if len(primary_manifests) == 1
+                else sorted(reference_manifests, key=lambda item: dataset_coverage(item))[0]
+            )
         plan = _resolve_position_only_flow_clocks(
             plan,
             fallback_resolution=position_only_fallback,
@@ -2125,9 +2108,9 @@ class OrchestratorJobHandler:
                     reason_code="REQUIRED_INPUT_UNAVAILABLE",
                 )
             policy_zone = ZoneInfo(policy.timezone)
-            evaluation_from = datetime.combine(
-                envelope.evaluation_start, time.min, tzinfo=policy_zone
-            ).astimezone(timezone.utc)
+            evaluation_from = datetime.combine(envelope.evaluation_start, time.min, tzinfo=policy_zone).astimezone(
+                timezone.utc
+            )
             evaluation_through = datetime.combine(
                 envelope.evaluation_end + timedelta(days=1), time.min, tzinfo=policy_zone
             ).astimezone(timezone.utc)
@@ -2145,13 +2128,9 @@ class OrchestratorJobHandler:
             evaluation_from, evaluation_through = reference_start + warmup, reference_end
         policy_zone = ZoneInfo(policy.timezone)
         schedule_first = evaluation_from.astimezone(policy_zone).date()
-        schedule_last = (evaluation_through - timedelta(microseconds=1)).astimezone(
-            policy_zone
-        ).date()
+        schedule_last = (evaluation_through - timedelta(microseconds=1)).astimezone(policy_zone).date()
         try:
-            evaluation_schedule = self._calendar.session_schedule(
-                schedule_first, schedule_last
-            )
+            evaluation_schedule = self._calendar.session_schedule(schedule_first, schedule_last)
         except CalendarCoverageError as exc:
             raise JobNotSatisfiable(
                 f"the official session calendar does not cover the evaluation interval: {exc}",
@@ -2190,9 +2169,7 @@ class OrchestratorJobHandler:
                     ),
                 )
             except FeatureOutputBindingError as exc:
-                raise JobNotSatisfiable(
-                    str(exc), reason_code="REQUIRED_INPUT_UNAVAILABLE"
-                ) from exc
+                raise JobNotSatisfiable(str(exc), reason_code="REQUIRED_INPUT_UNAVAILABLE") from exc
         requirements = derive_data_requirements(
             plan, evaluation_from=evaluation_from, evaluation_through=evaluation_through
         )
@@ -2249,6 +2226,7 @@ class OrchestratorJobHandler:
             job=backtest_job,
             correlation_id=self._correlation_id,
             manifests=tuple(resolved_manifests),
+            session_schedule=evaluation_schedule,
             feature_series=feature_series,
         )
 
@@ -2482,8 +2460,7 @@ def build_api_runtime(environ: Mapping[str, str]) -> ApiRuntime:
             # endpoint the deployment is on.
             boto3.client(
                 "sqs",
-                endpoint_url=environ.get("AWS_ENDPOINT_URL_SQS")
-                or environ.get("AWS_ENDPOINT_URL"),
+                endpoint_url=environ.get("AWS_ENDPOINT_URL_SQS") or environ.get("AWS_ENDPOINT_URL"),
                 region_name=environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION"),
             ),
             environ["BACKTEST_QUEUE_URL"],
