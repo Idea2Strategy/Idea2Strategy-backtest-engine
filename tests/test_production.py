@@ -61,6 +61,24 @@ def test_worker_wall_clock_advances_from_monotonic_elapsed_time() -> None:
     assert clock() == anchor.replace(second=4)
 
 
+def test_worker_wall_clock_resynchronizes_forward_without_regressing() -> None:
+    anchor = datetime(2026, 8, 25, 13, 0, tzinfo=UTC)
+    wall_instants = iter(
+        (
+            anchor,
+            anchor.replace(hour=14),
+            anchor.replace(hour=12),
+            anchor.replace(hour=14, second=5),
+        )
+    )
+    ticks = iter((100.0, 101.0, 102.0, 103.0))
+    clock = MonotonicUtcClock(lambda: next(wall_instants), lambda: next(ticks))
+
+    assert clock() == anchor.replace(hour=14)
+    assert clock() == anchor.replace(hour=14)
+    assert clock() == anchor.replace(hour=14, second=5)
+
+
 class _HttpResultResponse:
     status = 200
 
@@ -475,6 +493,25 @@ def test_feature_object_reader_requests_the_exact_s3_version_and_closes_the_body
         "VersionId": "version-7",
     }
     assert s3.body.closed
+
+
+def test_feature_object_reader_accepts_the_legacy_s3_provider_name() -> None:
+    class Body:
+        def read(self) -> bytes:
+            return b"versioned-feature-bytes"
+
+        def close(self) -> None:
+            pass
+
+    class S3:
+        def get_object(self, **_kwargs: str) -> dict[str, object]:
+            return {"Body": Body()}
+
+    reader = S3VersionedFeatureObjectReader(S3())
+
+    assert reader.read_version("S3", "feature-bucket", "features/rsi.parquet", "version-7") == (
+        b"versioned-feature-bytes"
+    )
 
 
 @pytest.mark.docker
