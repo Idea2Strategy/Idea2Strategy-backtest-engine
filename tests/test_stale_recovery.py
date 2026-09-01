@@ -72,6 +72,19 @@ def _expire(engine: Engine, run_id: uuid.UUID) -> None:
         )
 
 
+def _set_old_queue_order(engine: Engine, run_ids: list[uuid.UUID]) -> None:
+    queued_at = datetime.now(UTC) - timedelta(hours=2)
+    with engine.begin() as connection:
+        for position, run_id in enumerate(run_ids):
+            connection.execute(
+                text("UPDATE backtest.runs SET queued_at=:queued_at WHERE id=:id"),
+                {
+                    "id": run_id,
+                    "queued_at": queued_at + timedelta(seconds=position),
+                },
+            )
+
+
 def test_exhausted_queued_run_becomes_failed_with_no_sixth_attempt(
     persistence: BacktestPersistence, admin_engine: Engine
 ) -> None:
@@ -331,3 +344,68 @@ def test_lane_dispatch_grace_differs_without_a_global_two_hour_blind_spot(
     assert _state(admin_engine, run_ids["COMPETITION"])["status"] == "FAILED"
     assert _state(admin_engine, run_ids["BASIC"])["status"] == "QUEUED"
     assert _state(admin_engine, run_ids["CUSTOM"])["status"] == "QUEUED"
+
+
+@pytest.mark.parametrize(
+    ("lane", "predecessor_count"),
+    [
+        (RunLane.BASIC, 2),
+        (RunLane.CUSTOM, 1),
+        (RunLane.COMPETITION, 1),
+    ],
+)
+def test_same_pass_requeued_predecessors_become_lane_heads_before_later_backlog_is_considered(
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    lane: RunLane,
+    predecessor_count: int,
+) -> None:
+    predecessor_ids = [_run(persistence, lane=lane) for _ in range(predecessor_count)]
+    backlog_id = _run(persistence, lane=lane)
+    _set_old_queue_order(admin_engine, [*predecessor_ids, backlog_id])
+    store = PersistenceExecutionKeyStore(persistence)
+    for position, run_id in enumerate(predecessor_ids):
+        claim = store.claim(
+            worker_execution_key_for(str(run_id), f"same-pass-{lane.value}-{position}"),
+            run_id=str(run_id),
+            owner=f"{lane.value}-worker-{position}",
+            now=datetime.now(UTC),
+            lease_duration=timedelta(minutes=1),
+        )
+        assert claim.acquired
+        _expire(admin_engine, run_id)
+
+    report = StaleRunRecovery(persistence, max_attempts=5, queue_policy=POLICY).recover_once()
+
+    assert report.requeued == predecessor_count
+    assert report.failed == 0
+    assert all(_state(admin_engine, run_id)["status"] == "QUEUED" for run_id in [*predecessor_ids, backlog_id])
+
+
+def test_same_pass_requeue_leaves_basic_lane_remaining_capacity_available(
+    persistence: BacktestPersistence, admin_engine: Engine
+) -> None:
+    predecessor_id = _run(persistence, lane=RunLane.BASIC)
+    stale_head_id = _run(persistence, lane=RunLane.BASIC)
+    _set_old_queue_order(admin_engine, [predecessor_id, stale_head_id])
+    store = PersistenceExecutionKeyStore(persistence)
+    claim = store.claim(
+        worker_execution_key_for(str(predecessor_id), "same-pass-basic-one-slot"),
+        run_id=str(predecessor_id),
+        owner="basic-worker",
+        now=datetime.now(UTC),
+        lease_duration=timedelta(minutes=1),
+    )
+    assert claim.acquired
+    _expire(admin_engine, predecessor_id)
+
+    report = StaleRunRecovery(persistence, max_attempts=5, queue_policy=POLICY).recover_once()
+
+    assert report.requeued == 1
+    assert report.failed == 1
+    assert _state(admin_engine, predecessor_id)["status"] == "QUEUED"
+    assert _state(admin_engine, stale_head_id) == {
+        "status": "FAILED",
+        "failure_code": "QUEUE_DISPATCH_TIMEOUT",
+        "cancellation_reason_code": None,
+    }

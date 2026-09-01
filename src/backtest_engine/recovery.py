@@ -119,32 +119,7 @@ class StaleRunRecovery:
                        r.cancellation_requested_at, r.cancellation_reason_code,
                        a.id AS attempt_id, a.attempt_number, a.status AS attempt_status,
                        a.completed_at AS attempt_completed_at,
-                       a.claim_expires_at, a.last_heartbeat_at,
-                       (SELECT count(*)
-                          FROM backtest.runs q
-                         WHERE q.lane=r.lane AND q.status='QUEUED'
-                           AND (q.queued_at < r.queued_at
-                                OR (q.queued_at=r.queued_at AND q.id < r.id)))
-                           AS queued_ahead,
-                       (SELECT count(*)
-                          FROM backtest.runs active
-                          JOIN LATERAL (
-                            SELECT status, claim_expires_at, last_heartbeat_at
-                              FROM backtest.run_attempts active_attempt
-                             WHERE active_attempt.run_id=active.id
-                             ORDER BY attempt_number DESC LIMIT 1
-                          ) live_attempt ON true
-                         WHERE active.lane=r.lane AND active.status='RUNNING'
-                           AND live_attempt.status='RUNNING'
-                           AND live_attempt.claim_expires_at > :now
-                           AND live_attempt.last_heartbeat_at IS NOT NULL)
-                           AS live_lane_attempts,
-                       (SELECT max(prior.completed_at)
-                          FROM backtest.runs prior
-                         WHERE prior.lane=r.lane AND prior.completed_at IS NOT NULL
-                           AND (prior.queued_at < r.queued_at
-                                OR (prior.queued_at=r.queued_at AND prior.id < r.id)))
-                           AS lane_progress_at
+                       a.claim_expires_at, a.last_heartbeat_at
                   FROM backtest.runs r
                   LEFT JOIN LATERAL (
                     SELECT id, attempt_number, status, completed_at,
@@ -158,7 +133,6 @@ class StaleRunRecovery:
                  ORDER BY r.queued_at, r.id
                  FOR UPDATE OF r SKIP LOCKED
             """),
-                    {"now": now},
                 )
                 .mappings()
                 .all()
@@ -235,21 +209,65 @@ class StaleRunRecovery:
             counts["requeued"] += changed.rowcount
             return
 
-        live_lane_attempts = int(row["live_lane_attempts"] or 0)
+        lane_facts = self._current_lane_facts(connection, row, now)
+        live_lane_attempts = int(lane_facts["live_lane_attempts"] or 0)
         available_slots = max(lane_policy.capacity - live_lane_attempts, 0)
-        if int(row["queued_ahead"] or 0) >= available_slots:
+        if int(lane_facts["queued_ahead"] or 0) >= available_slots:
             return
         progress_at = max(
             value
             for value in (
                 row["queued_at"],
                 row["attempt_completed_at"],
-                row["lane_progress_at"],
+                lane_facts["lane_progress_at"],
             )
             if value is not None
         )
         if progress_at + lane_policy.dispatch_timeout <= now:
             counts["failed"] += self._fail_run(connection, row["id"], now, "QUEUE_DISPATCH_TIMEOUT")
+
+    @staticmethod
+    def _current_lane_facts(connection: Any, row: Any, now: datetime) -> Mapping[str, Any]:
+        """Read queue position after all earlier mutations in this recovery pass."""
+        return (
+            connection.execute(
+                text("""
+                SELECT (SELECT count(*)
+                          FROM backtest.runs q
+                         WHERE q.lane=:lane AND q.status='QUEUED'
+                           AND (q.queued_at < :queued_at
+                                OR (q.queued_at=:queued_at AND q.id < :id)))
+                           AS queued_ahead,
+                       (SELECT count(*)
+                          FROM backtest.runs active
+                          JOIN LATERAL (
+                            SELECT status, claim_expires_at, last_heartbeat_at
+                              FROM backtest.run_attempts active_attempt
+                             WHERE active_attempt.run_id=active.id
+                             ORDER BY attempt_number DESC LIMIT 1
+                          ) live_attempt ON true
+                         WHERE active.lane=:lane AND active.status='RUNNING'
+                           AND live_attempt.status='RUNNING'
+                           AND live_attempt.claim_expires_at > :now
+                           AND live_attempt.last_heartbeat_at IS NOT NULL)
+                           AS live_lane_attempts,
+                       (SELECT max(prior.completed_at)
+                          FROM backtest.runs prior
+                         WHERE prior.lane=:lane AND prior.completed_at IS NOT NULL
+                           AND (prior.queued_at < :queued_at
+                                OR (prior.queued_at=:queued_at AND prior.id < :id)))
+                           AS lane_progress_at
+            """),
+                {
+                    "id": row["id"],
+                    "lane": row["lane"],
+                    "queued_at": row["queued_at"],
+                    "now": now,
+                },
+            )
+            .mappings()
+            .one()
+        )
 
     @staticmethod
     def _close_expired_attempt(
