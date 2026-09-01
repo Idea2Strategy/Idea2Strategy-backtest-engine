@@ -854,9 +854,9 @@ def test_incompatible_development_windows_are_one_terminal_binding_failure(
     assert outcome.result is JobResult.PERMANENT_FAILURE
     assert outcome.reason_code == "REQUIRED_INPUT_UNAVAILABLE"
     assert len(sink.events) == 1
-    assert sink.events[0]["status"] == "FAILED"
-    assert sink.events[0]["failureCode"] == "REQUIRED_INPUT_UNAVAILABLE"
-    assert sink.events[0]["retryable"] is False
+    assert sink.events[0]["status"] == "UNAVAILABLE"
+    assert sink.events[0]["reasonCode"] == "REQUIRED_INPUT_UNAVAILABLE"
+    assert sink.events[0]["missingRequirements"] == ["REQUIRED_INPUT_UNAVAILABLE"]
     assert sink.events[0]["deliveryAttempt"] == 1
 
 

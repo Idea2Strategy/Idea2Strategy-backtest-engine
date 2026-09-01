@@ -1080,7 +1080,7 @@ def orchestrator_job_handler(
             timeout_seconds=float(environ.get("BACKTEST_RESULT_TIMEOUT_SECONDS", "10")),
         ),
         attempt_policy=policy.attempt,
-        monitor=ProcessResourceMonitor(),
+        monitor=ProcessResourceMonitor,
         microstructure=policy.microstructure,
         fractional_policy=policy.fractional,
         risk_limits=policy.risk_limits,

@@ -74,6 +74,7 @@ from backtest_engine.wiring import (
     _required_feature_through,
     _resolve_position_only_flow_clocks,
     _trading_sessions_between,
+    _utc_text,
     dataset_coverage,
     evaluation_window,
     require_compatible_execution_window,
@@ -605,10 +606,33 @@ def test_unsatisfiable_binding_publishes_the_terminal_failure(
 
     assert outcome.result is JobResult.PERMANENT_FAILURE
     assert outcome.reason_code == "REQUIRED_INPUT_UNAVAILABLE"
-    assert sink.events[0]["status"] == "FAILED"
-    assert sink.events[0]["failureCode"] == "REQUIRED_INPUT_UNAVAILABLE"
-    assert sink.events[0]["retryable"] is False
+    assert sink.events[0]["status"] == "UNAVAILABLE"
+    assert sink.events[0]["reasonCode"] == "REQUIRED_INPUT_UNAVAILABLE"
+    assert sink.events[0]["missingRequirements"] == ["REQUIRED_INPUT_UNAVAILABLE"]
+    assert sink.events[0]["decidedAt"] == "2026-08-01T12:00:00Z"
     assert sink.events[0]["metadata"]["correlationId"] == "77777777-7777-4777-8777-777777777777"
+
+
+def test_terminal_timestamp_keeps_subseconds_so_it_cannot_precede_started_at() -> None:
+    instant = datetime(2026, 9, 1, 4, 46, 33, 426991, tzinfo=UTC)
+
+    assert _utc_text(instant) == "2026-09-01T04:46:33.426991Z"
+
+
+def test_each_job_gets_a_fresh_attempt_resource_monitor() -> None:
+    created: list[SimpleNamespace] = []
+    handler = object.__new__(OrchestratorJobHandler)
+
+    def factory() -> SimpleNamespace:
+        monitor = SimpleNamespace(sample=lambda: ResourceSample(timedelta(0), 0))
+        created.append(monitor)
+        return monitor
+
+    handler._monitor_factory = factory
+
+    assert handler._new_attempt_monitor() is created[0]
+    assert handler._new_attempt_monitor() is created[1]
+    assert created[0] is not created[1]
 
 
 def test_terminal_binding_failure_survives_its_failure_event_publish_failing(

@@ -276,7 +276,7 @@ class JobNotSatisfiable(WiringError):
 
 def _utc_text(value: datetime) -> str:
     """The ``utcTimestamp`` form every `backtest.v1` field is validated against."""
-    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _prefixed(digest: str) -> str:
@@ -1870,7 +1870,7 @@ class OrchestratorJobHandler:
         storage_write_port: Any,
         sink: ResultSink,
         attempt_policy: AttemptPolicy,
-        monitor: ResourceMonitor,
+        monitor: ResourceMonitor | Callable[[], ResourceMonitor],
         microstructure: ExecutionMicrostructurePolicy,
         fractional_policy: InstrumentFractionalPolicy,
         risk_limits: RiskLimits,
@@ -1897,7 +1897,11 @@ class OrchestratorJobHandler:
         self._port = storage_write_port
         self._sink = sink
         self._attempt_policy = attempt_policy
-        self._monitor = monitor
+        self._monitor_factory: Callable[[], ResourceMonitor]
+        if callable(monitor):
+            self._monitor_factory = monitor
+        else:
+            self._monitor_factory = lambda: monitor
         self._microstructure = microstructure
         self._fractional = fractional_policy
         self._risk_limits = risk_limits
@@ -1907,6 +1911,10 @@ class OrchestratorJobHandler:
         self._publication_lag = publication_lag
 
     # -- JobHandler --------------------------------------------------------
+
+    def _new_attempt_monitor(self) -> ResourceMonitor:
+        """Return a monitor whose CPU origin belongs to this job attempt."""
+        return self._monitor_factory()
 
     def __call__(self, job: Mapping[str, Any], context: JobContext) -> JobOutcome:
         try:
@@ -1926,16 +1934,27 @@ class OrchestratorJobHandler:
                 exc,
             )
             try:
-                self._publish(
-                    envelope,
-                    self._correlation_id,
-                    status="FAILED",
-                    delivery_attempt=context.receive_count,
-                    failedAt=_utc_text(self._wall_clock()),
-                    attempt=context.attempt_number,
-                    failureCode=exc.reason_code,
-                    retryable=False,
-                )
+                if exc.reason_code in {"REQUIRED_INPUT_UNAVAILABLE", "REQUIRED_DATA_UNAVAILABLE"}:
+                    self._publish(
+                        envelope,
+                        self._correlation_id,
+                        status="UNAVAILABLE",
+                        delivery_attempt=context.receive_count,
+                        decidedAt=_utc_text(self._wall_clock()),
+                        reasonCode=exc.reason_code,
+                        missingRequirements=[exc.reason_code],
+                    )
+                else:
+                    self._publish(
+                        envelope,
+                        self._correlation_id,
+                        status="FAILED",
+                        delivery_attempt=context.receive_count,
+                        failedAt=_utc_text(self._wall_clock()),
+                        attempt=context.attempt_number,
+                        failureCode=exc.reason_code,
+                        retryable=False,
+                    )
             except Exception:
                 _LOGGER.exception(
                     "terminal backtest result publish failed run_id=%s attempt=%s reason_code=%s; "
@@ -1994,7 +2013,7 @@ class OrchestratorJobHandler:
             wall_clock=self._wall_clock,
             publication_lag=self._publication_lag,
         )
-        monitor: ResourceMonitor = self._monitor
+        monitor = self._new_attempt_monitor()
         if context.cancellation_reason is not None:
             monitor = _CancellationAwareMonitor(monitor, coordinator, context.cancellation_reason, self._wall_clock)
         outcome = orchestrator.run(binding.job, coordinator=coordinator, lease=lease, monitor=monitor)
