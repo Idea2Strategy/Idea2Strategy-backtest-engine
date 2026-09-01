@@ -202,7 +202,7 @@ class ExecutionKeyStore(Protocol):
         self, key: str, run_id: str, failure_code: str, *, now: datetime
     ) -> ExecutionRecordStatus: ...
 
-    def recover_stale(self, *, max_attempts: int, queued_timeout: timedelta) -> Any: ...
+    def recover_stale(self, *, max_attempts: int, queue_policy: Any) -> Any: ...
 
     def status(self, key: str) -> ExecutionRecordStatus | None: ...
 
@@ -311,8 +311,8 @@ class InMemoryExecutionKeyStore:
         with self._lock:
             return self._run_failures.get(run_id)
 
-    def recover_stale(self, *, max_attempts: int, queued_timeout: timedelta) -> None:
-        del max_attempts, queued_timeout
+    def recover_stale(self, *, max_attempts: int, queue_policy: Any) -> None:
+        del max_attempts, queue_policy
 
     def status(self, key: str) -> ExecutionRecordStatus | None:
         with self._lock:
@@ -1177,12 +1177,12 @@ def _stale_recovery_loop(
     *,
     interval: timedelta,
     max_attempts: int,
-    queued_timeout: timedelta,
+    queue_policy: Any,
 ) -> None:
     while not stop.is_set():
         try:
             report = store.recover_stale(
-                max_attempts=max_attempts, queued_timeout=queued_timeout
+                max_attempts=max_attempts, queue_policy=queue_policy
             )
             if report is not None:
                 _LOGGER.info("backtest stale recovery completed report=%s", report)
@@ -1214,12 +1214,12 @@ def run() -> None:
     recovery_interval = timedelta(
         seconds=int(os.environ.get("BACKTEST_RECOVERY_INTERVAL_SECONDS", "60"))
     )
-    queued_timeout = timedelta(
-        seconds=int(os.environ.get("BACKTEST_QUEUED_TIMEOUT_SECONDS", "900"))
-    )
+    from .recovery import QueueDispatchPolicy
+
+    queue_policy = QueueDispatchPolicy.from_environment(os.environ)
     max_attempts = int(os.environ.get("BACKTEST_MAX_RECEIVE_COUNT", "5"))
-    if recovery_interval <= timedelta(0) or queued_timeout <= timedelta(0):
-        raise WorkerConfigurationError("backtest recovery intervals must be positive")
+    if recovery_interval <= timedelta(0):
+        raise WorkerConfigurationError("backtest recovery interval must be positive")
     recovery_stop = threading.Event()
     recovery_thread = threading.Thread(
         target=_stale_recovery_loop,
@@ -1227,7 +1227,7 @@ def run() -> None:
         kwargs={
             "interval": recovery_interval,
             "max_attempts": max_attempts,
-            "queued_timeout": queued_timeout,
+            "queue_policy": queue_policy,
         },
         daemon=True,
         name="backtest-stale-recovery",

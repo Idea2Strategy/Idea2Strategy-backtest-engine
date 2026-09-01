@@ -1020,13 +1020,13 @@ class PersistenceExecutionKeyStore:
             uow.runs.mark_failed(run_uuid, database_now, failure_code, retryable=False)
             return ExecutionRecordStatus.FAILED
 
-    def recover_stale(self, *, max_attempts: int, queued_timeout: timedelta) -> Any:
+    def recover_stale(self, *, max_attempts: int, queue_policy: Any) -> Any:
         from .recovery import StaleRunRecovery
 
         return StaleRunRecovery(
             self._persistence,
             max_attempts=max_attempts,
-            queued_timeout=queued_timeout,
+            queue_policy=queue_policy,
         ).recover_once()
 
     def status(self, key: str) -> ExecutionRecordStatus | None:
