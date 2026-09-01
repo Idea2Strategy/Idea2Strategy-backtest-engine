@@ -688,6 +688,7 @@ class _OrderState:
     expires_at: datetime
     remaining_quantity: Decimal | None
     remaining_notional: Decimal | None
+    submission_sequence: int
     filled_quantity: Decimal = ZERO
     status: OrderStatus = OrderStatus.ACCEPTED
     reason_code: str | None = None
@@ -844,6 +845,7 @@ class BacktestExecutionModel:
             expires_at=expires_at,
             remaining_quantity=request.quantity,
             remaining_notional=request.notional_amount,
+            submission_sequence=len(self._orders) + 1,
             trail_reference=quantize_money(request.reference_price, "trail_reference")
             if request.order_type is OrderType.TRAILING_STOP
             else None,
@@ -1483,8 +1485,12 @@ class BacktestExecutionModel:
         return state.status in {OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED}
 
     @staticmethod
-    def _order_key(state: _OrderState) -> tuple[datetime, str]:
-        return state.request.submitted_at, state.request.order_id
+    def _order_key(state: _OrderState) -> tuple[datetime, int, str]:
+        return (
+            state.request.submitted_at,
+            state.submission_sequence,
+            state.request.order_id,
+        )
 
     @staticmethod
     def _snapshot(state: _OrderState) -> BacktestOrder:

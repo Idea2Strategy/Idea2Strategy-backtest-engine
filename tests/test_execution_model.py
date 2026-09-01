@@ -380,6 +380,23 @@ def test_participation_capacity_is_shared_by_every_order_on_the_same_bar() -> No
     assert model.order("00000000-0000-4000-8000-000000000502").remaining_quantity == Decimal("60")
 
 
+def test_shared_capacity_uses_submission_order_not_run_specific_order_id() -> None:
+    """A rerun-specific UUID must not change which semantic intent fills first."""
+
+    model = _model(cash="100000", strategy_budget="100000", gross_limit="100000", instrument_limit="100000")
+    first_id = "00000000-0000-4000-8000-000000000599"
+    second_id = "00000000-0000-4000-8000-000000000500"
+    model.submit(_request(order_id=first_id, quantity="80"))
+    model.submit(_request(order_id=second_id, quantity="80"))
+
+    fills = model.process_bar(_bar(volume="1000"))
+
+    assert [(fill.order_id, fill.quantity) for fill in fills] == [
+        (first_id, Decimal("80")),
+        (second_id, Decimal("20")),
+    ]
+
+
 def test_participation_capacity_is_replenished_by_the_next_bar() -> None:
     model = _model(cash="100000", strategy_budget="100000", gross_limit="100000", instrument_limit="100000")
     model.submit(_request(quantity="150"))
