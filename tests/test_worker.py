@@ -385,6 +385,26 @@ def test_cancellation_committed_before_claim_acknowledges_the_delivery_without_a
         )
     assert cancelled.status.value == "CANCELLED"
 
+    sentinel = make_run(
+        id=uuid.UUID(task5_run_id("cancellation-before-claim-live-sentinel")),
+        idempotency_key="TASK5:CANCEL-BEFORE-CLAIM:LIVE-SENTINEL",
+    )
+    with persistence.unit_of_work() as uow:
+        accepted_sentinel, sentinel_created = uow.runs.accept(sentinel)
+    assert sentinel_created
+    sentinel_store = PersistenceExecutionKeyStore(persistence)
+    sentinel_key = worker_execution_key_for(
+        str(accepted_sentinel.id), accepted_sentinel.idempotency_key
+    )
+    sentinel_claim = sentinel_store.claim(
+        sentinel_key,
+        run_id=str(accepted_sentinel.id),
+        owner="task5-cancel-claim-live-worker",
+        now=datetime.now(timezone.utc),
+        lease_duration=timedelta(minutes=5),
+    )
+    assert sentinel_claim.acquired
+
     queue = RecordingQueue()
     handler = RecordingHandler()
     worker = BacktestWorker(
@@ -423,8 +443,41 @@ def test_cancellation_committed_before_claim_acknowledges_the_delivery_without_a
     ).recover_once()
     assert recovery.requeued == recovery.failed == recovery.cancelled == 0
     with admin_engine.connect() as connection:
-        nonterminal = connection.scalar(text("SELECT count(*) FROM backtest.runs WHERE status IN ('QUEUED','RUNNING')"))
-    assert nonterminal == 0
+        target_nonterminal = connection.scalar(
+            text(
+                "SELECT count(*) FROM backtest.runs "
+                "WHERE id=:id AND status IN ('QUEUED','RUNNING')"
+            ),
+            {"id": accepted.id},
+        )
+        live_sentinel = connection.execute(
+            text(
+                "SELECT r.status AS run_status,a.status AS attempt_status,"
+                "a.claim_expires_at > clock_timestamp() AS lease_live "
+                "FROM backtest.runs r JOIN backtest.run_attempts a ON a.run_id=r.id "
+                "WHERE r.id=:id"
+            ),
+            {"id": accepted_sentinel.id},
+        ).mappings().one()
+    assert target_nonterminal == 0
+    assert dict(live_sentinel) == {
+        "run_status": "RUNNING",
+        "attempt_status": "RUNNING",
+        "lease_live": True,
+    }
+    with persistence.unit_of_work() as uow:
+        uow.runs.request_cancellation(
+            accepted_sentinel.id,
+            reason_code="USER_CANCELLED",
+        )
+    sentinel_store.finish(
+        sentinel_key,
+        ExecutionRecordStatus.CANCELLED,
+        now=datetime.now(timezone.utc),
+        claim=sentinel_claim,
+        reason_code="USER_CANCELLED",
+        run_id=str(accepted_sentinel.id),
+    )
     record_evidence(
         evidence_result(
             scenario="task5-cancellation-race-claim",
@@ -437,7 +490,8 @@ def test_cancellation_committed_before_claim_acknowledges_the_delivery_without_a
                 "disposition": handled.disposition.value,
                 "reason": handled.reason_code,
                 "attempt_count": attempt_count,
-                "nonterminal_after_recovery": nonterminal,
+                "nonterminal_after_recovery": target_nonterminal,
+                "live_lease_preserved": True,
             },
         )
     )
