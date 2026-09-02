@@ -128,6 +128,68 @@ def test_the_first_claim_writes_a_durable_attempt_row(
     ]
 
 
+def test_runtime_role_claims_heartbeats_releases_and_closes_only_through_capabilities(
+    backtest_role_persistence: BacktestPersistence,
+    run_id: uuid.UUID,
+    admin_engine: Engine,
+) -> None:
+    """The production adapter remains usable after direct attempt writes are revoked."""
+
+    runtime_store = PersistenceExecutionKeyStore(backtest_role_persistence)
+    key = worker_execution_key_for(str(run_id), "TASK6:RUNTIME-CAPABILITIES")
+    first = runtime_store.claim(
+        key,
+        run_id=str(run_id),
+        owner="runtime-worker-one",
+        now=T0,
+        lease_duration=LEASE,
+    )
+
+    assert first.acquired
+    assert runtime_store.heartbeat(key, first, lease_duration=LEASE) is None
+    runtime_store.release(
+        key,
+        now=T0 + timedelta(seconds=1),
+        claim=first,
+        reason_code="TRANSIENT_RETRY",
+    )
+
+    second = runtime_store.claim(
+        key,
+        run_id=str(run_id),
+        owner="runtime-worker-two",
+        now=T0 + timedelta(seconds=2),
+        lease_duration=LEASE,
+    )
+    assert second.acquired
+    assert second.attempt_number == 2
+    assert second.claim_token != first.claim_token
+    assert second.cleanup_capability != first.cleanup_capability
+    runtime_store.finish(
+        key,
+        ExecutionRecordStatus.SUCCEEDED,
+        now=T0 + timedelta(seconds=3),
+        claim=second,
+    )
+
+    rows = attempt_rows(admin_engine, run_id)
+    assert all(row["completed_at"] is not None for row in rows)
+    assert [{**row, "completed_at": None} for row in rows] == [
+        {
+            "attempt_number": 1,
+            "status": "FAILED",
+            "worker_execution_key": f"{key}:1",
+            "completed_at": None,
+        },
+        {
+            "attempt_number": 2,
+            "status": "SUCCEEDED",
+            "worker_execution_key": f"{key}:2",
+            "completed_at": None,
+        },
+    ]
+
+
 def test_only_one_of_many_concurrent_workers_wins_the_durable_cas(
     persistence: BacktestPersistence, run_id: uuid.UUID, admin_engine: Engine
 ) -> None:
@@ -526,6 +588,51 @@ def object_row(engine: Engine, object_id: uuid.UUID) -> dict[str, Any]:
             .mappings()
             .one()
         )
+
+
+def test_provider_only_reconciliation_stays_unowned_when_the_database_row_is_missing(
+    persistence: BacktestPersistence,
+    backtest_role_persistence: BacktestPersistence,
+    admin_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    """Provider bytes predate this attempt, so compensation must never adopt them."""
+
+    owner = _producer_claim(persistence, uuid.uuid4())
+    object_id = uuid.uuid4()
+    object_key = _canonical_cleanup_key(run_id=owner.run_id, record_type="PROVIDER_ONLY")
+    object_store = LocalObjectStore(tmp_path / "provider-only", bucket_name="bt7-fixture")
+    first_receipt = object_store.put(object_key, BODY)
+    assert first_receipt.reconciled is False
+
+    published = StorageObjectRegistrar(
+        object_store,
+        PersistenceStorageObjectWritePort(backtest_role_persistence),
+        producer_claim=owner,
+    ).publish(
+        object_id=object_id,
+        object_key=object_key,
+        data=BODY,
+        schema_version="1.0.0",
+        row_count=3,
+        period_start=T0,
+        period_end=T0,
+        created_at=T0,
+        verified_at=T0,
+        expected_content_hash=hashlib.sha256(BODY).hexdigest(),
+    )
+
+    assert published.receipt.reconciled is True
+    assert published.cleanup_token is None
+    assert object_store.exists(object_key)
+    with admin_engine.connect() as connection:
+        assert connection.scalar(
+            text(
+                "SELECT count(*) FROM storage.backtest_object_ownerships "
+                "WHERE object_id=:object_id"
+            ),
+            {"object_id": object_id},
+        ) == 0
 
 
 def test_an_object_reaches_available_only_after_its_bytes_were_re_hashed(
@@ -1406,6 +1513,97 @@ def test_successor_reissues_exact_predecessor_object_and_fences_every_other_clai
         )
     assert runtime_port.find(object_id) is None
     assert not object_store.exists(object_key)
+
+
+def test_later_descendant_preserves_the_original_attempt_artifact_for_reconciliation(
+    persistence: BacktestPersistence,
+    backtest_role_persistence: BacktestPersistence,
+    admin_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    """Attempt three is not the immediate successor of attempt one."""
+
+    run_id = uuid.uuid4()
+    with persistence.unit_of_work() as uow:
+        _stored, created = uow.runs.accept(
+            make_run(
+                run_id=run_id,
+                idempotency_key=f"TASK6:DIRECT-SUCCESSOR:{uuid.uuid4()}",
+                status=RunStatus.RUNNING,
+            )
+        )
+    assert created
+    key = worker_execution_key_for(str(run_id), f"TASK6:DIRECT-SUCCESSOR:{uuid.uuid4()}")
+    execution_store = PersistenceExecutionKeyStore(persistence)
+    now = datetime.now(UTC)
+    first_claim = execution_store.claim(
+        key,
+        run_id=str(run_id),
+        owner="attempt-one",
+        now=now,
+        lease_duration=timedelta(minutes=5),
+    )
+    first_owner = _claim_as_producer(run_id, first_claim)
+    object_store = LocalObjectStore(tmp_path / "direct-successor", bucket_name="bt7-fixture")
+    runtime_port = PersistenceStorageObjectWritePort(backtest_role_persistence)
+    object_id = uuid.uuid4()
+    object_key = _canonical_cleanup_key(run_id=run_id, record_type="ANCESTOR")
+    first = _publish(
+        PersistenceStorageObjectWritePort(persistence),
+        tmp_path / "direct-successor",
+        object_id=object_id,
+        key=object_key,
+        body=BODY,
+        producer_claim=first_owner,
+    )
+
+    execution_store.release(key, now=now + timedelta(seconds=1), claim=first_claim)
+    second_claim = execution_store.claim(
+        key,
+        run_id=str(run_id),
+        owner="attempt-two",
+        now=now + timedelta(seconds=2),
+        lease_duration=timedelta(minutes=5),
+    )
+    execution_store.release(key, now=now + timedelta(seconds=3), claim=second_claim)
+    third_claim = execution_store.claim(
+        key,
+        run_id=str(run_id),
+        owner="attempt-three",
+        now=now + timedelta(seconds=4),
+        lease_duration=timedelta(minutes=5),
+    )
+    third_owner = _claim_as_producer(run_id, third_claim)
+
+    preserved = _publish(
+        runtime_port,
+        tmp_path / "direct-successor",
+        object_id=object_id,
+        key=object_key,
+        body=BODY,
+        producer_claim=third_owner,
+    )
+
+    assert preserved.cleanup_token is None
+    with admin_engine.connect() as connection:
+        ownership = connection.execute(
+            text(
+                "SELECT producing_attempt_id,producing_claim_token "
+                "FROM storage.backtest_object_ownerships WHERE object_id=:object_id"
+            ),
+            {"object_id": object_id},
+        ).mappings().one()
+    assert dict(ownership) == {
+        "producing_attempt_id": first_owner.attempt_id,
+        "producing_claim_token": first_owner.claim_token,
+    }
+    with pytest.raises(ObjectStoreConflict, match="producer ownership"), runtime_port.cleanup_batch(
+        (preserved.record,),
+        producer_claim=third_owner,
+        cleanup_tokens={object_id: first.cleanup_token or ""},
+    ):
+        pytest.fail("a later descendant reached the external deletion boundary")
+    assert object_store.exists(object_key)
 
 
 def test_future_storage_object_fk_blocks_every_external_delete(

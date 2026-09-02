@@ -50,6 +50,15 @@ _WRITE_TARGET = re.compile(
     r'"?(?P<schema>[a-z_][a-z0-9_]*)"?\s*\.',
     re.I,
 )
+_CAPABILITY_WRITE_TARGET = re.compile(
+    r"^\s*SELECT\s+(?:\*\s+FROM\s+)?"
+    r'"?(?P<schema>backtest|storage)"?\s*\.\s*"?'
+    r"(?:claim_run_attempt|heartbeat_run_attempt|close_run_attempt|"
+    r"recover_expired_run_attempt|register_backtest_object|"
+    r"transition_backtest_object|prepare_backtest_object_cleanup|"
+    r"reissue_backtest_object_cleanup)\b",
+    re.I,
+)
 
 
 class StatementRecorder:
@@ -71,12 +80,18 @@ class StatementRecorder:
 
     @property
     def writes(self) -> list[str]:
-        return [item for item in self.statements if _WRITE.match(item.strip())]
+        return [
+            item
+            for item in self.statements
+            if _WRITE.match(item.strip()) or _CAPABILITY_WRITE_TARGET.match(item.strip())
+        ]
 
     def written_schemas(self) -> set[str]:
         found: set[str] = set()
         for statement in self.writes:
-            match = _WRITE_TARGET.match(statement.strip())
+            match = _WRITE_TARGET.match(statement.strip()) or _CAPABILITY_WRITE_TARGET.match(
+                statement.strip()
+            )
             assert match is not None, f"unparsed write statement: {statement[:160]!r}"
             found.add(match.group("schema").lower())
         return found

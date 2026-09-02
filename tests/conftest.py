@@ -195,9 +195,15 @@ def _apply_backtest_runtime_role(url: str) -> None:
             END $$;
             ALTER ROLE idea2strategy_backtest
               NOLOGIN NOCREATEDB NOCREATEROLE NOINHERIT;
+            GRANT USAGE ON SCHEMA backtest TO idea2strategy_backtest;
             GRANT USAGE ON SCHEMA storage TO idea2strategy_backtest;
-            GRANT SELECT, INSERT, UPDATE ON TABLE storage.objects
+            GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA backtest
               TO idea2strategy_backtest;
+            REVOKE INSERT, UPDATE ON TABLE backtest.run_attempts
+              FROM idea2strategy_backtest;
+            GRANT SELECT ON TABLE storage.objects TO idea2strategy_backtest;
+            REVOKE INSERT, UPDATE, DELETE ON TABLE storage.objects
+              FROM idea2strategy_backtest;
             DO $$ BEGIN
               IF to_regprocedure(
                 'storage.prepare_backtest_object_cleanup(jsonb)'
@@ -211,6 +217,28 @@ def _apply_backtest_runtime_role(url: str) -> None:
               ) IS NOT NULL THEN
                 GRANT EXECUTE ON FUNCTION
                   storage.reissue_backtest_object_cleanup(jsonb,text)
+                  TO idea2strategy_backtest;
+              END IF;
+              IF to_regprocedure(
+                'backtest.claim_run_attempt(uuid,text,text,bigint)'
+              ) IS NOT NULL THEN
+                GRANT EXECUTE ON FUNCTION
+                  backtest.claim_run_attempt(uuid,text,text,bigint)
+                  TO idea2strategy_backtest;
+                GRANT EXECUTE ON FUNCTION
+                  backtest.heartbeat_run_attempt(uuid,uuid,bigint)
+                  TO idea2strategy_backtest;
+                GRANT EXECUTE ON FUNCTION
+                  backtest.close_run_attempt(uuid,uuid,text,text,text,boolean)
+                  TO idea2strategy_backtest;
+                GRANT EXECUTE ON FUNCTION
+                  backtest.recover_expired_run_attempt(uuid,text,text)
+                  TO idea2strategy_backtest;
+                GRANT EXECUTE ON FUNCTION
+                  storage.register_backtest_object(jsonb)
+                  TO idea2strategy_backtest;
+                GRANT EXECUTE ON FUNCTION
+                  storage.transition_backtest_object(uuid,text,timestamp with time zone)
                   TO idea2strategy_backtest;
               END IF;
             END $$;

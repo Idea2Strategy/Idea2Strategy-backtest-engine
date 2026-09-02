@@ -323,11 +323,24 @@ class StorageObjectWritePort(Protocol):
         *,
         producer_claim: StorageObjectProducerClaim | None = None,
         cleanup_token: str | None = None,
+        created_by_attempt: bool = False,
     ) -> UUID | StorageObjectRegistration: ...
 
-    def mark_available(self, object_id: UUID, verified_at: datetime) -> StorageObjectRecord: ...
+    def mark_available(
+        self,
+        object_id: UUID,
+        verified_at: datetime,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+    ) -> StorageObjectRecord: ...
 
-    def quarantine(self, object_id: UUID, quarantined_at: datetime) -> StorageObjectRecord: ...
+    def quarantine(
+        self,
+        object_id: UUID,
+        quarantined_at: datetime,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+    ) -> StorageObjectRecord: ...
 
     def find(self, object_id: UUID) -> StorageObjectRecord | None: ...
 
@@ -377,14 +390,29 @@ class UnauthorizedStorageObjectWritePort:
         *,
         producer_claim: StorageObjectProducerClaim | None = None,
         cleanup_token: str | None = None,
+        created_by_attempt: bool = False,
     ) -> UUID:
-        del producer_claim, cleanup_token
+        del producer_claim, cleanup_token, created_by_attempt
         raise StorageWriteNotAuthorized(f"{self.reason} (offered object_key={record.object_key})")
 
-    def mark_available(self, object_id: UUID, verified_at: datetime) -> StorageObjectRecord:
+    def mark_available(
+        self,
+        object_id: UUID,
+        verified_at: datetime,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+    ) -> StorageObjectRecord:
+        del producer_claim
         raise StorageWriteNotAuthorized(f"{self.reason} (offered object_id={object_id})")
 
-    def quarantine(self, object_id: UUID, quarantined_at: datetime) -> StorageObjectRecord:
+    def quarantine(
+        self,
+        object_id: UUID,
+        quarantined_at: datetime,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+    ) -> StorageObjectRecord:
+        del producer_claim
         raise StorageWriteNotAuthorized(f"{self.reason} (offered object_id={object_id})")
 
     def find(self, object_id: UUID) -> StorageObjectRecord | None:
@@ -467,8 +495,9 @@ class InMemoryStorageObjectRegistry:
         *,
         producer_claim: StorageObjectProducerClaim | None = None,
         cleanup_token: str | None = None,
+        created_by_attempt: bool = False,
     ) -> UUID:
-        del producer_claim, cleanup_token
+        del producer_claim, cleanup_token, created_by_attempt
         if not isinstance(record, StorageObjectRecord):
             raise TypeError(f"record must be a StorageObjectRecord, got {type(record).__name__}")
         if record.status is not ObjectStatus.STAGED:
@@ -496,7 +525,14 @@ class InMemoryStorageObjectRegistry:
             self._object_id_by_key[key] = record.object_id
             return record.object_id
 
-    def mark_available(self, object_id: UUID, verified_at: datetime) -> StorageObjectRecord:
+    def mark_available(
+        self,
+        object_id: UUID,
+        verified_at: datetime,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+    ) -> StorageObjectRecord:
+        del producer_claim
         with self._lock:
             current = self._require(object_id)
             if current.status is ObjectStatus.AVAILABLE:
@@ -509,7 +545,14 @@ class InMemoryStorageObjectRegistry:
             self._rows[object_id] = promoted
             return promoted
 
-    def quarantine(self, object_id: UUID, quarantined_at: datetime) -> StorageObjectRecord:
+    def quarantine(
+        self,
+        object_id: UUID,
+        quarantined_at: datetime,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+    ) -> StorageObjectRecord:
+        del producer_claim
         with self._lock:
             quarantined = self._require(object_id).quarantined(quarantined_at)
             self._rows[object_id] = quarantined
@@ -740,6 +783,7 @@ class StorageObjectRegistrar:
                     staged,
                     producer_claim=self._producer_claim,
                     cleanup_token=cleanup_token,
+                    created_by_attempt=not receipt.reconciled,
                 )
         except BaseException:
             # The bytes exist even when row registration fails (or its commit
@@ -776,13 +820,21 @@ class StorageObjectRegistrar:
         if not check.ok:
             # The row is not deleted: a quarantined object is auditable evidence, and a
             # missing row would make the failure invisible.
-            self._port.quarantine(registered_id, verified_at)
+            self._port.quarantine(
+                registered_id,
+                verified_at,
+                producer_claim=self._producer_claim,
+            )
             raise ObjectVerificationError(
                 f"stored object failed verification and was quarantined: {object_key} ({check.message})"
             )
         return RegisteredObject(
             receipt=receipt,
-            record=self._port.mark_available(registered_id, verified_at),
+            record=self._port.mark_available(
+                registered_id,
+                verified_at,
+                producer_claim=self._producer_claim,
+            ),
             producer_claim=self._producer_claim,
             cleanup_token=cleanup_token,
         )

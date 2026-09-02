@@ -280,22 +280,18 @@ class StaleRunRecovery:
     ) -> int:
         if row["attempt_id"] is None or str(row["attempt_status"] or "") != "RUNNING":
             return 0
-        changed = connection.execute(
-            text(f"""
-            UPDATE backtest.run_attempts
-               SET status='{status}', completed_at=:now,
-                   failure_code=:failure_code, terminal_reason_code=:reason
-             WHERE id=:id AND status='RUNNING'
-               AND (claim_expires_at IS NULL OR claim_expires_at <= :now)
-        """),
+        changed = connection.scalar(
+            text(
+                "SELECT backtest.recover_expired_run_attempt("
+                ":attempt_id, :status, :reason)"
+            ),
             {
-                "id": row["attempt_id"],
-                "now": now,
-                "failure_code": None if status == "CANCELLED" else reason,
+                "attempt_id": row["attempt_id"],
+                "status": status,
                 "reason": reason,
             },
         )
-        return changed.rowcount
+        return int(changed or 0)
 
     @staticmethod
     def _fail_run(connection: Any, run_id: Any, now: datetime, reason: str) -> int:

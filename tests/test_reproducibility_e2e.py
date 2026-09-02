@@ -2244,6 +2244,7 @@ def test_registration_conflict_cleans_only_the_new_active_store_versions(
         *,
         producer_claim: Any = None,
         cleanup_token: str | None = None,
+        created_by_attempt: bool = False,
     ) -> uuid.UUID:
         nonlocal foreign_record, register_calls
         register_calls += 1
@@ -2266,6 +2267,7 @@ def test_registration_conflict_cleans_only_the_new_active_store_versions(
             record,
             producer_claim=producer_claim,
             cleanup_token=cleanup_token,
+            created_by_attempt=created_by_attempt,
         )
 
     monkeypatch.setattr(

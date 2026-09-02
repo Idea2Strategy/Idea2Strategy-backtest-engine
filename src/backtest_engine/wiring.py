@@ -801,16 +801,20 @@ class PersistenceStorageObjectWritePort:
         *,
         producer_claim: StorageObjectProducerClaim | None = None,
         cleanup_token: str | None = None,
+        created_by_attempt: bool = False,
     ) -> StorageObjectRegistration:
         token_hash = _cleanup_token_hash(cleanup_token)
         with _as_object_store_conflict(), self._persistence.unit_of_work() as uow:
             _set_storage_producer_context(
                 uow.connection,
                 producer_claim,
-                cleanup_token_hash=token_hash,
+                cleanup_token_hash=token_hash if created_by_attempt else None,
             )
-            row, inserted = uow.objects.register(record.to_row())
-            cleanup_owned = inserted
+            row, inserted = uow.objects.register(
+                record.to_row(),
+                via_capability=True,
+            )
+            cleanup_owned = inserted and created_by_attempt
             if not inserted:
                 cleanup_owned = uow.objects.reissue_cleanup_capability(row, token_hash)
             return StorageObjectRegistration(
@@ -818,13 +822,39 @@ class PersistenceStorageObjectWritePort:
                 cleanup_owned=cleanup_owned,
             )
 
-    def mark_available(self, object_id: uuid.UUID, verified_at: datetime) -> StorageObjectRecord:
+    def mark_available(
+        self,
+        object_id: uuid.UUID,
+        verified_at: datetime,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+    ) -> StorageObjectRecord:
         with _as_object_store_conflict(), self._persistence.unit_of_work() as uow:
-            return _record_of(uow.objects.mark_available(object_id, verified_at))
+            _set_storage_producer_context(uow.connection, producer_claim)
+            return _record_of(
+                uow.objects.mark_available(
+                    object_id,
+                    verified_at,
+                    via_capability=True,
+                )
+            )
 
-    def quarantine(self, object_id: uuid.UUID, quarantined_at: datetime) -> StorageObjectRecord:
+    def quarantine(
+        self,
+        object_id: uuid.UUID,
+        quarantined_at: datetime,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+    ) -> StorageObjectRecord:
         with _as_object_store_conflict(), self._persistence.unit_of_work() as uow:
-            return _record_of(uow.objects.quarantine(object_id, quarantined_at))
+            _set_storage_producer_context(uow.connection, producer_claim)
+            return _record_of(
+                uow.objects.quarantine(
+                    object_id,
+                    quarantined_at,
+                    via_capability=True,
+                )
+            )
 
     def find(self, object_id: uuid.UUID) -> StorageObjectRecord | None:
         with self._persistence.read_only() as uow:
@@ -1116,15 +1146,12 @@ class PersistenceExecutionKeyStore:
                 if latest is not None and latest["status"] == WorkStatus.RUNNING.value:
                     if latest["claim_expires_at"] is not None and latest["claim_expires_at"] > database_now:
                         return ExecutionRecordStatus.IN_PROGRESS
-                    uow.connection.execute(
-                        text("""
-                        UPDATE backtest.run_attempts
-                           SET status='CANCELLED', completed_at=:now,
-                               failure_code=NULL, terminal_reason_code='CANCELLED_BY_REQUEST'
-                         WHERE id=:attempt_id AND status='RUNNING'
-                           AND (claim_expires_at IS NULL OR claim_expires_at <= :now)
-                    """),
-                        {"attempt_id": latest["id"], "now": database_now},
+                    uow.connection.scalar(
+                        text(
+                            "SELECT backtest.recover_expired_run_attempt("
+                            ":attempt_id, 'CANCELLED', 'CANCELLED_BY_REQUEST')"
+                        ),
+                        {"attempt_id": latest["id"]},
                     )
                 uow.runs.mark_cancelled(
                     run_uuid,
@@ -1135,17 +1162,13 @@ class PersistenceExecutionKeyStore:
             if latest is not None and latest["status"] == WorkStatus.RUNNING.value:
                 if latest["claim_expires_at"] is not None and latest["claim_expires_at"] > database_now:
                     return ExecutionRecordStatus.IN_PROGRESS
-                uow.connection.execute(
-                    text("""
-                    UPDATE backtest.run_attempts
-                       SET status='FAILED', completed_at=:now,
-                           failure_code=:reason, terminal_reason_code=:reason
-                     WHERE id=:attempt_id AND status='RUNNING'
-                       AND (claim_expires_at IS NULL OR claim_expires_at <= :now)
-                """),
+                uow.connection.scalar(
+                    text(
+                        "SELECT backtest.recover_expired_run_attempt("
+                        ":attempt_id, 'FAILED', :reason)"
+                    ),
                     {
                         "attempt_id": latest["id"],
-                        "now": database_now,
                         "reason": failure_code,
                     },
                 )
