@@ -63,6 +63,7 @@ from backtest_engine.object_store import (
     ObjectStore,
     ObjectStoreError,
     ObjectVerificationError,
+    StorageObjectProducerClaim,
     StorageObjectRecord,
     StorageObjectRegistrar,
     StorageObjectUpload,
@@ -1033,6 +1034,7 @@ class DetailObjectPublisher:
         store: ObjectStore,
         *,
         storage_write_port: StorageObjectWritePort,
+        producer_claim: StorageObjectProducerClaim | None = None,
         upload_observer: Callable[[StorageObjectUpload], None] | None = None,
     ) -> None:
         self._store = store
@@ -1040,6 +1042,7 @@ class DetailObjectPublisher:
         self._registrar = StorageObjectRegistrar(
             store,
             storage_write_port,
+            producer_claim=producer_claim,
             upload_observer=upload_observer,
         )
 

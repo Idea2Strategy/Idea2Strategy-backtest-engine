@@ -153,6 +153,7 @@ class ExecutionClaim:
     existing_status: ExecutionRecordStatus | None = None
     attempt_id: str | None = None
     claim_token: str | None = None
+    cleanup_capability: str | None = None
 
 
 class ExecutionKeyStore(Protocol):
@@ -341,6 +342,7 @@ class JobContext:
     worker_id: str
     attempt_id: str | None = None
     claim_token: str | None = None
+    cleanup_capability: str | None = None
     cancellation_reason: Callable[[], str | None] | None = None
 
 
@@ -556,6 +558,7 @@ class BacktestWorker:
             worker_id=self._config.worker_id,
             attempt_id=claim.attempt_id,
             claim_token=claim.claim_token,
+            cleanup_capability=claim.cleanup_capability,
             cancellation_reason=cancellation.reason,
         )
         outcome = self._invoke(job, context, receipt, key, claim, cancellation)

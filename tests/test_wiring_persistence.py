@@ -13,6 +13,7 @@ unguarded engine.
 from __future__ import annotations
 
 import hashlib
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -23,12 +24,14 @@ from typing import Any
 
 import pytest
 from sqlalchemy import Engine, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from backtest_engine.object_store import (
     LocalObjectStore,
     ObjectStoreConflict,
     S3ObjectStore,
+    StorageObjectProducerClaim,
+    StorageObjectRecord,
     StorageObjectRegistrar,
 )
 from backtest_engine.persistence import (
@@ -403,8 +406,13 @@ def _publish(
     object_id: uuid.UUID,
     key: str,
     body: bytes,
+    producer_claim: StorageObjectProducerClaim,
 ) -> Any:
-    registrar = StorageObjectRegistrar(LocalObjectStore(root, bucket_name="bt7-fixture"), port)
+    registrar = StorageObjectRegistrar(
+        LocalObjectStore(root, bucket_name="bt7-fixture"),
+        port,
+        producer_claim=producer_claim,
+    )
     return registrar.publish(
         object_id=object_id,
         object_key=key,
@@ -413,6 +421,92 @@ def _publish(
         row_count=3,
         period_start=datetime(2024, 1, 2, 14, 30, tzinfo=UTC),
         period_end=datetime(2024, 1, 2, 14, 50, tzinfo=UTC),
+        created_at=T0,
+        verified_at=T0,
+        expected_content_hash=hashlib.sha256(body).hexdigest(),
+    )
+
+
+def _run_id_from_key(key: str) -> uuid.UUID:
+    return uuid.UUID(key.split("/", 2)[1])
+
+
+def _producer_claim(
+    persistence: BacktestPersistence,
+    run_id: uuid.UUID,
+) -> StorageObjectProducerClaim:
+    with persistence.unit_of_work() as uow:
+        _stored, created = uow.runs.accept(
+            make_run(
+                run_id=run_id,
+                idempotency_key=f"TASK5:OBJECT-OWNER:{uuid.uuid4()}",
+                status=RunStatus.RUNNING,
+            )
+        )
+        assert created
+    claim = PersistenceExecutionKeyStore(persistence).claim(
+        worker_execution_key_for(str(run_id), f"TASK5:OBJECT-OWNER:{uuid.uuid4()}"),
+        run_id=str(run_id),
+        owner="task5-object-owner",
+        now=datetime.now(UTC),
+        lease_duration=timedelta(minutes=5),
+    )
+    assert claim.acquired
+    assert claim.attempt_id is not None
+    assert claim.claim_token is not None
+    assert claim.cleanup_capability is not None
+    return StorageObjectProducerClaim(
+        run_id=run_id,
+        attempt_id=uuid.UUID(claim.attempt_id),
+        claim_token=uuid.UUID(claim.claim_token),
+        cleanup_capability=claim.cleanup_capability,
+    )
+
+
+def _claim_as_producer(run_id: uuid.UUID, claim: Any) -> StorageObjectProducerClaim:
+    assert claim.acquired
+    assert claim.attempt_id is not None
+    assert claim.claim_token is not None
+    assert claim.cleanup_capability is not None
+    return StorageObjectProducerClaim(
+        run_id=run_id,
+        attempt_id=uuid.UUID(claim.attempt_id),
+        claim_token=uuid.UUID(claim.claim_token),
+        cleanup_capability=claim.cleanup_capability,
+    )
+
+
+def _cleanup_kwargs(published: Any) -> dict[str, Any]:
+    assert published.producer_claim is not None
+    assert published.cleanup_token is not None
+    return {
+        "producer_claim": published.producer_claim,
+        "cleanup_tokens": {published.record.object_id: published.cleanup_token},
+    }
+
+
+def _publish_cleanup_object(
+    persistence: BacktestPersistence,
+    port: PersistenceStorageObjectWritePort,
+    object_store: Any,
+    *,
+    record_type: str,
+    body: bytes = BODY,
+    object_id: uuid.UUID | None = None,
+) -> Any:
+    key = _canonical_cleanup_key(body=body, record_type=record_type)
+    return StorageObjectRegistrar(
+        object_store,
+        port,
+        producer_claim=_producer_claim(persistence, _run_id_from_key(key)),
+    ).publish(
+        object_id=object_id or uuid.uuid4(),
+        object_key=key,
+        data=body,
+        schema_version="1.0.0",
+        row_count=3,
+        period_start=T0,
+        period_end=T0,
         created_at=T0,
         verified_at=T0,
         expected_content_hash=hashlib.sha256(body).hexdigest(),
@@ -439,9 +533,12 @@ def test_an_object_reaches_available_only_after_its_bytes_were_re_hashed(
 ) -> None:
     port = PersistenceStorageObjectWritePort(persistence)
     object_id = uuid.uuid4()
-    key = f"backtest-results/{uuid.uuid4()}/TRADE_DETAIL/week_start=2024-01-01/part=0001/{'a' * 64}.parquet"
+    owner = _producer_claim(persistence, uuid.uuid4())
+    key = f"backtest-results/{owner.run_id}/TRADE_DETAIL/week_start=2024-01-01/part=0001/{'a' * 64}.parquet"
 
-    published = _publish(port, tmp_path, object_id=object_id, key=key, body=BODY)
+    published = _publish(
+        port, tmp_path, object_id=object_id, key=key, body=BODY, producer_claim=owner
+    )
 
     row = object_row(admin_engine, object_id)
     assert published.record.status is ObjectStatus.AVAILABLE
@@ -460,10 +557,15 @@ def test_republishing_the_same_object_is_idempotent_not_a_second_row(
     """An at-least-once retry of an upload must reconcile, not duplicate."""
     port = PersistenceStorageObjectWritePort(persistence)
     object_id = uuid.uuid4()
-    key = f"backtest-results/{uuid.uuid4()}/TRADE_DETAIL/week_start=2024-01-01/part=0001/{'b' * 64}.parquet"
+    owner = _producer_claim(persistence, uuid.uuid4())
+    key = f"backtest-results/{owner.run_id}/TRADE_DETAIL/week_start=2024-01-01/part=0001/{'b' * 64}.parquet"
 
-    first = _publish(port, tmp_path, object_id=object_id, key=key, body=BODY)
-    second = _publish(port, tmp_path, object_id=object_id, key=key, body=BODY)
+    first = _publish(
+        port, tmp_path, object_id=object_id, key=key, body=BODY, producer_claim=owner
+    )
+    second = _publish(
+        port, tmp_path, object_id=object_id, key=key, body=BODY, producer_claim=owner
+    )
 
     assert first.record == second.record
     with admin_engine.connect() as connection:
@@ -477,8 +579,16 @@ def test_reusing_an_object_id_for_different_bytes_is_refused(persistence: Backte
     """The object id is what a detail manifest points at; it cannot be re-aimed."""
     port = PersistenceStorageObjectWritePort(persistence)
     object_id = uuid.uuid4()
-    prefix = f"backtest-results/{uuid.uuid4()}/TRADE_DETAIL/week_start=2024-01-01/part=0001"
-    _publish(port, tmp_path, object_id=object_id, key=f"{prefix}/{'c' * 64}.parquet", body=BODY)
+    owner = _producer_claim(persistence, uuid.uuid4())
+    prefix = f"backtest-results/{owner.run_id}/TRADE_DETAIL/week_start=2024-01-01/part=0001"
+    _publish(
+        port,
+        tmp_path,
+        object_id=object_id,
+        key=f"{prefix}/{'c' * 64}.parquet",
+        body=BODY,
+        producer_claim=owner,
+    )
 
     with pytest.raises(ObjectStoreConflict):
         _publish(
@@ -487,6 +597,7 @@ def test_reusing_an_object_id_for_different_bytes_is_refused(persistence: Backte
             object_id=object_id,
             key=f"{prefix}/{'d' * 64}.parquet",
             body=OTHER_BODY,
+            producer_claim=owner,
         )
 
 
@@ -495,8 +606,11 @@ def test_find_projects_the_persisted_row_back_onto_the_value_object(
 ) -> None:
     port = PersistenceStorageObjectWritePort(persistence)
     object_id = uuid.uuid4()
-    key = f"backtest-results/{uuid.uuid4()}/REPLAY_LEDGER/week_start=2024-01-01/part=0001/{'e' * 64}.parquet"
-    published = _publish(port, tmp_path, object_id=object_id, key=key, body=BODY)
+    owner = _producer_claim(persistence, uuid.uuid4())
+    key = f"backtest-results/{owner.run_id}/REPLAY_LEDGER/week_start=2024-01-01/part=0001/{'e' * 64}.parquet"
+    published = _publish(
+        port, tmp_path, object_id=object_id, key=key, body=BODY, producer_claim=owner
+    )
 
     found = port.find(object_id)
 
@@ -512,7 +626,14 @@ def test_cleanup_batch_fences_the_durable_provider_version(
     port = PersistenceStorageObjectWritePort(persistence)
     object_id = uuid.uuid4()
     key = _canonical_cleanup_key(record_type="PROVIDER_VERSION_FENCE")
-    published = _publish(port, tmp_path, object_id=object_id, key=key, body=BODY)
+    published = _publish(
+        port,
+        tmp_path,
+        object_id=object_id,
+        key=key,
+        body=BODY,
+        producer_claim=_producer_claim(persistence, _run_id_from_key(key)),
+    )
 
     with pytest.raises(
         ObjectStoreConflict, match="provider version"
@@ -522,7 +643,8 @@ def test_cleanup_batch_fences_the_durable_provider_version(
                 published.record,
                 provider_version_id="different-provider-version",
             ),
-        )
+        ),
+        **_cleanup_kwargs(published),
     ):
         pass
 
@@ -546,7 +668,14 @@ def test_unregister_fences_the_durable_provider_and_bucket_identity(
     port = PersistenceStorageObjectWritePort(persistence)
     object_id = uuid.uuid4()
     key = _canonical_cleanup_key(record_type="PROVIDER_BUCKET_FENCE")
-    published = _publish(port, tmp_path, object_id=object_id, key=key, body=BODY)
+    published = _publish(
+        port,
+        tmp_path,
+        object_id=object_id,
+        key=key,
+        body=BODY,
+        producer_claim=_producer_claim(persistence, _run_id_from_key(key)),
+    )
     identity = {
         "storage_provider": published.record.storage_provider,
         "bucket_name": published.record.bucket_name,
@@ -557,7 +686,12 @@ def test_unregister_fences_the_durable_provider_and_bucket_identity(
     identity[field] = foreign_value
 
     with pytest.raises(ObjectStoreConflict):
-        port.unregister(object_id, **identity)
+        port.unregister(
+            object_id,
+            **identity,
+            producer_claim=published.producer_claim,
+            cleanup_token=published.cleanup_token,
+        )
 
     assert object_row(admin_engine, object_id)["object_key"] == key
 
@@ -570,7 +704,14 @@ def test_cleanup_batch_refuses_a_result_object_referenced_as_durable_evidence(
     port = PersistenceStorageObjectWritePort(persistence)
     object_id = uuid.uuid4()
     key = _canonical_cleanup_key(record_type="DURABLE_EVIDENCE")
-    published = _publish(port, tmp_path, object_id=object_id, key=key, body=BODY)
+    published = _publish(
+        port,
+        tmp_path,
+        object_id=object_id,
+        key=key,
+        body=BODY,
+        producer_claim=_producer_claim(persistence, _run_id_from_key(key)),
+    )
     with admin_engine.begin() as connection:
         connection.execute(
             text(
@@ -593,7 +734,7 @@ def test_cleanup_batch_refuses_a_result_object_referenced_as_durable_evidence(
 
     with pytest.raises(
         ObjectStoreConflict, match="operations.audit_events"
-    ), port.cleanup_batch((published.record,)):
+    ), port.cleanup_batch((published.record,), **_cleanup_kwargs(published)):
         pass
 
     assert object_row(admin_engine, object_id)["object_key"] == key
@@ -607,7 +748,14 @@ def test_cleanup_batch_refuses_a_detail_object_referenced_by_a_manifest(
     port = PersistenceStorageObjectWritePort(persistence)
     object_id = uuid.uuid4()
     key = _canonical_cleanup_key(record_type="TRADE_DETAIL")
-    published = _publish(port, tmp_path, object_id=object_id, key=key, body=BODY)
+    published = _publish(
+        port,
+        tmp_path,
+        object_id=object_id,
+        key=key,
+        body=BODY,
+        producer_claim=_producer_claim(persistence, _run_id_from_key(key)),
+    )
     run = make_run(idempotency_key=f"TASK5:DETAIL-REFERENCE:{uuid.uuid4()}")
     with persistence.unit_of_work() as uow:
         accepted, created = uow.runs.accept(run)
@@ -616,7 +764,7 @@ def test_cleanup_batch_refuses_a_detail_object_referenced_by_a_manifest(
 
     with pytest.raises(
         ObjectStoreConflict, match="backtest.detail_manifests"
-    ), port.cleanup_batch((published.record,)):
+    ), port.cleanup_batch((published.record,), **_cleanup_kwargs(published)):
         pass
 
     assert object_row(admin_engine, object_id)["object_key"] == key
@@ -657,6 +805,7 @@ def test_live_catalog_exposes_every_canonical_storage_object_fk(
         ("performance.series_manifests", "object_id"),
         ("operations.audit_events", "evidence_object_id"),
         ("operations.case_evidence_references", "storage_object_id"),
+        ("storage.backtest_object_ownerships", "object_id"),
     }
 
 
@@ -705,10 +854,11 @@ def _drop_test_schema(admin_engine: Engine, schema: str) -> None:
 def _cleanup_owned_object(
     port: PersistenceStorageObjectWritePort,
     object_store: Any,
-    record: Any,
+    published: Any,
 ) -> None:
     """Remove only the exact test-owned row/provider version, if still present."""
 
+    record = published.record
     current = port.find(record.object_id)
     if current is None:
         object_store.delete_if_matches(
@@ -717,7 +867,7 @@ def _cleanup_owned_object(
             record.provider_version_id,
         )
         return
-    with port.cleanup_batch((current,)) as locked:
+    with port.cleanup_batch((current,), **_cleanup_kwargs(published)) as locked:
         for item in locked:
             if object_store.preflight_delete(
                 item.object_key,
@@ -744,9 +894,14 @@ def test_canonical_backtest_role_uses_only_the_narrow_cleanup_capability(
     admin_port = PersistenceStorageObjectWritePort(persistence)
     runtime_port = PersistenceStorageObjectWritePort(backtest_role_persistence)
     object_store = S3ObjectStore(bucket, client=s3)
-    published = StorageObjectRegistrar(object_store, admin_port).publish(
+    key = _canonical_cleanup_key()
+    published = StorageObjectRegistrar(
+        object_store,
+        admin_port,
+        producer_claim=_producer_claim(persistence, _run_id_from_key(key)),
+    ).publish(
         object_id=uuid.uuid4(),
-        object_key=_canonical_cleanup_key(),
+        object_key=key,
         data=BODY,
         schema_version="1.0.0",
         row_count=3,
@@ -755,6 +910,7 @@ def test_canonical_backtest_role_uses_only_the_narrow_cleanup_capability(
         created_at=T0,
         verified_at=T0,
     )
+
 
     with admin_engine.connect() as connection:
         identity_relation_oid = connection.scalar(
@@ -767,19 +923,31 @@ def test_canonical_backtest_role_uses_only_the_narrow_cleanup_capability(
                 "SELECT current_user AS role_name,"
                 "has_table_privilege(current_user,'storage.objects','DELETE') AS can_delete,"
                 "has_table_privilege(current_user,"
+                "'storage.backtest_object_ownerships','SELECT') AS can_read_ownerships,"
+                "has_table_privilege(current_user,"
+                "'storage.backtest_attempt_cleanup_capabilities','SELECT') "
+                "AS can_read_attempt_capabilities,"
+                "has_table_privilege(current_user,"
                 "CAST(:identity_relation_oid AS oid),'SELECT') AS can_read_identity,"
                 "has_function_privilege(current_user,"
-                "'storage.prepare_backtest_object_cleanup(jsonb)','EXECUTE') AS can_cleanup"
+                "'storage.prepare_backtest_object_cleanup(jsonb)','EXECUTE') AS can_cleanup,"
+                "has_function_privilege(current_user,"
+                "'storage.reissue_backtest_object_cleanup(jsonb,text)','EXECUTE') AS can_reissue"
             ),
             {"identity_relation_oid": identity_relation_oid},
         ).mappings().one() == {
             "role_name": "idea2strategy_backtest",
             "can_delete": False,
+            "can_read_ownerships": False,
+            "can_read_attempt_capabilities": False,
             "can_read_identity": False,
             "can_cleanup": True,
+            "can_reissue": True,
         }
 
-    with runtime_port.cleanup_batch((published.record,)) as locked:
+    with runtime_port.cleanup_batch(
+        (published.record,), **_cleanup_kwargs(published)
+    ) as locked:
         assert locked == (published.record,)
         assert object_store.delete_if_matches(
             published.record.object_key,
@@ -810,9 +978,14 @@ def test_runtime_unreadable_future_fk_fails_before_external_delete(
         tmp_path / "future-unreadable",
         bucket_name="task5-future-unreadable",
     )
-    published = StorageObjectRegistrar(object_store, admin_port).publish(
+    key = _canonical_cleanup_key(record_type="FUTURE_UNREADABLE")
+    published = StorageObjectRegistrar(
+        object_store,
+        admin_port,
+        producer_claim=_producer_claim(persistence, _run_id_from_key(key)),
+    ).publish(
         object_id=uuid.uuid4(),
-        object_key=_canonical_cleanup_key(record_type="FUTURE_UNREADABLE"),
+        object_key=key,
         data=BODY,
         schema_version="1.0.0",
         row_count=3,
@@ -835,7 +1008,9 @@ def test_runtime_unreadable_future_fk_fails_before_external_delete(
 
         with (
             pytest.raises(ObjectStoreConflict, match="future object refs"),
-            runtime_port.cleanup_batch((published.record,)),
+            runtime_port.cleanup_batch(
+                (published.record,), **_cleanup_kwargs(published)
+            ),
         ):
             entered_external_delete = True
 
@@ -850,7 +1025,7 @@ def test_runtime_unreadable_future_fk_fails_before_external_delete(
         )
     finally:
         _drop_test_schema(admin_engine, schema)
-        _cleanup_owned_object(admin_port, object_store, published.record)
+        _cleanup_owned_object(admin_port, object_store, published)
 
 
 def test_storage_row_delete_is_completed_before_external_delete(
@@ -867,9 +1042,14 @@ def test_storage_row_delete_is_completed_before_external_delete(
         tmp_path / "delete-trigger",
         bucket_name="task5-delete-trigger",
     )
-    published = StorageObjectRegistrar(object_store, admin_port).publish(
+    key = _canonical_cleanup_key(record_type="DELETE_TRIGGER")
+    published = StorageObjectRegistrar(
+        object_store,
+        admin_port,
+        producer_claim=_producer_claim(persistence, _run_id_from_key(key)),
+    ).publish(
         object_id=uuid.uuid4(),
-        object_key=_canonical_cleanup_key(record_type="DELETE_TRIGGER"),
+        object_key=key,
         data=BODY,
         schema_version="1.0.0",
         row_count=3,
@@ -901,7 +1081,9 @@ def test_storage_row_delete_is_completed_before_external_delete(
 
         with (
             pytest.raises(ObjectStoreConflict, match="delete rejected"),
-            runtime_port.cleanup_batch((published.record,)),
+            runtime_port.cleanup_batch(
+                (published.record,), **_cleanup_kwargs(published)
+            ),
         ):
             entered_external_delete = True
             object_store.delete_if_matches(
@@ -921,7 +1103,7 @@ def test_storage_row_delete_is_completed_before_external_delete(
         )
     finally:
         _drop_test_schema(admin_engine, schema)
-        _cleanup_owned_object(admin_port, object_store, published.record)
+        _cleanup_owned_object(admin_port, object_store, published)
 
 
 def test_cleanup_capability_refuses_an_unowned_object_namespace(
@@ -932,51 +1114,298 @@ def test_cleanup_capability_refuses_an_unowned_object_namespace(
 ) -> None:
     """EXECUTE is not a disguised grant to delete arbitrary storage rows."""
 
-    admin_port = PersistenceStorageObjectWritePort(persistence)
     runtime_port = PersistenceStorageObjectWritePort(backtest_role_persistence)
     object_store = LocalObjectStore(
         tmp_path / "unowned",
         bucket_name="task5-unowned",
     )
-    published = StorageObjectRegistrar(object_store, admin_port).publish(
-        object_id=uuid.uuid4(),
-        object_key=f"pipeline-owned/{uuid.uuid4()}/{hashlib.sha256(BODY).hexdigest()}.parquet",
-        data=BODY,
+    caller = _producer_claim(persistence, uuid.uuid4())
+    object_id = uuid.uuid4()
+    object_key = _canonical_cleanup_key(
+        run_id=caller.run_id,
+        record_type="UNOWNED_CANONICAL",
+    )
+    receipt = object_store.put(object_key, BODY)
+    staged = StorageObjectRecord.staged(
+        object_id=object_id,
+        receipt=receipt,
         schema_version="1.0.0",
         row_count=3,
         period_start=T0,
         period_end=T0,
         created_at=T0,
-        verified_at=T0,
     )
+    # Deliberately bypass the ownership-aware port: this models a pre-existing or
+    # other-worker row in the exact namespace visible to the shared runtime role.
+    unowned = staged.verified(T0)
+    with persistence.unit_of_work() as uow:
+        inserted, created = uow.objects.register(staged.to_row())
+        uow.objects.mark_available(object_id, T0)
+    assert created
+    assert inserted.id == object_id
     entered_external_delete = False
     try:
         with (
-            pytest.raises(ObjectStoreConflict, match="canonical backtest"),
-            runtime_port.cleanup_batch((published.record,)),
+            pytest.raises(ObjectStoreConflict, match="producer ownership"),
+            runtime_port.cleanup_batch(
+                (unowned,),
+                producer_claim=caller,
+                cleanup_tokens={object_id: "f" * 64},
+            ),
         ):
             entered_external_delete = True
 
         assert entered_external_delete is False
         assert object_store.preflight_delete(
-            published.record.object_key,
-            published.record.content_hash,
-            published.record.provider_version_id,
+            unowned.object_key,
+            unowned.content_hash,
+            unowned.provider_version_id,
         )
-        assert object_row(admin_engine, published.record.object_id)["object_key"] == (
-            published.record.object_key
-        )
+        assert object_row(admin_engine, object_id)["object_key"] == object_key
     finally:
         with admin_engine.begin() as connection:
             connection.execute(
                 text("DELETE FROM storage.objects WHERE id=:id"),
-                {"id": published.record.object_id},
+                {"id": object_id},
             )
         object_store.delete_if_matches(
-            published.record.object_key,
-            published.record.content_hash,
-            published.record.provider_version_id,
+            unowned.object_key,
+            unowned.content_hash,
+            unowned.provider_version_id,
         )
+
+
+@pytest.mark.parametrize(
+    ("legal_hold", "retention_delta", "allowed"),
+    [
+        (True, None, False),
+        (False, timedelta(hours=1), False),
+        (False, timedelta(hours=-1), True),
+    ],
+    ids=["legal-hold", "future-retention", "expired-retention"],
+)
+def test_cleanup_enforces_object_hold_and_retention_policy(
+    persistence: BacktestPersistence,
+    backtest_role_persistence: BacktestPersistence,
+    admin_engine: Engine,
+    tmp_path: Path,
+    legal_hold: bool,
+    retention_delta: timedelta | None,
+    allowed: bool,
+) -> None:
+    runtime_port = PersistenceStorageObjectWritePort(backtest_role_persistence)
+    admin_port = PersistenceStorageObjectWritePort(persistence)
+    object_store = LocalObjectStore(
+        tmp_path / f"policy-{int(legal_hold)}-{int(allowed)}",
+        bucket_name="task5-object-policy",
+    )
+    published = _publish_cleanup_object(
+        persistence,
+        admin_port,
+        object_store,
+        record_type="OBJECT_POLICY",
+    )
+    retention_until = (
+        None if retention_delta is None else datetime.now(UTC) + retention_delta
+    )
+    with admin_engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE storage.objects SET legal_hold=:legal_hold, "
+                "retention_until=:retention_until WHERE id=:object_id"
+            ),
+            {
+                "legal_hold": legal_hold,
+                "retention_until": retention_until,
+                "object_id": published.record.object_id,
+            },
+        )
+
+    entered_external_delete = False
+    try:
+        current = runtime_port.find(published.record.object_id)
+        assert current is not None
+        if not allowed:
+            with (
+                pytest.raises(ObjectStoreConflict, match="hold|retention"),
+                runtime_port.cleanup_batch(
+                    (current,), **_cleanup_kwargs(published)
+                ),
+            ):
+                entered_external_delete = True
+            assert entered_external_delete is False
+            assert object_store.exists(current.object_key)
+            assert runtime_port.find(current.object_id) is not None
+            return
+
+        with runtime_port.cleanup_batch(
+            (current,), **_cleanup_kwargs(published)
+        ) as locked:
+            entered_external_delete = True
+            assert locked == (current,)
+            assert object_store.delete_if_matches(
+                current.object_key,
+                current.content_hash,
+                current.provider_version_id,
+            )
+        assert runtime_port.find(current.object_id) is None
+        assert not object_store.exists(current.object_key)
+    finally:
+        if runtime_port.find(published.record.object_id) is not None:
+            with admin_engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE storage.objects SET legal_hold=false, "
+                        "retention_until=NULL WHERE id=:object_id"
+                    ),
+                    {"object_id": published.record.object_id},
+                )
+            _cleanup_owned_object(admin_port, object_store, published)
+
+
+def test_successor_reissues_exact_predecessor_object_and_fences_every_other_claim(
+    persistence: BacktestPersistence,
+    backtest_role_persistence: BacktestPersistence,
+    admin_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    """A restart safely adopts one exact upload; stale and unrelated claims cannot."""
+
+    run_id = uuid.uuid4()
+    with persistence.unit_of_work() as uow:
+        _stored, created = uow.runs.accept(
+            make_run(
+                run_id=run_id,
+                idempotency_key=f"TASK5:REISSUE:{uuid.uuid4()}",
+                status=RunStatus.RUNNING,
+            )
+        )
+    assert created
+    key = worker_execution_key_for(str(run_id), f"TASK5:REISSUE:{uuid.uuid4()}")
+    execution_store = PersistenceExecutionKeyStore(persistence)
+    now = datetime.now(UTC)
+    first_claim = execution_store.claim(
+        key,
+        run_id=str(run_id),
+        owner="predecessor-worker",
+        now=now,
+        lease_duration=timedelta(minutes=5),
+    )
+    first_owner = _claim_as_producer(run_id, first_claim)
+    object_store = LocalObjectStore(tmp_path / "reissue", bucket_name="bt7-fixture")
+    admin_port = PersistenceStorageObjectWritePort(persistence)
+    runtime_port = PersistenceStorageObjectWritePort(backtest_role_persistence)
+    object_id = uuid.uuid4()
+    object_key = _canonical_cleanup_key(run_id=run_id, record_type="REISSUE")
+    first = _publish(
+        admin_port,
+        tmp_path / "reissue",
+        object_id=object_id,
+        key=object_key,
+        body=BODY,
+        producer_claim=first_owner,
+    )
+
+    execution_store.release(
+        key,
+        now=now + timedelta(seconds=1),
+        claim=first_claim,
+        reason_code="WORKER_KILLED_AFTER_UPLOAD",
+    )
+    second_claim = execution_store.claim(
+        key,
+        run_id=str(run_id),
+        owner="successor-worker",
+        now=now + timedelta(seconds=2),
+        lease_duration=timedelta(minutes=5),
+    )
+    second_owner = _claim_as_producer(run_id, second_claim)
+
+    with pytest.raises(
+        ObjectStoreConflict, match="stale|superseded"
+    ), runtime_port.cleanup_batch(
+        (first.record,), **_cleanup_kwargs(first)
+    ):
+        pytest.fail("stale predecessor reached external deletion")
+
+    unrelated_owner = _producer_claim(persistence, uuid.uuid4())
+    preserved = _publish(
+        runtime_port,
+        tmp_path / "reissue",
+        object_id=object_id,
+        key=object_key,
+        body=BODY,
+        producer_claim=unrelated_owner,
+    )
+    assert preserved.cleanup_token is None
+    with admin_engine.connect() as connection:
+        unchanged_owner = connection.execute(
+            text(
+                "SELECT run_id,producing_attempt_id,producing_claim_token "
+                "FROM storage.backtest_object_ownerships WHERE object_id=:object_id"
+            ),
+            {"object_id": object_id},
+        ).mappings().one()
+    assert dict(unchanged_owner) == {
+        "run_id": run_id,
+        "producing_attempt_id": first_owner.attempt_id,
+        "producing_claim_token": first_owner.claim_token,
+    }
+    with pytest.raises(
+        ObjectStoreConflict, match="producer ownership"
+    ), runtime_port.cleanup_batch(
+        (preserved.record,),
+        producer_claim=unrelated_owner,
+        cleanup_tokens={object_id: "e" * 64},
+    ):
+        pytest.fail("an unrelated reconciler reached external deletion")
+
+    adopted = _publish(
+        runtime_port,
+        tmp_path / "reissue",
+        object_id=object_id,
+        key=object_key,
+        body=BODY,
+        producer_claim=second_owner,
+    )
+    with admin_engine.connect() as connection:
+        ownership = connection.execute(
+            text(
+                "SELECT run_id,producing_attempt_id,producing_claim_token "
+                "FROM storage.backtest_object_ownerships WHERE object_id=:object_id"
+            ),
+            {"object_id": object_id},
+        ).mappings().one()
+        assert dict(ownership) == {
+            "run_id": run_id,
+            "producing_attempt_id": second_owner.attempt_id,
+            "producing_claim_token": second_owner.claim_token,
+        }
+        assert connection.scalar(
+            text("SELECT count(*) FROM storage.objects WHERE id=:object_id"),
+            {"object_id": object_id},
+        ) == 1
+
+    with pytest.raises(
+        ObjectStoreConflict, match="producer ownership"
+    ), runtime_port.cleanup_batch(
+        (adopted.record,),
+        producer_claim=second_owner,
+        cleanup_tokens={object_id: first.cleanup_token or ""},
+    ):
+        pytest.fail("rotated predecessor token reached external deletion")
+
+    with runtime_port.cleanup_batch(
+        (adopted.record,), **_cleanup_kwargs(adopted)
+    ) as locked:
+        assert locked == (adopted.record,)
+        assert object_store.delete_if_matches(
+            adopted.record.object_key,
+            adopted.record.content_hash,
+            adopted.record.provider_version_id,
+        )
+    assert runtime_port.find(object_id) is None
+    assert not object_store.exists(object_key)
 
 
 def test_future_storage_object_fk_blocks_every_external_delete(
@@ -991,7 +1420,11 @@ def test_future_storage_object_fk_blocks_every_external_delete(
     object_store = S3ObjectStore(bucket, client=s3)
     object_id = uuid.uuid4()
     key = _canonical_cleanup_key(record_type="FUTURE_FK")
-    published = StorageObjectRegistrar(object_store, port).publish(
+    published = StorageObjectRegistrar(
+        object_store,
+        port,
+        producer_claim=_producer_claim(persistence, _run_id_from_key(key)),
+    ).publish(
         object_id=object_id,
         object_key=key,
         data=BODY,
@@ -1009,7 +1442,9 @@ def test_future_storage_object_fk_blocks_every_external_delete(
     survived_exactly = False
     try:
         try:
-            with port.cleanup_batch((published.record,)):
+            with port.cleanup_batch(
+                (published.record,), **_cleanup_kwargs(published)
+            ):
                 entered_external_delete = True
                 object_store.delete_if_matches(
                     published.record.object_key,
@@ -1030,7 +1465,7 @@ def test_future_storage_object_fk_blocks_every_external_delete(
         ) == (ObjectStoreConflict, False, True)
     finally:
         _drop_test_schema(admin_engine, schema)
-        _cleanup_owned_object(port, object_store, published.record)
+        _cleanup_owned_object(port, object_store, published)
 
 
 def test_cleanup_table_lock_allows_an_unrelated_storage_object_insert(
@@ -1042,9 +1477,16 @@ def test_cleanup_table_lock_allows_an_unrelated_storage_object_insert(
     port = PersistenceStorageObjectWritePort(persistence)
     candidate_store = LocalObjectStore(tmp_path / "candidate", bucket_name="task5-candidate")
     unrelated_store = LocalObjectStore(tmp_path / "unrelated", bucket_name="task5-unrelated")
-    candidate = StorageObjectRegistrar(candidate_store, port).publish(
+    candidate_key = _canonical_cleanup_key(record_type="UNRELATED_DML_CANDIDATE")
+    candidate = StorageObjectRegistrar(
+        candidate_store,
+        port,
+        producer_claim=_producer_claim(
+            persistence, _run_id_from_key(candidate_key)
+        ),
+    ).publish(
         object_id=uuid.uuid4(),
-        object_key=_canonical_cleanup_key(record_type="UNRELATED_DML_CANDIDATE"),
+        object_key=candidate_key,
         data=BODY,
         schema_version="1.0.0",
         row_count=3,
@@ -1054,14 +1496,20 @@ def test_cleanup_table_lock_allows_an_unrelated_storage_object_insert(
         verified_at=T0,
     )
     unrelated_id = uuid.uuid4()
+    unrelated_key = _canonical_cleanup_key(
+        body=OTHER_BODY,
+        record_type="UNRELATED_DML_OTHER",
+    )
+    unrelated_claim = _producer_claim(persistence, _run_id_from_key(unrelated_key))
 
     def publish_unrelated() -> Any:
-        return StorageObjectRegistrar(unrelated_store, port).publish(
+        return StorageObjectRegistrar(
+            unrelated_store,
+            port,
+            producer_claim=unrelated_claim,
+        ).publish(
             object_id=unrelated_id,
-            object_key=_canonical_cleanup_key(
-                body=OTHER_BODY,
-                record_type="UNRELATED_DML_OTHER",
-            ),
+            object_key=unrelated_key,
             data=OTHER_BODY,
             schema_version="1.0.0",
             row_count=3,
@@ -1073,15 +1521,17 @@ def test_cleanup_table_lock_allows_an_unrelated_storage_object_insert(
 
     with (
         ThreadPoolExecutor(max_workers=1) as pool,
-        port.cleanup_batch((candidate.record,)) as locked,
+        port.cleanup_batch(
+            (candidate.record,), **_cleanup_kwargs(candidate)
+        ) as locked,
     ):
         assert locked == (candidate.record,)
         unrelated = pool.submit(publish_unrelated).result(timeout=10)
 
     assert port.find(candidate.record.object_id) is None
     assert port.find(unrelated_id) == unrelated.record
-    _cleanup_owned_object(port, candidate_store, candidate.record)
-    _cleanup_owned_object(port, unrelated_store, unrelated.record)
+    _cleanup_owned_object(port, candidate_store, candidate)
+    _cleanup_owned_object(port, unrelated_store, unrelated)
 
 
 def _blocked_relation_lock(
@@ -1122,34 +1572,50 @@ def _blocked_backend_lock(
         ).scalar_one_or_none()
 
 
-@pytest.mark.parametrize("operation", ["add", "drop", "rename"])
-def test_inverse_fk_ddl_order_is_deadlock_free_and_fails_before_external_delete(
+def _backend_wait_event(
+    admin_engine: Engine,
+    *,
+    application_name: str,
+) -> str | None:
+    with admin_engine.connect() as connection:
+        return connection.execute(
+            text(
+                "SELECT wait_event FROM pg_stat_activity "
+                "WHERE application_name=:application_name "
+                "ORDER BY backend_start DESC LIMIT 1"
+            ),
+            {"application_name": application_name},
+        ).scalar_one_or_none()
+
+
+@pytest.mark.parametrize("source_known", [False, True], ids=["unknown-source", "known-source"])
+@pytest.mark.parametrize("not_valid", [False, True], ids=["validated", "not-valid"])
+def test_add_fk_ddl_first_releases_target_then_retries_without_a_dangling_reference(
     postgres_url: str,
     persistence: BacktestPersistence,
     admin_engine: Engine,
     tmp_path: Path,
-    operation: str,
+    source_known: bool,
+    not_valid: bool,
 ) -> None:
-    """DDL may own the source before cleanup asks for its target lock."""
+    """Source-first ADD linearizes before cleanup without an inverse deadlock."""
 
     admin_port = PersistenceStorageObjectWritePort(persistence)
     object_store = LocalObjectStore(
-        tmp_path / f"inverse-{operation}",
-        bucket_name=f"task5-inverse-{operation}",
+        tmp_path / f"ddl-first-add-{source_known}-{not_valid}",
+        bucket_name=f"task5-ddl-first-add-{source_known}-{not_valid}",
     )
-    published = StorageObjectRegistrar(object_store, admin_port).publish(
-        object_id=uuid.uuid4(),
-        object_key=_canonical_cleanup_key(record_type=f"INVERSE_{operation.upper()}"),
-        data=BODY,
-        schema_version="1.0.0",
-        row_count=3,
-        period_start=T0,
-        period_end=T0,
-        created_at=T0,
-        verified_at=T0,
+    published = _publish_cleanup_object(
+        persistence,
+        admin_port,
+        object_store,
+        record_type=f"DDL_FIRST_{'KNOWN' if source_known else 'UNKNOWN'}_"
+        f"{'NOT_VALID' if not_valid else 'VALIDATED'}",
     )
-    schema = _future_fk_schema(admin_engine)
-    if operation == "add":
+    schema = _future_fk_schema(admin_engine, with_constraint=source_known)
+    source_column = "storage object id"
+    if source_known:
+        source_column = "second storage object id"
         with admin_engine.begin() as connection:
             connection.execute(
                 text(
@@ -1157,39 +1623,33 @@ def test_inverse_fk_ddl_order_is_deadlock_free_and_fails_before_external_delete(
                     'ADD COLUMN "second storage object id" uuid'
                 )
             )
-        ddl = (
-            f'ALTER TABLE "{schema}"."future object refs" '
-            'ADD CONSTRAINT "second future storage object fk" '
-            'FOREIGN KEY ("second storage object id") REFERENCES storage.objects(id)'
-        )
-    elif operation == "drop":
-        ddl = (
-            f'ALTER TABLE "{schema}"."future object refs" '
-            'DROP CONSTRAINT "future storage object fk"'
-        )
-    else:
-        ddl = (
-            f'ALTER TABLE "{schema}"."future object refs" '
-            'RENAME CONSTRAINT "future storage object fk" '
-            'TO "renamed future storage fk"'
+    with admin_engine.begin() as connection:
+        connection.execute(
+            text(
+                f'INSERT INTO "{schema}"."future object refs" '
+                f'("{source_column}") VALUES (:object_id)'
+            ),
+            {"object_id": published.record.object_id},
         )
 
-    cleanup_name = f"task5-inverse-cleanup-{operation}-{uuid.uuid4().hex}"
+    ddl = (
+        f'ALTER TABLE "{schema}"."future object refs" '
+        'ADD CONSTRAINT "new storage object fk" '
+        f'FOREIGN KEY ("{source_column}") REFERENCES storage.objects(id)'
+        + (" NOT VALID" if not_valid else "")
+    )
+    cleanup_name = f"task5-ddl-first-add-cleanup-{uuid.uuid4().hex}"
     cleanup_engine = create_backtest_engine(
         postgres_url,
         application_name=cleanup_name,
-        connect_args={
-            "options": "-c deadlock_timeout=100ms -c lock_timeout=5s",
-        },
+        connect_args={"options": "-c deadlock_timeout=100ms -c statement_timeout=10s"},
     )
-    cleanup_port = PersistenceStorageObjectWritePort(
-        BacktestPersistence(cleanup_engine)
-    )
+    cleanup_port = PersistenceStorageObjectWritePort(BacktestPersistence(cleanup_engine))
     source_locked = Event()
     allow_ddl_target = Event()
     entered_external_delete = False
 
-    def mutate_after_source_lock() -> None:
+    def add_after_source_lock() -> None:
         with admin_engine.begin() as connection:
             connection.execute(text("SET LOCAL deadlock_timeout='100ms'"))
             connection.execute(text("SET LOCAL statement_timeout='10s'"))
@@ -1205,89 +1665,109 @@ def test_inverse_fk_ddl_order_is_deadlock_free_and_fails_before_external_delete(
 
     def cleanup() -> None:
         nonlocal entered_external_delete
-        with cleanup_port.cleanup_batch((published.record,)):
+        with cleanup_port.cleanup_batch(
+            (published.record,), **_cleanup_kwargs(published)
+        ) as locked:
+            assert locked == (published.record,)
             entered_external_delete = True
+            assert object_store.delete_if_matches(
+                published.record.object_key,
+                published.record.content_hash,
+                published.record.provider_version_id,
+            )
 
     pool = ThreadPoolExecutor(max_workers=2)
-    ddl_future = pool.submit(mutate_after_source_lock)
+    ddl_future = pool.submit(add_after_source_lock)
     cleanup_future = None
     try:
         assert source_locked.wait(timeout=10), "DDL did not acquire its source lock"
         cleanup_future = pool.submit(cleanup)
-        blocked = wait_until(
-            lambda: _blocked_relation_lock(
-                admin_engine,
-                application_name=cleanup_name,
+        wait_event = wait_until(
+            lambda: (
+                _backend_wait_event(
+                    admin_engine,
+                    application_name=cleanup_name,
+                )
+                == "PgSleep"
             ),
-            description="cleanup to wait on the DDL-owned source before target locking",
-            timeout_seconds=10,
+            description="cleanup to enter a bounded retry after NOWAIT source conflict",
+            timeout_seconds=3,
+            poll_seconds=0.005,
         )
-        assert blocked == f"{schema}.future object refs:AccessShareLock"
+        assert wait_event is True
 
+        # The failed subtransaction released storage.objects before this DDL asks
+        # for the target.  It therefore finishes rather than forming source->target
+        # versus target->source deadlock edges with cleanup.
         allow_ddl_target.set()
-        ddl_future.result(timeout=10)
-        with pytest.raises(ObjectStoreConflict, match="catalog changed"):
+        if not_valid:
+            with pytest.raises(DBAPIError, match="unvalidated"):
+                ddl_future.result(timeout=10)
             cleanup_future.result(timeout=10)
-        assert entered_external_delete is False
-        assert object_store.preflight_delete(
-            published.record.object_key,
-            published.record.content_hash,
-            published.record.provider_version_id,
-        )
+            assert entered_external_delete is True
+            assert cleanup_port.find(published.record.object_id) is None
+            assert not object_store.exists(published.record.object_key)
+        else:
+            ddl_future.result(timeout=10)
+            with pytest.raises(ObjectStoreConflict, match="future object refs"):
+                cleanup_future.result(timeout=10)
+            assert entered_external_delete is False
+            assert object_store.preflight_delete(
+                published.record.object_key,
+                published.record.content_hash,
+                published.record.provider_version_id,
+            )
+            assert cleanup_port.find(published.record.object_id) is not None
     finally:
         allow_ddl_target.set()
         pool.shutdown(wait=True)
         cleanup_engine.dispose()
         _drop_test_schema(admin_engine, schema)
-        _cleanup_owned_object(admin_port, object_store, published.record)
+        _cleanup_owned_object(admin_port, object_store, published)
 
 
-def test_unknown_source_fk_ddl_linearizes_after_cleanup_without_deadlock(
+@pytest.mark.parametrize("operation", ["drop", "rename"])
+def test_drop_or_rename_ddl_first_is_deadlock_free(
+    postgres_url: str,
     persistence: BacktestPersistence,
     admin_engine: Engine,
     tmp_path: Path,
+    operation: str,
 ) -> None:
-    """A source absent from the first fingerprint cannot form an inverse cycle."""
-
-    port = PersistenceStorageObjectWritePort(persistence)
+    admin_port = PersistenceStorageObjectWritePort(persistence)
     object_store = LocalObjectStore(
-        tmp_path / "unknown-source",
-        bucket_name="task5-unknown-source",
+        tmp_path / f"ddl-first-{operation}",
+        bucket_name=f"task5-ddl-first-{operation}",
     )
-    published = StorageObjectRegistrar(object_store, port).publish(
-        object_id=uuid.uuid4(),
-        object_key=_canonical_cleanup_key(record_type="UNKNOWN_SOURCE"),
-        data=BODY,
-        schema_version="1.0.0",
-        row_count=3,
-        period_start=T0,
-        period_end=T0,
-        created_at=T0,
-        verified_at=T0,
+    published = _publish_cleanup_object(
+        persistence,
+        admin_port,
+        object_store,
+        record_type=f"DDL_FIRST_{operation.upper()}",
     )
-    schema = _future_fk_schema(admin_engine, with_constraint=False)
-    with admin_engine.begin() as connection:
-        connection.execute(
-            text(
-                f'INSERT INTO "{schema}"."future object refs" '
-                '("storage object id") VALUES (:object_id)'
-            ),
-            {"object_id": published.record.object_id},
+    schema = _future_fk_schema(admin_engine)
+    ddl = (
+        f'ALTER TABLE "{schema}"."future object refs" '
+        + (
+            'DROP CONSTRAINT "future storage object fk"'
+            if operation == "drop"
+            else 'RENAME CONSTRAINT "future storage object fk" '
+            'TO "renamed future storage fk"'
         )
-
-    ddl_name = f"task5-unknown-source-ddl-{uuid.uuid4().hex}"
+    )
+    cleanup_name = f"task5-ddl-first-{operation}-cleanup-{uuid.uuid4().hex}"
+    cleanup_engine = create_backtest_engine(
+        postgres_url,
+        application_name=cleanup_name,
+        connect_args={"options": "-c deadlock_timeout=100ms -c statement_timeout=10s"},
+    )
+    cleanup_port = PersistenceStorageObjectWritePort(BacktestPersistence(cleanup_engine))
     source_locked = Event()
     allow_ddl_target = Event()
-    cleanup_reached_external_boundary = Event()
-    allow_cleanup_commit = Event()
+    entered_external_delete = False
 
-    def add_unknown_fk() -> None:
+    def mutate_after_source_lock() -> None:
         with admin_engine.begin() as connection:
-            connection.execute(
-                text("SELECT set_config('application_name', :name, true)"),
-                {"name": ddl_name},
-            )
-            connection.execute(text("SET LOCAL statement_timeout='10s'"))
             connection.execute(
                 text(
                     f'LOCK TABLE "{schema}"."future object refs" '
@@ -1296,19 +1776,14 @@ def test_unknown_source_fk_ddl_linearizes_after_cleanup_without_deadlock(
             )
             source_locked.set()
             assert allow_ddl_target.wait(timeout=10)
-            connection.execute(
-                text(
-                    f'ALTER TABLE "{schema}"."future object refs" '
-                    'ADD CONSTRAINT "new unknown storage object fk" '
-                    'FOREIGN KEY ("storage object id") REFERENCES storage.objects(id)'
-                )
-            )
+            connection.execute(text(ddl))
 
     def cleanup() -> None:
-        with port.cleanup_batch((published.record,)) as locked:
-            assert locked == (published.record,)
-            cleanup_reached_external_boundary.set()
-            assert allow_cleanup_commit.wait(timeout=10)
+        nonlocal entered_external_delete
+        with cleanup_port.cleanup_batch(
+            (published.record,), **_cleanup_kwargs(published)
+        ):
+            entered_external_delete = True
             assert object_store.delete_if_matches(
                 published.record.object_key,
                 published.record.content_hash,
@@ -1316,76 +1791,165 @@ def test_unknown_source_fk_ddl_linearizes_after_cleanup_without_deadlock(
             )
 
     pool = ThreadPoolExecutor(max_workers=2)
-    ddl_future = pool.submit(add_unknown_fk)
+    ddl_future = pool.submit(mutate_after_source_lock)
     cleanup_future = None
     try:
-        assert source_locked.wait(timeout=10), "DDL did not acquire the unknown source lock"
+        assert source_locked.wait(timeout=10)
         cleanup_future = pool.submit(cleanup)
-        assert cleanup_reached_external_boundary.wait(timeout=10), (
-            "cleanup waited on a source absent from its initial FK fingerprint"
-        )
-
-        allow_ddl_target.set()
-        blocked = wait_until(
-            lambda: _blocked_relation_lock(
+        assert wait_until(
+            lambda: _backend_wait_event(
                 admin_engine,
-                application_name=ddl_name,
-            ),
-            description="unknown-source ADD FK to wait on cleanup's target fence",
-            timeout_seconds=10,
+                application_name=cleanup_name,
+            )
+            == "PgSleep",
+            description="cleanup to release target and enter its retry",
+            timeout_seconds=3,
+            poll_seconds=0.005,
         )
-        assert blocked == "storage.objects:ShareRowExclusiveLock"
-
-        allow_cleanup_commit.set()
+        allow_ddl_target.set()
+        ddl_future.result(timeout=10)
         cleanup_future.result(timeout=10)
-        with pytest.raises(IntegrityError):
-            ddl_future.result(timeout=10)
-        assert port.find(published.record.object_id) is None
+        assert entered_external_delete is True
+        assert cleanup_port.find(published.record.object_id) is None
         assert not object_store.exists(published.record.object_key)
     finally:
         allow_ddl_target.set()
-        allow_cleanup_commit.set()
         pool.shutdown(wait=True)
+        cleanup_engine.dispose()
         _drop_test_schema(admin_engine, schema)
-        _cleanup_owned_object(port, object_store, published.record)
+        _cleanup_owned_object(admin_port, object_store, published)
+
+
+def test_cleanup_ddl_retry_is_bounded_and_never_reaches_external_delete(
+    postgres_url: str,
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    admin_port = PersistenceStorageObjectWritePort(persistence)
+    object_store = LocalObjectStore(
+        tmp_path / "bounded-ddl-retry",
+        bucket_name="task5-bounded-ddl-retry",
+    )
+    published = _publish_cleanup_object(
+        persistence,
+        admin_port,
+        object_store,
+        record_type="BOUNDED_DDL_RETRY",
+    )
+    schema = _future_fk_schema(admin_engine)
+    cleanup_name = f"task5-bounded-retry-{uuid.uuid4().hex}"
+    cleanup_engine = create_backtest_engine(
+        postgres_url,
+        application_name=cleanup_name,
+        connect_args={"options": "-c statement_timeout=10s"},
+    )
+    cleanup_port = PersistenceStorageObjectWritePort(BacktestPersistence(cleanup_engine))
+    source_locked = Event()
+    release_source = Event()
+    entered_external_delete = False
+
+    def hold_source() -> None:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                text(
+                    f'LOCK TABLE "{schema}"."future object refs" '
+                    "IN ACCESS EXCLUSIVE MODE"
+                )
+            )
+            source_locked.set()
+            assert release_source.wait(timeout=10)
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    holder = pool.submit(hold_source)
+    try:
+        assert source_locked.wait(timeout=10)
+        started = time.monotonic()
+        with (
+            pytest.raises(ObjectStoreConflict, match="exhausted 12 bounded"),
+            cleanup_port.cleanup_batch(
+                (published.record,), **_cleanup_kwargs(published)
+            ),
+        ):
+            entered_external_delete = True
+        elapsed = time.monotonic() - started
+        assert entered_external_delete is False
+        assert 0.3 <= elapsed < 3.0
+        assert cleanup_port.find(published.record.object_id) is not None
+        assert object_store.preflight_delete(
+            published.record.object_key,
+            published.record.content_hash,
+            published.record.provider_version_id,
+        )
+    finally:
+        release_source.set()
+        holder.result(timeout=10)
+        pool.shutdown(wait=True)
+        cleanup_engine.dispose()
+        _drop_test_schema(admin_engine, schema)
+        _cleanup_owned_object(admin_port, object_store, published)
 
 
 @pytest.mark.parametrize(
-    "operation",
-    ["add", "drop", "rename"],
+    ("operation", "source_known"),
+    [
+        ("add-validated", False),
+        ("add-validated", True),
+        ("add-not-valid", False),
+        ("add-not-valid", True),
+        ("drop", True),
+        ("rename", True),
+    ],
+    ids=[
+        "add-validated-unknown-source",
+        "add-validated-known-source",
+        "add-not-valid-unknown-source",
+        "add-not-valid-known-source",
+        "drop-known-source",
+        "rename-known-source",
+    ],
 )
 def test_cleanup_serializes_concurrent_storage_fk_ddl(
     persistence: BacktestPersistence,
     admin_engine: Engine,
     tmp_path: Path,
     operation: str,
+    source_known: bool,
 ) -> None:
     """FK catalog shape cannot change between enumeration and external deletion."""
 
     port = PersistenceStorageObjectWritePort(persistence)
     object_store = LocalObjectStore(tmp_path / operation, bucket_name=f"task5-ddl-{operation}")
-    published = StorageObjectRegistrar(object_store, port).publish(
-        object_id=uuid.uuid4(),
-        object_key=_canonical_cleanup_key(record_type=f"DDL_{operation.upper()}"),
-        data=BODY,
-        schema_version="1.0.0",
-        row_count=3,
-        period_start=T0,
-        period_end=T0,
-        created_at=T0,
-        verified_at=T0,
+    published = _publish_cleanup_object(
+        persistence,
+        port,
+        object_store,
+        record_type=f"DDL_{operation.upper().replace('-', '_')}",
     )
     schema = _future_fk_schema(
         admin_engine,
-        with_constraint=operation != "add",
+        with_constraint=source_known,
     )
     application_name = f"task5-fk-ddl-{operation}-{uuid.uuid4().hex}"
     ready = Event()
-    if operation == "add":
+    if operation.startswith("add"):
+        source_column = "storage object id"
+        constraint_name = "future storage object fk"
+        if source_known:
+            source_column = "second storage object id"
+            constraint_name = "second future storage object fk"
+            with admin_engine.begin() as connection:
+                connection.execute(
+                    text(
+                        f'ALTER TABLE "{schema}"."future object refs" '
+                        'ADD COLUMN "second storage object id" uuid'
+                    )
+                )
         ddl = (
             f'ALTER TABLE "{schema}"."future object refs" '
-            'ADD CONSTRAINT "future storage object fk" '
-            'FOREIGN KEY ("storage object id") REFERENCES storage.objects(id)'
+            f'ADD CONSTRAINT "{constraint_name}" '
+            f'FOREIGN KEY ("{source_column}") REFERENCES storage.objects(id)'
+            + (" NOT VALID" if operation == "add-not-valid" else "")
         )
     elif operation == "drop":
         ddl = (
@@ -1411,7 +1975,9 @@ def test_cleanup_serializes_concurrent_storage_fk_ddl(
     pool = ThreadPoolExecutor(max_workers=1)
     future = None
     try:
-        with port.cleanup_batch((published.record,)):
+        with port.cleanup_batch(
+            (published.record,), **_cleanup_kwargs(published)
+        ):
             future = pool.submit(mutate_catalog)
             assert ready.wait(timeout=10), "DDL worker never reached its boundary"
 
@@ -1434,12 +2000,23 @@ def test_cleanup_serializes_concurrent_storage_fk_ddl(
                 "storage.objects",
                 f"{schema}.future object refs",
             }
+            assert object_store.delete_if_matches(
+                published.record.object_key,
+                published.record.content_hash,
+                published.record.provider_version_id,
+            )
         assert future is not None
-        future.result(timeout=10)
+        if operation == "add-not-valid":
+            with pytest.raises(DBAPIError, match="unvalidated"):
+                future.result(timeout=10)
+        else:
+            future.result(timeout=10)
+        assert port.find(published.record.object_id) is None
+        assert not object_store.exists(published.record.object_key)
     finally:
         pool.shutdown(wait=True)
         _drop_test_schema(admin_engine, schema)
-        _cleanup_owned_object(port, object_store, published.record)
+        _cleanup_owned_object(port, object_store, published)
 
 
 def test_candidate_row_lock_serializes_a_concurrent_future_fk_insert(
@@ -1451,16 +2028,11 @@ def test_candidate_row_lock_serializes_a_concurrent_future_fk_insert(
 
     port = PersistenceStorageObjectWritePort(persistence)
     object_store = LocalObjectStore(tmp_path / "fk-insert", bucket_name="task5-fk-insert")
-    published = StorageObjectRegistrar(object_store, port).publish(
-        object_id=uuid.uuid4(),
-        object_key=_canonical_cleanup_key(record_type="CONCURRENT_FK_INSERT"),
-        data=BODY,
-        schema_version="1.0.0",
-        row_count=3,
-        period_start=T0,
-        period_end=T0,
-        created_at=T0,
-        verified_at=T0,
+    published = _publish_cleanup_object(
+        persistence,
+        port,
+        object_store,
+        record_type="CONCURRENT_FK_INSERT",
     )
     schema = _future_fk_schema(admin_engine)
     application_name = f"task5-fk-insert-{uuid.uuid4().hex}"
@@ -1484,7 +2056,9 @@ def test_candidate_row_lock_serializes_a_concurrent_future_fk_insert(
     pool = ThreadPoolExecutor(max_workers=1)
     future = None
     try:
-        with port.cleanup_batch((published.record,)):
+        with port.cleanup_batch(
+            (published.record,), **_cleanup_kwargs(published)
+        ):
             future = pool.submit(insert_reference)
             assert ready.wait(timeout=10), "reference writer never reached its boundary"
 
@@ -1509,7 +2083,7 @@ def test_candidate_row_lock_serializes_a_concurrent_future_fk_insert(
     finally:
         pool.shutdown(wait=True)
         _drop_test_schema(admin_engine, schema)
-        _cleanup_owned_object(port, object_store, published.record)
+        _cleanup_owned_object(port, object_store, published)
 
 
 @pytest.mark.parametrize(
@@ -1524,16 +2098,11 @@ def test_cleanup_fails_closed_for_unsupported_future_fk_shapes(
 ) -> None:
     port = PersistenceStorageObjectWritePort(persistence)
     object_store = LocalObjectStore(tmp_path / shape, bucket_name=f"task5-shape-{shape}")
-    published = StorageObjectRegistrar(object_store, port).publish(
-        object_id=uuid.uuid4(),
-        object_key=_canonical_cleanup_key(record_type=f"SHAPE_{shape.upper()}"),
-        data=BODY,
-        schema_version="1.0.0",
-        row_count=3,
-        period_start=T0,
-        period_end=T0,
-        created_at=T0,
-        verified_at=T0,
+    published = _publish_cleanup_object(
+        persistence,
+        port,
+        object_store,
+        record_type=f"SHAPE_{shape.upper()}",
     )
     schema = f"task5_fk_{uuid.uuid4().hex}"
     target_constraint = f"task5_composite_{uuid.uuid4().hex}"
@@ -1582,7 +2151,9 @@ def test_cleanup_fails_closed_for_unsupported_future_fk_shapes(
         entered_external_delete = False
         with (
             pytest.raises(ObjectStoreConflict, match="unsupported"),
-            port.cleanup_batch((published.record,)),
+            port.cleanup_batch(
+                (published.record,), **_cleanup_kwargs(published)
+            ),
         ):
             entered_external_delete = True
         assert entered_external_delete is False
@@ -1597,4 +2168,4 @@ def test_cleanup_fails_closed_for_unsupported_future_fk_shapes(
                         f'DROP CONSTRAINT IF EXISTS "{target_constraint}"'
                     )
                 )
-        _cleanup_owned_object(port, object_store, published.record)
+        _cleanup_owned_object(port, object_store, published)

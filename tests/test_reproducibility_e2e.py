@@ -81,7 +81,10 @@ from sqlalchemy import Engine, text
 from backtest_engine.attempt_coordinator import ResourceSample
 from backtest_engine.lifecycle import StaticDatasetManifestSource
 from backtest_engine.object_store import S3ObjectStore
-from backtest_engine.object_store.registration import StorageObjectRegistrar
+from backtest_engine.object_store.registration import (
+    RegisteredObject,
+    StorageObjectRecord,
+)
 from backtest_engine.persistence import (
     BacktestPersistence,
     StaleAttemptClaim,
@@ -1260,6 +1263,23 @@ def test_task5_process_kill_restart_preserves_lineage_and_one_terminal_publicati
             "SELECT id,claim_token,status FROM backtest.run_attempts WHERE run_id=:id ORDER BY attempt_number LIMIT 1",
             id=run_id,
         )
+        if checkpoint == "upload":
+            registered_before_kill = sql_all(
+                admin_engine,
+                "SELECT o.id,o.status,w.run_id,w.producing_attempt_id,"
+                "w.producing_claim_token FROM storage.objects o "
+                "JOIN storage.backtest_object_ownerships w ON w.object_id=o.id "
+                "WHERE o.object_key LIKE :prefix ORDER BY o.id",
+                prefix=f"backtest-results/{run_id}/%",
+            )
+            assert len(registered_before_kill) == 1
+            assert registered_before_kill[0] == {
+                "id": registered_before_kill[0]["id"],
+                "status": "STAGED",
+                "run_id": uuid.UUID(run_id),
+                "producing_attempt_id": first_claim["id"],
+                "producing_claim_token": first_claim["claim_token"],
+            }
     finally:
         if process.poll() is None:
             process.kill()
@@ -1358,6 +1378,45 @@ def test_task5_process_kill_restart_preserves_lineage_and_one_terminal_publicati
         )
         > 0
     )
+    if checkpoint == "upload":
+        # The successor must adopt the predecessor's registered upload, not leak
+        # it and create a parallel provider version.  Every row under the run is
+        # either the one result JSON or referenced by exactly one detail manifest,
+        # and every protected ownership now belongs to the successful successor.
+        registered_after_restart = sql_all(
+            admin_engine,
+            "SELECT o.id,o.status,o.object_key,w.producing_attempt_id "
+            "FROM storage.objects o "
+            "JOIN storage.backtest_object_ownerships w ON w.object_id=o.id "
+            "WHERE o.object_key LIKE :prefix ORDER BY o.object_key",
+            prefix=f"backtest-results/{run_id}/%",
+        )
+        detail_ids = {
+            row["object_id"]
+            for row in sql_all(
+                admin_engine,
+                "SELECT object_id FROM backtest.detail_manifests WHERE run_id=:id",
+                id=run_id,
+            )
+        }
+        json_ids = {
+            row["id"]
+            for row in registered_after_restart
+            if str(row["object_key"]).endswith(".json")
+        }
+        assert len(json_ids) == 1
+        assert {row["id"] for row in registered_after_restart} == detail_ids | json_ids
+        assert all(row["status"] == "AVAILABLE" for row in registered_after_restart)
+        assert all(
+            row["producing_attempt_id"] == attempts[1]["id"]
+            for row in registered_after_restart
+        )
+        versions = s3.list_object_versions(
+            Bucket=bucket,
+            Prefix=f"backtest-results/{run_id}/",
+        )
+        assert len(versions.get("Versions", [])) == len(registered_after_restart)
+        assert versions.get("DeleteMarkers", []) == []
     assert stack.visible(stack.main_queue) == 0
     _assert_recovery_invariants(
         persistence,
@@ -1731,21 +1790,26 @@ def test_partial_promotion_failure_is_cleaned_before_the_idempotent_retry(
     guard_key = f"backtest-results/{run_id}/unrelated-task5-guard.json"
     guard_bytes = b'{"kind":"unrelated-task5-guard"}'
     guard_time = datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc)
-    guard = StorageObjectRegistrar(
-        stack.store,
-        PersistenceStorageObjectWritePort(persistence),
-    ).publish(
-        object_id=uuid.uuid5(uuid.NAMESPACE_URL, f"task5-unrelated:{bucket}:{run_id}"),
-        object_key=guard_key,
-        data=guard_bytes,
+    guard_id = uuid.uuid5(uuid.NAMESPACE_URL, f"task5-unrelated:{bucket}:{run_id}")
+    guard_receipt = stack.store.put(guard_key, guard_bytes)
+    guard_staged = StorageObjectRecord.staged(
+        object_id=guard_id,
+        receipt=guard_receipt,
         schema_version="task5-unrelated-v1",
         row_count=1,
         period_start=guard_time,
         period_end=guard_time,
         created_at=guard_time,
-        verified_at=guard_time,
         media_type="application/json",
         file_format="JSON",
+    )
+    with persistence.unit_of_work() as uow:
+        stored_guard, created = uow.objects.register(guard_staged.to_row())
+        assert created
+        uow.objects.mark_available(stored_guard.id, guard_time)
+    guard = RegisteredObject(
+        receipt=guard_receipt,
+        record=guard_staged.verified(guard_time),
     )
     sentinel_key, sentinel_store, sentinel_claim = _start_live_sentinel(
         persistence, "partial-promotion-cleanup"
@@ -2177,6 +2241,9 @@ def test_registration_conflict_cleans_only_the_new_active_store_versions(
     def inject_foreign_registration(
         self: PersistenceStorageObjectWritePort,
         record: Any,
+        *,
+        producer_claim: Any = None,
+        cleanup_token: str | None = None,
     ) -> uuid.UUID:
         nonlocal foreign_record, register_calls
         register_calls += 1
@@ -2194,7 +2261,12 @@ def test_registration_conflict_cleans_only_the_new_active_store_versions(
                 inserted, created = uow.objects.register(foreign_record.to_row())
                 assert created
                 uow.objects.mark_available(inserted.id, record.created_at)
-        return original_register(self, record)
+        return original_register(
+            self,
+            record,
+            producer_claim=producer_claim,
+            cleanup_token=cleanup_token,
+        )
 
     monkeypatch.setattr(
         S3ObjectStore,

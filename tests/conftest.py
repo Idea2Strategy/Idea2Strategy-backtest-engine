@@ -206,6 +206,13 @@ def _apply_backtest_runtime_role(url: str) -> None:
                   storage.prepare_backtest_object_cleanup(jsonb)
                   TO idea2strategy_backtest;
               END IF;
+              IF to_regprocedure(
+                'storage.reissue_backtest_object_cleanup(jsonb,text)'
+              ) IS NOT NULL THEN
+                GRANT EXECUTE ON FUNCTION
+                  storage.reissue_backtest_object_cleanup(jsonb,text)
+                  TO idea2strategy_backtest;
+              END IF;
             END $$;
             """
         ],

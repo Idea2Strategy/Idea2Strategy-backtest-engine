@@ -92,19 +92,29 @@ __all__ = [
 _PREPARE_BACKTEST_OBJECT_CLEANUP = text(
     "SELECT * FROM storage.prepare_backtest_object_cleanup(CAST(:candidates AS jsonb))"
 )
+_REISSUE_BACKTEST_OBJECT_CLEANUP = text(
+    "SELECT storage.reissue_backtest_object_cleanup(CAST(:candidate AS jsonb), :new_cleanup_token_hash)"
+)
 
 
-def _cleanup_candidate_payload(candidates: Sequence[StorageObjectRow]) -> str:
+def _object_identity_payload(candidate: StorageObjectRow) -> dict[str, str]:
+    return {
+        "object_id": str(candidate.id),
+        "storage_provider": candidate.storage_provider,
+        "bucket_name": candidate.bucket_name,
+        "object_key": candidate.object_key,
+        "provider_version_id": candidate.provider_version_id,
+        "content_hash": candidate.content_hash,
+    }
+
+
+def _cleanup_candidate_payload(
+    candidates: Sequence[StorageObjectRow],
+    cleanup_tokens: Mapping[UUID, str],
+) -> str:
     return json.dumps(
         [
-            {
-                "object_id": str(candidate.id),
-                "storage_provider": candidate.storage_provider,
-                "bucket_name": candidate.bucket_name,
-                "object_key": candidate.object_key,
-                "provider_version_id": candidate.provider_version_id,
-                "content_hash": candidate.content_hash,
-            }
+            {**_object_identity_payload(candidate), "cleanup_token": cleanup_tokens[candidate.id]}
             for candidate in candidates
         ],
         separators=(",", ":"),
@@ -1321,6 +1331,33 @@ class StorageObjectRepository(StorageObjectReader):
             )
         return existing, False
 
+    def reissue_cleanup_capability(
+        self,
+        row: StorageObjectRow,
+        new_cleanup_token_hash: str,
+    ) -> bool:
+        """Transfer an eligible predecessor object; preserve other exact objects."""
+
+        try:
+            reissued = self._connection.scalar(
+                _REISSUE_BACKTEST_OBJECT_CLEANUP,
+                {
+                    "candidate": json.dumps(
+                        _object_identity_payload(row),
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    "new_cleanup_token_hash": new_cleanup_token_hash,
+                },
+            )
+        except DBAPIError as exc:
+            raise PublishConflict(_cleanup_failure_message(exc)) from exc
+        if reissued is None:
+            return False
+        if reissued != row.id:
+            raise PublishConflict("cleanup capability reissue returned the wrong object id")
+        return True
+
     def mark_available(self, object_id: UUID, verified_at: datetime) -> StorageObjectRow:
         """Publish a verified object. Only `STAGED` may become `AVAILABLE`."""
         return self._transition(
@@ -1352,6 +1389,7 @@ class StorageObjectRepository(StorageObjectReader):
         object_key: str,
         provider_version_id: str,
         content_hash: str,
+        cleanup_token: str,
     ) -> bool:
         """Remove an uncommitted publication artifact by exact immutable identity."""
 
@@ -1371,13 +1409,17 @@ class StorageObjectRepository(StorageObjectReader):
             )
         ):
             raise PublishConflict(f"refusing to unregister changed storage object {object_id}")
-        locked = self.preflight_unregister_unreferenced((current,))
+        locked = self.preflight_unregister_unreferenced(
+            (current,),
+            {current.id: cleanup_token},
+        )
         return bool(locked)
 
     @contextmanager
     def cleanup_unreferenced_batch(
         self,
         candidates: Sequence[StorageObjectRow],
+        cleanup_tokens: Mapping[UUID, str],
     ) -> Iterator[tuple[StorageObjectRow, ...]]:
         """Delete transactionally, then hold every fence through the external gate.
 
@@ -1387,12 +1429,13 @@ class StorageObjectRepository(StorageObjectReader):
         have already disappeared.
         """
 
-        locked = self.preflight_unregister_unreferenced(candidates)
+        locked = self.preflight_unregister_unreferenced(candidates, cleanup_tokens)
         yield locked
 
     def preflight_unregister_unreferenced(
         self,
         candidates: Sequence[StorageObjectRow],
+        cleanup_tokens: Mapping[UUID, str],
     ) -> tuple[StorageObjectRow, ...]:
         """Lock and validate every cleanup row before any external object delete."""
 
@@ -1408,7 +1451,12 @@ class StorageObjectRepository(StorageObjectReader):
         try:
             rows = self._connection.execute(
                 _PREPARE_BACKTEST_OBJECT_CLEANUP,
-                {"candidates": _cleanup_candidate_payload(tuple(by_id.values()))},
+                {
+                    "candidates": _cleanup_candidate_payload(
+                        tuple(by_id.values()),
+                        cleanup_tokens,
+                    )
+                },
             ).mappings()
             current_by_id = {row["id"]: _hydrate(StorageObjectRow, row) for row in rows}
         except DBAPIError as exc:

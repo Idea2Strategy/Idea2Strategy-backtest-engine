@@ -53,6 +53,7 @@ remove.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -136,8 +137,10 @@ from .monthly_judgment import (
 from .object_store import (
     ObjectStore,
     ObjectStoreConflict,
+    StorageObjectProducerClaim,
     StorageObjectRecord,
     StorageObjectRegistrar,
+    StorageObjectRegistration,
     StorageObjectUpload,
 )
 from .orchestrator import (
@@ -727,6 +730,50 @@ def _trading_sessions_between(session_index_by_date: Mapping[date, int], start: 
 # ==========================================================================
 
 
+def _cleanup_token_hash(cleanup_token: str | None) -> str:
+    if (
+        not isinstance(cleanup_token, str)
+        or len(cleanup_token) != 64
+        or any(character not in "0123456789abcdef" for character in cleanup_token)
+    ):
+        raise ObjectStoreConflict("durable cleanup requires a 256-bit object capability")
+    return hashlib.sha256(cleanup_token.encode("ascii")).hexdigest()
+
+
+def _set_storage_producer_context(
+    connection: Any,
+    producer_claim: StorageObjectProducerClaim | None,
+    *,
+    cleanup_token_hash: str | None = None,
+) -> StorageObjectProducerClaim:
+    if producer_claim is None:
+        raise ObjectStoreConflict("durable storage publication requires its producing attempt capability")
+    connection.execute(
+        text(
+            "SELECT "
+            "set_config('idea2strategy.backtest_run_id', :run_id, true), "
+            "set_config('idea2strategy.backtest_attempt_id', :attempt_id, true), "
+            "set_config('idea2strategy.backtest_claim_token', :claim_token, true), "
+            "set_config('idea2strategy.backtest_attempt_cleanup_capability', :capability, true)"
+        ),
+        {
+            "run_id": str(producer_claim.run_id),
+            "attempt_id": str(producer_claim.attempt_id),
+            "claim_token": str(producer_claim.claim_token),
+            "capability": producer_claim.cleanup_capability,
+        },
+    )
+    if cleanup_token_hash is not None:
+        connection.execute(
+            text(
+                "SELECT set_config("
+                "'idea2strategy.backtest_cleanup_token_hash', :token_hash, true)"
+            ),
+            {"token_hash": cleanup_token_hash},
+        )
+    return producer_claim
+
+
 class PersistenceStorageObjectWritePort:
     """The durable `storage.objects` writer the object store package left open.
 
@@ -748,10 +795,28 @@ class PersistenceStorageObjectWritePort:
     def __init__(self, persistence: BacktestPersistence) -> None:
         self._persistence = persistence
 
-    def register(self, record: StorageObjectRecord) -> uuid.UUID:
+    def register(
+        self,
+        record: StorageObjectRecord,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_token: str | None = None,
+    ) -> StorageObjectRegistration:
+        token_hash = _cleanup_token_hash(cleanup_token)
         with _as_object_store_conflict(), self._persistence.unit_of_work() as uow:
-            row, _ = uow.objects.register(record.to_row())
-            return row.id
+            _set_storage_producer_context(
+                uow.connection,
+                producer_claim,
+                cleanup_token_hash=token_hash,
+            )
+            row, inserted = uow.objects.register(record.to_row())
+            cleanup_owned = inserted
+            if not inserted:
+                cleanup_owned = uow.objects.reissue_cleanup_capability(row, token_hash)
+            return StorageObjectRegistration(
+                object_id=row.id,
+                cleanup_owned=cleanup_owned,
+            )
 
     def mark_available(self, object_id: uuid.UUID, verified_at: datetime) -> StorageObjectRecord:
         with _as_object_store_conflict(), self._persistence.unit_of_work() as uow:
@@ -770,12 +835,19 @@ class PersistenceStorageObjectWritePort:
     def cleanup_batch(
         self,
         records: Sequence[StorageObjectRecord],
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_tokens: Mapping[uuid.UUID, str] | None = None,
     ) -> Iterator[tuple[StorageObjectRecord, ...]]:
         """Hold exact row/reference locks through object-store compensation."""
 
         with _as_object_store_conflict(), self._persistence.unit_of_work() as uow:
+            _set_storage_producer_context(uow.connection, producer_claim)
             candidates = tuple(record.to_row() for record in records)
-            with uow.objects.cleanup_unreferenced_batch(candidates) as locked_rows:
+            tokens = dict(cleanup_tokens or {})
+            for candidate in candidates:
+                _cleanup_token_hash(tokens.get(candidate.id))
+            with uow.objects.cleanup_unreferenced_batch(candidates, tokens) as locked_rows:
                 yield tuple(_record_of(row) for row in locked_rows)
 
     def unregister(
@@ -787,8 +859,11 @@ class PersistenceStorageObjectWritePort:
         object_key: str,
         provider_version_id: str,
         content_hash: str,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_token: str | None = None,
     ) -> bool:
         with _as_object_store_conflict(), self._persistence.unit_of_work() as uow:
+            _set_storage_producer_context(uow.connection, producer_claim)
             return uow.objects.unregister_unreferenced(
                 object_id,
                 storage_provider=storage_provider,
@@ -796,6 +871,7 @@ class PersistenceStorageObjectWritePort:
                 object_key=object_key,
                 provider_version_id=provider_version_id,
                 content_hash=content_hash,
+                cleanup_token=cleanup_token or "",
             )
 
 
@@ -884,11 +960,22 @@ class PersistenceExecutionKeyStore:
                 lease_duration=lease_duration,
             )
             if attempt is not None:
+                cleanup_capability = uow.connection.scalar(
+                    text(
+                        "SELECT current_setting("
+                        "'idea2strategy.backtest_attempt_cleanup_capability', true)"
+                    )
+                )
+                if not isinstance(cleanup_capability, str) or len(cleanup_capability) != 64:
+                    raise PublishConflict(
+                        "new run attempt did not receive its protected cleanup capability"
+                    )
                 return ExecutionClaim(
                     acquired=True,
                     attempt_number=attempt.attempt_number,
                     attempt_id=str(attempt.id),
                     claim_token=str(attempt.claim_token),
+                    cleanup_capability=cleanup_capability,
                 )
             existing = uow.attempts.latest_for_run(run_uuid)
             existing_status = None
@@ -1253,6 +1340,7 @@ class JobBinding:
     worker_execution_key: str
     attempt_id: uuid.UUID | None
     claim_token: uuid.UUID | None
+    cleanup_capability: str | None
     manifest: Mapping[str, Any]
     policy: ExecutionPolicy
     plan: BasicCompiledPlan
@@ -1351,6 +1439,20 @@ class DurableResultPublisher:
         self._persistence = persistence
         self._store = object_store
         self._port = storage_write_port
+        if (
+            binding.attempt_id is None
+            or binding.claim_token is None
+            or binding.cleanup_capability is None
+        ):
+            raise WiringError(
+                "durable result publication requires its protected producing attempt capability"
+            )
+        self._producer_claim = StorageObjectProducerClaim(
+            run_id=binding.run_id,
+            attempt_id=binding.attempt_id,
+            claim_token=binding.claim_token,
+            cleanup_capability=binding.cleanup_capability,
+        )
         self._published: ResultSnapshot | None = None
         self._bundle: DetailObjectBundle | None = None
 
@@ -1456,6 +1558,7 @@ class DurableResultPublisher:
         return StorageObjectRegistrar(
             self._store,
             self._port,
+            producer_claim=self._producer_claim,
             upload_observer=upload_observer,
         ).publish(
             object_id=uuid.uuid5(
@@ -1546,7 +1649,11 @@ class DurableResultPublisher:
                                 f"storage object {artifact.object_id} no longer matches "
                                 "publication provider, bucket, key, or hash"
                             )
-                        registered.append(current)
+                        # A row from an earlier process has no object capability in
+                        # this publication journal.  It is never a cleanup candidate;
+                        # a successor can acquire it only by re-registering the exact
+                        # bytes, which executes the protected lineage reissue path.
+                        preserved.append(current)
                         continue
 
                     uploaded = upload.record
@@ -1563,7 +1670,13 @@ class DurableResultPublisher:
                             f"uploaded object {artifact.object_id} is outside the active store"
                         )
                     if current is not None and _same_stored_version(current, uploaded):
-                        registered.append(current)
+                        if upload.cleanup_token is None:
+                            # Registration explicitly reconciled immutable bytes
+                            # without acquiring their ownership.  They may be used by
+                            # this publication, but never enter its compensation set.
+                            preserved.append(current)
+                        else:
+                            registered.append(current)
                         continue
 
                     # The upload was observed before registration. A conflicting row
@@ -1574,13 +1687,26 @@ class DurableResultPublisher:
                         # but include it in whole-batch preflight before compensating
                         # any earlier objects this call did create and register.
                         preserved.append(uploaded)
-                        foreign_registration = True
+                        if current is not None:
+                            # A different durable identity claimed the object id after
+                            # upload. Preserve the pre-existing bytes, but retain the
+                            # typed cleanup-conflict signal for the caller.
+                            foreign_registration = True
                         continue
                     direct.append(uploaded)
                     if current is not None:
                         foreign_registration = True
 
-                with self._port.cleanup_batch(tuple(registered)) as locked:
+                cleanup_tokens = {
+                    observed.record.object_id: observed.cleanup_token
+                    for observed in captured
+                    if observed.cleanup_token is not None
+                }
+                with self._port.cleanup_batch(
+                    tuple(registered),
+                    producer_claim=self._producer_claim,
+                    cleanup_tokens=cleanup_tokens,
+                ) as locked:
                     locked_by_id = {record.object_id: record for record in locked}
                     if set(locked_by_id) != {record.object_id for record in registered}:
                         raise ObjectStoreConflict(
@@ -1714,6 +1840,7 @@ class DurableResultPublisher:
                     published = DetailObjectPublisher(
                         self._store,
                         storage_write_port=self._port,
+                        producer_claim=self._producer_claim,
                         upload_observer=captured.append,
                     ).publish(bundle, verified_at=completed_at)
                     uow.inputs.lock(
@@ -2592,6 +2719,7 @@ class OrchestratorJobHandler:
             worker_execution_key=context.worker_execution_key,
             attempt_id=(uuid.UUID(context.attempt_id) if context.attempt_id is not None else None),
             claim_token=(uuid.UUID(context.claim_token) if context.claim_token is not None else None),
+            cleanup_capability=context.cleanup_capability,
             manifest=manifest,
             policy=policy,
             plan=plan,

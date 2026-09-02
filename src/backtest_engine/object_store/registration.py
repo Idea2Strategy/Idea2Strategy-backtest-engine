@@ -51,8 +51,9 @@ persistence package and one binding changes; no call site does. Nothing here aut
 
 from __future__ import annotations
 
+import secrets
 import threading
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -72,8 +73,10 @@ __all__ = [
     "InMemoryStorageObjectRegistry",
     "ObjectStatus",
     "RegisteredObject",
+    "StorageObjectProducerClaim",
     "StorageObjectRecord",
     "StorageObjectRegistrar",
+    "StorageObjectRegistration",
     "StorageObjectUpload",
     "StorageObjectWritePort",
     "UnauthorizedStorageObjectWritePort",
@@ -273,6 +276,27 @@ class StorageObjectRecord:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class StorageObjectProducerClaim:
+    """Non-forgeable cleanup identity for the exact fenced producing attempt."""
+
+    run_id: UUID
+    attempt_id: UUID
+    claim_token: UUID
+    cleanup_capability: str
+
+    def __post_init__(self) -> None:
+        for label in ("run_id", "attempt_id", "claim_token"):
+            if not isinstance(getattr(self, label), UUID):
+                raise ValueError(f"{label} must be a UUID")
+        if (
+            not isinstance(self.cleanup_capability, str)
+            or len(self.cleanup_capability) != 64
+            or any(character not in "0123456789abcdef" for character in self.cleanup_capability)
+        ):
+            raise ValueError("cleanup_capability must be a 256-bit lowercase hex token")
+
+
 class StorageObjectWritePort(Protocol):
     """The narrow seam an authorised `storage.objects` writer plugs into.
 
@@ -293,7 +317,13 @@ class StorageObjectWritePort(Protocol):
     docstring), not a code change at any call site.
     """
 
-    def register(self, record: StorageObjectRecord) -> UUID: ...
+    def register(
+        self,
+        record: StorageObjectRecord,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_token: str | None = None,
+    ) -> UUID | StorageObjectRegistration: ...
 
     def mark_available(self, object_id: UUID, verified_at: datetime) -> StorageObjectRecord: ...
 
@@ -304,6 +334,9 @@ class StorageObjectWritePort(Protocol):
     def cleanup_batch(
         self,
         records: Sequence[StorageObjectRecord],
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_tokens: Mapping[UUID, str] | None = None,
     ) -> AbstractContextManager[tuple[StorageObjectRecord, ...]]: ...
 
     def unregister(
@@ -315,6 +348,8 @@ class StorageObjectWritePort(Protocol):
         object_key: str,
         provider_version_id: str,
         content_hash: str,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_token: str | None = None,
     ) -> bool: ...
 
 
@@ -336,7 +371,14 @@ class UnauthorizedStorageObjectWritePort:
         "Resolve the ownership contradiction, then bind an authorised StorageObjectWritePort."
     )
 
-    def register(self, record: StorageObjectRecord) -> UUID:
+    def register(
+        self,
+        record: StorageObjectRecord,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_token: str | None = None,
+    ) -> UUID:
+        del producer_claim, cleanup_token
         raise StorageWriteNotAuthorized(f"{self.reason} (offered object_key={record.object_key})")
 
     def mark_available(self, object_id: UUID, verified_at: datetime) -> StorageObjectRecord:
@@ -352,7 +394,11 @@ class UnauthorizedStorageObjectWritePort:
     def cleanup_batch(
         self,
         records: Sequence[StorageObjectRecord],
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_tokens: Mapping[UUID, str] | None = None,
     ) -> Iterator[tuple[StorageObjectRecord, ...]]:
+        del producer_claim, cleanup_tokens
         offered = records[0].object_id if records else "empty-batch"
         raise StorageWriteNotAuthorized(f"{self.reason} (offered object_id={offered})")
         yield ()  # pragma: no cover - contextmanager typing requires a generator
@@ -366,7 +412,10 @@ class UnauthorizedStorageObjectWritePort:
         object_key: str,
         provider_version_id: str,
         content_hash: str,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_token: str | None = None,
     ) -> bool:
+        del producer_claim, cleanup_token
         raise StorageWriteNotAuthorized(f"{self.reason} (offered object_id={object_id})")
 
 
@@ -412,7 +461,14 @@ class InMemoryStorageObjectRegistry:
     def _same_object(left: StorageObjectRecord, right: StorageObjectRecord) -> bool:
         return all(getattr(left, column) == getattr(right, column) for column in _IDENTITY_COLUMNS)
 
-    def register(self, record: StorageObjectRecord) -> UUID:
+    def register(
+        self,
+        record: StorageObjectRecord,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_token: str | None = None,
+    ) -> UUID:
+        del producer_claim, cleanup_token
         if not isinstance(record, StorageObjectRecord):
             raise TypeError(f"record must be a StorageObjectRecord, got {type(record).__name__}")
         if record.status is not ObjectStatus.STAGED:
@@ -490,9 +546,13 @@ class InMemoryStorageObjectRegistry:
     def cleanup_batch(
         self,
         records: Sequence[StorageObjectRecord],
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_tokens: Mapping[UUID, str] | None = None,
     ) -> Iterator[tuple[StorageObjectRecord, ...]]:
         """Hold the registry lock across all preflight and external deletion."""
 
+        del producer_claim, cleanup_tokens
         with self._lock:
             locked: list[StorageObjectRecord] = []
             seen: set[UUID] = set()
@@ -519,7 +579,10 @@ class InMemoryStorageObjectRegistry:
         object_key: str,
         provider_version_id: str,
         content_hash: str,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_token: str | None = None,
     ) -> bool:
+        del producer_claim, cleanup_token
         with self._lock:
             current = self._rows.get(object_id)
             if current is None:
@@ -563,6 +626,22 @@ class RegisteredObject:
 
     receipt: ObjectReceipt
     record: StorageObjectRecord
+    producer_claim: StorageObjectProducerClaim | None = None
+    cleanup_token: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StorageObjectRegistration:
+    """Registration result, including whether this caller owns compensation.
+
+    A durable content-addressed object may already exist because another run
+    published the same immutable bytes.  Reconciliation may use that object, but
+    it must not hand the new caller a deletion capability.  Durable ports return
+    this richer result; UUID-only legacy/in-memory ports retain their contract.
+    """
+
+    object_id: UUID
+    cleanup_owned: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -571,6 +650,8 @@ class StorageObjectUpload:
 
     receipt: ObjectReceipt
     record: StorageObjectRecord
+    producer_claim: StorageObjectProducerClaim | None = None
+    cleanup_token: str | None = None
 
     @property
     def newly_created(self) -> bool:
@@ -585,10 +666,12 @@ class StorageObjectRegistrar:
         store: ObjectStore,
         port: StorageObjectWritePort,
         *,
+        producer_claim: StorageObjectProducerClaim | None = None,
         upload_observer: Callable[[StorageObjectUpload], None] | None = None,
     ) -> None:
         self._store = store
         self._port = port
+        self._producer_claim = producer_claim
         self._upload_observer = upload_observer
 
     @property
@@ -645,9 +728,49 @@ class StorageObjectRegistrar:
             retention_until=retention_until,
             legal_hold=legal_hold,
         )
+        cleanup_token = secrets.token_hex(32) if self._producer_claim is not None else None
+        try:
+            if self._producer_claim is None:
+                # Preserve the claim-free in-memory/unauthorized port contract.  The
+                # extra capability arguments are load-bearing only for durable
+                # backtest publication and need not widen unrelated port adapters.
+                registration = self._port.register(staged)
+            else:
+                registration = self._port.register(
+                    staged,
+                    producer_claim=self._producer_claim,
+                    cleanup_token=cleanup_token,
+                )
+        except BaseException:
+            # The bytes exist even when row registration fails (or its commit
+            # acknowledgement is lost).  Record their exact provider version, but
+            # never claim a cleanup token whose durable ownership is unproven.
+            if self._upload_observer is not None:
+                self._upload_observer(
+                    StorageObjectUpload(
+                        receipt=receipt,
+                        record=staged,
+                        producer_claim=self._producer_claim,
+                        cleanup_token=None,
+                    )
+                )
+            raise
+
+        if isinstance(registration, StorageObjectRegistration):
+            registered_id = registration.object_id
+            if not registration.cleanup_owned:
+                cleanup_token = None
+        else:
+            registered_id = registration
         if self._upload_observer is not None:
-            self._upload_observer(StorageObjectUpload(receipt=receipt, record=staged))
-        registered_id = self._port.register(staged)
+            self._upload_observer(
+                StorageObjectUpload(
+                    receipt=receipt,
+                    record=staged,
+                    producer_claim=self._producer_claim,
+                    cleanup_token=cleanup_token,
+                )
+            )
 
         check = self._store.verify(object_key, receipt.content_hash, deep=True)
         if not check.ok:
@@ -657,4 +780,9 @@ class StorageObjectRegistrar:
             raise ObjectVerificationError(
                 f"stored object failed verification and was quarantined: {object_key} ({check.message})"
             )
-        return RegisteredObject(receipt=receipt, record=self._port.mark_available(registered_id, verified_at))
+        return RegisteredObject(
+            receipt=receipt,
+            record=self._port.mark_available(registered_id, verified_at),
+            producer_claim=self._producer_claim,
+            cleanup_token=cleanup_token,
+        )

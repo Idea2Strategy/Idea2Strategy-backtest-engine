@@ -13,7 +13,11 @@ import boto3
 
 from backtest_engine.attempt_coordinator import ResourceSample
 from backtest_engine.persistence import BacktestPersistence, create_backtest_engine
-from backtest_engine.wiring import DurableResultPublisher, PersistenceExecutionKeyStore
+from backtest_engine.wiring import (
+    DurableResultPublisher,
+    PersistenceExecutionKeyStore,
+    PersistenceStorageObjectWritePort,
+)
 from backtest_engine.worker import BacktestWorker, WorkerConfig
 from d_integration_stack import ScriptedMonitor, build_stack
 
@@ -95,14 +99,20 @@ def main() -> int:
 
             stack.handler.bind = gated_bind  # type: ignore[method-assign]
         elif checkpoint_name == "upload":
-            original_put = stack.store.put
+            original_mark_available = PersistenceStorageObjectWritePort.mark_available
 
-            def gated_put(*args: Any, **kwargs: Any) -> Any:
-                receipt = original_put(*args, **kwargs)
+            def gated_mark_available(
+                self: PersistenceStorageObjectWritePort,
+                *args: Any,
+                **kwargs: Any,
+            ) -> Any:
+                # Registration is a separate committed transaction.  Stopping
+                # immediately before promotion therefore guarantees that bytes,
+                # the STAGED row, and its protected ownership ledger all exist.
                 checkpoint()
-                return receipt
+                return original_mark_available(self, *args, **kwargs)
 
-            stack.store.put = gated_put  # type: ignore[method-assign]
+            PersistenceStorageObjectWritePort.mark_available = gated_mark_available  # type: ignore[method-assign]
         elif checkpoint_name == "publication":
             original_write = DurableResultPublisher._write
 
