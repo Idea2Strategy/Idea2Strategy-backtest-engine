@@ -52,6 +52,8 @@ persistence package and one binding changes; no call site does. Nothing here aut
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterator, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Protocol
@@ -273,7 +275,7 @@ class StorageObjectRecord:
 class StorageObjectWritePort(Protocol):
     """The narrow seam an authorised `storage.objects` writer plugs into.
 
-    Five operations, matching the canonical lifecycle exactly:
+    Six operations, matching the canonical lifecycle exactly:
 
     * `register` inserts the `STAGED` row and is idempotent on `object_id`. Offering a
       *different* object under an `object_id` that already exists is a conflict, never
@@ -282,8 +284,9 @@ class StorageObjectWritePort(Protocol):
       the verification time it is being granted for.
     * `quarantine` records a verification failure against the row that already exists.
     * `find` reads one row back, so a caller can prove the row is there.
-    * `unregister` removes only an exact, unreferenced staged/publication artifact
-      during compensating cleanup; key and content hash are mandatory fences.
+    * `cleanup_batch` locks and preflights every exact unreferenced artifact before
+      yielding control to object-store deletion, then unregisters the whole batch on
+      clean exit. Provider version, key, hash and id are mandatory fences.
 
     Implementing this against Postgres is a schema-ownership decision (see the module
     docstring), not a code change at any call site.
@@ -297,11 +300,17 @@ class StorageObjectWritePort(Protocol):
 
     def find(self, object_id: UUID) -> StorageObjectRecord | None: ...
 
+    def cleanup_batch(
+        self,
+        records: Sequence[StorageObjectRecord],
+    ) -> AbstractContextManager[tuple[StorageObjectRecord, ...]]: ...
+
     def unregister(
         self,
         object_id: UUID,
         *,
         object_key: str,
+        provider_version_id: str,
         content_hash: str,
     ) -> bool: ...
 
@@ -336,11 +345,21 @@ class UnauthorizedStorageObjectWritePort:
     def find(self, object_id: UUID) -> StorageObjectRecord | None:
         raise StorageWriteNotAuthorized(f"{self.reason} (offered object_id={object_id})")
 
+    @contextmanager
+    def cleanup_batch(
+        self,
+        records: Sequence[StorageObjectRecord],
+    ) -> Iterator[tuple[StorageObjectRecord, ...]]:
+        offered = records[0].object_id if records else "empty-batch"
+        raise StorageWriteNotAuthorized(f"{self.reason} (offered object_id={offered})")
+        yield ()  # pragma: no cover - contextmanager typing requires a generator
+
     def unregister(
         self,
         object_id: UUID,
         *,
         object_key: str,
+        provider_version_id: str,
         content_hash: str,
     ) -> bool:
         raise StorageWriteNotAuthorized(f"{self.reason} (offered object_id={object_id})")
@@ -439,17 +458,70 @@ class InMemoryStorageObjectRegistry:
         with self._lock:
             return self._rows.get(object_id)
 
+    @staticmethod
+    def _require_cleanup_identity(
+        current: StorageObjectRecord,
+        offered: StorageObjectRecord,
+    ) -> None:
+        if current.provider_version_id != offered.provider_version_id:
+            raise ObjectStoreConflict(
+                f"refusing to unregister storage object {current.object_id} with a "
+                "different provider version"
+            )
+        if any(
+            getattr(current, field) != getattr(offered, field)
+            for field in (
+                "storage_provider",
+                "bucket_name",
+                "object_key",
+                "content_hash",
+            )
+        ):
+            raise ObjectStoreConflict(
+                f"refusing to unregister changed storage object {current.object_id}"
+            )
+
+    @contextmanager
+    def cleanup_batch(
+        self,
+        records: Sequence[StorageObjectRecord],
+    ) -> Iterator[tuple[StorageObjectRecord, ...]]:
+        """Hold the registry lock across all preflight and external deletion."""
+
+        with self._lock:
+            locked: list[StorageObjectRecord] = []
+            seen: set[UUID] = set()
+            for offered in records:
+                if offered.object_id in seen:
+                    continue
+                seen.add(offered.object_id)
+                current = self._rows.get(offered.object_id)
+                if current is None:
+                    continue
+                self._require_cleanup_identity(current, offered)
+                locked.append(current)
+            yield tuple(locked)
+            for current in locked:
+                del self._rows[current.object_id]
+                self._object_id_by_key.pop(self._key(current), None)
+
     def unregister(
         self,
         object_id: UUID,
         *,
         object_key: str,
+        provider_version_id: str,
         content_hash: str,
     ) -> bool:
         with self._lock:
             current = self._rows.get(object_id)
             if current is None:
                 return False
+            if current.provider_version_id != provider_version_id:
+                raise ObjectStoreConflict(
+                    f"refusing to unregister storage object {object_id} with a "
+                    "different provider version"
+                )
             if current.object_key != object_key or current.content_hash != content_hash:
                 raise ObjectStoreConflict(
                     f"refusing to unregister changed storage object {object_id}"

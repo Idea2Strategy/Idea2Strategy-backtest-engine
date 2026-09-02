@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier
@@ -29,12 +30,13 @@ from backtest_engine.object_store import (
     StorageObjectRegistrar,
 )
 from backtest_engine.persistence import BacktestPersistence, ObjectStatus, RunStatus
+from backtest_engine.persistence import repositories as persistence_repositories
 from backtest_engine.wiring import (
     PersistenceExecutionKeyStore,
     PersistenceStorageObjectWritePort,
 )
 from backtest_engine.worker import ExecutionRecordStatus, worker_execution_key_for
-from persistence.support import make_run
+from persistence.support import make_detail_manifest, make_run
 
 
 pytestmark = pytest.mark.docker
@@ -477,3 +479,118 @@ def test_find_projects_the_persisted_row_back_onto_the_value_object(
 
     assert found == published.record
     assert port.find(uuid.uuid4()) is None
+
+
+def test_cleanup_batch_fences_the_durable_provider_version(
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    port = PersistenceStorageObjectWritePort(persistence)
+    object_id = uuid.uuid4()
+    key = f"backtest-results/{uuid.uuid4()}/RESULT_SNAPSHOT/{'f' * 64}.parquet"
+    published = _publish(port, tmp_path, object_id=object_id, key=key, body=BODY)
+
+    with pytest.raises(
+        ObjectStoreConflict, match="provider version"
+    ), port.cleanup_batch(
+        (
+            replace(
+                published.record,
+                provider_version_id="different-provider-version",
+            ),
+        )
+    ):
+        pass
+
+    assert object_row(admin_engine, object_id)["object_key"] == key
+
+
+def test_cleanup_batch_refuses_a_result_object_referenced_as_durable_evidence(
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    port = PersistenceStorageObjectWritePort(persistence)
+    object_id = uuid.uuid4()
+    key = f"backtest-results/{uuid.uuid4()}/RESULT_SNAPSHOT/{'1' * 64}.parquet"
+    published = _publish(port, tmp_path, object_id=object_id, key=key, body=BODY)
+    with admin_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO operations.audit_events "
+                "(id,actor_type,actor_id,action_type,target_domain,target_id,"
+                "reason_code,correlation_id,idempotency_key,evidence_object_id,occurred_at) "
+                "VALUES (:id,'SYSTEM',:actor,'TASK5_RESULT_REFERENCE','BACKTEST',"
+                ":target,'TASK5_REFERENCE',:correlation,:key,:object_id,:occurred_at)"
+            ),
+            {
+                "id": uuid.uuid4(),
+                "actor": uuid.uuid4(),
+                "target": uuid.uuid4(),
+                "correlation": uuid.uuid4(),
+                "key": f"TASK5:RESULT-REFERENCE:{uuid.uuid4()}",
+                "object_id": object_id,
+                "occurred_at": T0,
+            },
+        )
+
+    with pytest.raises(
+        ObjectStoreConflict, match="operations.audit_events"
+    ), port.cleanup_batch((published.record,)):
+        pass
+
+    assert object_row(admin_engine, object_id)["object_key"] == key
+
+
+def test_cleanup_batch_refuses_a_detail_object_referenced_by_a_manifest(
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    port = PersistenceStorageObjectWritePort(persistence)
+    object_id = uuid.uuid4()
+    key = f"backtest-results/{uuid.uuid4()}/TRADE_DETAIL/{'2' * 64}.parquet"
+    published = _publish(port, tmp_path, object_id=object_id, key=key, body=BODY)
+    run = make_run(idempotency_key=f"TASK5:DETAIL-REFERENCE:{uuid.uuid4()}")
+    with persistence.unit_of_work() as uow:
+        accepted, created = uow.runs.accept(run)
+        assert created
+        uow.manifests.insert(make_detail_manifest(accepted.id, object_id=object_id))
+
+    with pytest.raises(
+        ObjectStoreConflict, match="backtest.detail_manifests"
+    ), port.cleanup_batch((published.record,)):
+        pass
+
+    assert object_row(admin_engine, object_id)["object_key"] == key
+
+
+def test_cleanup_reference_fence_covers_every_canonical_storage_object_fk(
+    admin_engine: Engine,
+) -> None:
+    with admin_engine.connect() as connection:
+        canonical_references = {
+            (row["source_table"], row["source_column"])
+            for row in connection.execute(
+                text(
+                    "SELECT source_ns.nspname || '.' || source.relname AS source_table,"
+                    "source_column.attname AS source_column "
+                    "FROM pg_constraint fk "
+                    "JOIN pg_class source ON source.oid=fk.conrelid "
+                    "JOIN pg_namespace source_ns ON source_ns.oid=source.relnamespace "
+                    "JOIN pg_class target ON target.oid=fk.confrelid "
+                    "JOIN pg_namespace target_ns ON target_ns.oid=target.relnamespace "
+                    "CROSS JOIN LATERAL unnest(fk.conkey) AS source_key(attnum) "
+                    "JOIN pg_attribute source_column "
+                    "ON source_column.attrelid=source.oid "
+                    "AND source_column.attnum=source_key.attnum "
+                    "WHERE fk.contype='f' AND target_ns.nspname='storage' "
+                    "AND target.relname='objects'"
+                )
+            ).mappings()
+        }
+
+    assert set(persistence_repositories.STORAGE_OBJECT_REFERENCE_COLUMNS) == (
+        canonical_references
+    )

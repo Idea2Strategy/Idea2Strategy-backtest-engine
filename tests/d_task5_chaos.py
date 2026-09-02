@@ -10,14 +10,22 @@ import hashlib
 import json
 import math
 import os
+import subprocess
+import sys
 import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+from backtest_engine.attempt_coordinator import (
+    AttemptPolicy,
+    ProcessResourceMonitor,
+    ResourceSample,
+)
 from backtest_engine.contracts import (
     compute_message_idempotency_key,
     official_backtest_operation_key,
@@ -111,6 +119,173 @@ class ResourcePeakObserver:
             if self._count < 1:
                 raise ValueError("no resource peak was observed")
             return ObservedResourcePeaks(dict(self._values), self._count)
+
+
+class BoundedProcessMonitorFactory:
+    """Create per-attempt production monitors over small isolated workloads.
+
+    The workload constants bound how much work the child may do; none of them is
+    copied into evidence.  Evidence receives only samples read by the production
+    ``ProcessResourceMonitor`` and returned to the attempt coordinator.
+    """
+
+    _CPU_EVIDENCE_SECONDS = 0.08
+    _MEMORY_EVIDENCE_DELTA = 16 * 1024 * 1024
+
+    def __init__(
+        self,
+        mode: str,
+        observer: ResourcePeakObserver,
+        root: Path,
+    ) -> None:
+        if mode not in {"cpu", "memory"}:
+            raise ValueError("bounded process monitor mode must be cpu or memory")
+        self._mode = mode
+        self._observer = observer
+        self._root = root
+        self._root.mkdir(parents=True, exist_ok=True)
+        self._monitors: list[_BoundedProcessMonitor] = []
+        baseline = self._start_monitor("baseline")
+        try:
+            self._baseline_memory_bytes = baseline.baseline.memory_bytes
+        finally:
+            baseline.close()
+
+    @property
+    def policy(self) -> AttemptPolicy:
+        return AttemptPolicy(
+            max_attempts=3,
+            lease_duration=timedelta(minutes=5),
+            attempt_timeout=timedelta(minutes=30),
+            max_cpu_time=(
+                timedelta(seconds=0.05)
+                if self._mode == "cpu"
+                else timedelta(seconds=30)
+            ),
+            max_memory_bytes=(
+                self._baseline_memory_bytes + 8 * 1024 * 1024
+                if self._mode == "memory"
+                else self._baseline_memory_bytes + 128 * 1024 * 1024
+            ),
+        )
+
+    def __call__(self) -> _BoundedProcessMonitor:
+        return self.new_monitor()
+
+    def new_monitor(self) -> _BoundedProcessMonitor:
+        monitor = self._start_monitor(f"attempt-{len(self._monitors) + 1}")
+        self._monitors.append(monitor)
+        return monitor
+
+    def close(self) -> None:
+        for monitor in self._monitors:
+            monitor.close()
+
+    def _start_monitor(self, label: str) -> _BoundedProcessMonitor:
+        stem = f"{label}-{uuid.uuid4().hex}"
+        marker = self._root / f"{stem}.ready"
+        command = self._root / f"{stem}.command"
+        exit_marker = self._root / f"{stem}.exit"
+        # On Windows ``venv/Scripts/python.exe`` is a launcher process; psutil
+        # would then sample the idle launcher rather than the workload child.
+        interpreter = str(getattr(sys, "_base_executable", sys.executable))
+        process = subprocess.Popen(
+            [
+                interpreter,
+                str(Path(__file__).with_name("d_task5_resource_probe.py")),
+                str(marker),
+                str(command),
+                str(exit_marker),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        def child_ready() -> bool:
+            if process.poll() is not None:
+                raise RuntimeError(
+                    f"bounded resource child exited before ready: {process.returncode}"
+                )
+            return marker.is_file()
+
+        wait_until(
+            child_ready,
+            description=f"bounded {self._mode} resource child to become ready",
+            timeout_seconds=10,
+        )
+        return _BoundedProcessMonitor(
+            mode=self._mode,
+            process=process,
+            marker=marker,
+            command=command,
+            exit_marker=exit_marker,
+            observer=self._observer,
+        )
+
+
+class _BoundedProcessMonitor:
+    def __init__(
+        self,
+        *,
+        mode: str,
+        process: subprocess.Popen[bytes],
+        marker: Path,
+        command: Path,
+        exit_marker: Path,
+        observer: ResourcePeakObserver,
+    ) -> None:
+        self._mode = mode
+        self._process = process
+        self._marker = marker
+        self._command = command
+        self._exit_marker = exit_marker
+        self._observer = observer
+        self._delegate = ProcessResourceMonitor(process.pid)
+        self.baseline = self._delegate.sample()
+        self._started = False
+
+    def sample(self) -> ResourceSample:
+        if not self._started:
+            self._command.write_text(self._mode, encoding="utf-8")
+            self._started = True
+
+        def budget_crossed() -> ResourceSample | None:
+            if self._process.poll() is not None:
+                raise RuntimeError(
+                    f"bounded resource child exited during observation: {self._process.returncode}"
+                )
+            measured = self._delegate.sample()
+            crossed = (
+                measured.cpu_time.total_seconds()
+                >= BoundedProcessMonitorFactory._CPU_EVIDENCE_SECONDS
+                if self._mode == "cpu"
+                else measured.memory_bytes
+                >= self.baseline.memory_bytes
+                + BoundedProcessMonitorFactory._MEMORY_EVIDENCE_DELTA
+            )
+            return measured if crossed else None
+
+        measured = wait_until(
+            budget_crossed,
+            description=f"real child {self._mode} usage to cross the test policy",
+            timeout_seconds=10,
+            poll_seconds=0.01,
+        )
+        self._observer.observe("cpu_seconds", measured.cpu_time.total_seconds())
+        self._observer.observe("memory_bytes", measured.memory_bytes)
+        self.close()
+        return measured
+
+    def close(self) -> None:
+        if self._process.poll() is None:
+            self._exit_marker.write_text("exit", encoding="utf-8")
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait(timeout=5)
+        for path in (self._marker, self._command, self._exit_marker):
+            path.unlink(missing_ok=True)
 
 
 def evidence_result(

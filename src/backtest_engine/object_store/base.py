@@ -127,7 +127,19 @@ class ObjectStore(Protocol):
 
     def put(self, object_key: str, data: bytes) -> ObjectReceipt: ...
 
-    def delete_if_matches(self, object_key: str, expected_sha256: str) -> bool: ...
+    def preflight_delete(
+        self,
+        object_key: str,
+        expected_sha256: str,
+        provider_version_id: str,
+    ) -> bool: ...
+
+    def delete_if_matches(
+        self,
+        object_key: str,
+        expected_sha256: str,
+        provider_version_id: str,
+    ) -> bool: ...
 
     def exists(self, object_key: str) -> bool: ...
 

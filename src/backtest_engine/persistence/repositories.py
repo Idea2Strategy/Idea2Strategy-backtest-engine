@@ -25,7 +25,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Connection, Row, Select, case, delete, exists, func, select, update
+from sqlalchemy import Connection, Row, Select, case, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .errors import (
@@ -73,6 +73,7 @@ from .tables import (
 
 
 __all__ = [
+    "STORAGE_OBJECT_REFERENCE_COLUMNS",
     "BacktestUnitOfWork",
     "DetailManifestRepository",
     "InputBundleRepository",
@@ -84,6 +85,44 @@ __all__ = [
     "StorageObjectReader",
     "StorageObjectRepository",
 ]
+
+
+#: Every canonical foreign key into ``storage.objects``. Compensation must fence
+#: all of them; checking only the backtest-owned detail table can erase evidence
+#: already attached by another bounded context.
+STORAGE_OBJECT_REFERENCE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("identity.account_sanction_events", "evidence_object_id"),
+    ("market_data.dataset_objects", "object_id"),
+    ("market_data.feature_snapshot_batches", "snapshot_object_id"),
+    ("market_data.quality_incidents", "evidence_object_id"),
+    ("bot.bot_events", "evidence_object_id"),
+    ("backtest.detail_manifests", "object_id"),
+    ("performance.series_manifests", "object_id"),
+    ("operations.audit_events", "evidence_object_id"),
+    ("operations.case_evidence_references", "storage_object_id"),
+)
+
+
+def _storage_object_reference_source(connection: Connection, object_id: UUID) -> str | None:
+    unions = " UNION ALL ".join(
+        f"SELECT '{table}.{column}' AS source FROM {table} WHERE {column}=:object_id"
+        for table, column in STORAGE_OBJECT_REFERENCE_COLUMNS
+    )
+    source = connection.scalar(text(f"SELECT source FROM ({unions}) refs LIMIT 1"), {"object_id": object_id})
+    return None if source is None else str(source)
+
+
+_UNREFERENCED_FENCES = " AND ".join(
+    f"NOT EXISTS (SELECT 1 FROM {table} ref WHERE ref.{column}=o.id)"
+    for table, column in STORAGE_OBJECT_REFERENCE_COLUMNS
+)
+_DELETE_UNREFERENCED_STORAGE_OBJECT = text(
+    "DELETE FROM storage.objects AS o "
+    "WHERE o.id=:object_id AND o.object_key=:object_key "
+    "AND o.provider_version_id=:provider_version_id "
+    "AND o.content_hash=:content_hash AND "
+    f"{_UNREFERENCED_FENCES} RETURNING o.id"
+)
 
 
 _ENUM_FIELDS: dict[type, dict[str, type]] = {
@@ -1316,43 +1355,96 @@ class StorageObjectRepository(StorageObjectReader):
         object_id: UUID,
         *,
         object_key: str,
+        provider_version_id: str,
         content_hash: str,
     ) -> bool:
         """Remove an uncommitted publication artifact by exact immutable identity."""
 
-        statement = (
-            delete(storage_objects)
-            .where(
-                storage_objects.c.id == object_id,
-                storage_objects.c.object_key == object_key,
-                storage_objects.c.content_hash == content_hash,
-                ~exists(
-                    select(detail_manifests.c.id).where(
-                        detail_manifests.c.object_id == object_id
-                    )
-                ),
-            )
-            .returning(storage_objects.c.id)
-        )
-        removed = self._connection.execute(statement).scalar_one_or_none()
+        removed = self._connection.execute(
+            _DELETE_UNREFERENCED_STORAGE_OBJECT,
+            {
+                "object_id": object_id,
+                "object_key": object_key,
+                "provider_version_id": provider_version_id,
+                "content_hash": content_hash,
+            },
+        ).scalar_one_or_none()
         if removed is not None:
             return True
         current = self.find(object_id)
         if current is None:
             return False
+        if current.provider_version_id != provider_version_id:
+            raise PublishConflict(
+                f"refusing to unregister storage object {object_id} with a different provider version"
+            )
         if current.object_key != object_key or current.content_hash != content_hash:
             raise PublishConflict(
                 f"refusing to unregister changed storage object {object_id}"
             )
-        if self._connection.execute(
-            select(detail_manifests.c.id)
-            .where(detail_manifests.c.object_id == object_id)
-            .limit(1)
-        ).first() is not None:
+        reference = _storage_object_reference_source(self._connection, object_id)
+        if reference is not None:
             raise PublishConflict(
-                f"storage object {object_id} is referenced by a durable detail manifest"
+                f"storage object {object_id} is referenced by {reference}"
             )
         raise PublishConflict(f"storage object {object_id} changed during compensation")
+
+    def preflight_unregister_unreferenced(
+        self,
+        candidates: Sequence[StorageObjectRow],
+    ) -> tuple[StorageObjectRow, ...]:
+        """Lock and validate every cleanup row before any external object delete."""
+
+        ordered: list[StorageObjectRow] = []
+        by_id: dict[UUID, StorageObjectRow] = {}
+        for candidate in candidates:
+            previous = by_id.get(candidate.id)
+            if previous is not None and previous != candidate:
+                raise PublishConflict(
+                    f"cleanup batch offers conflicting identities for storage object {candidate.id}"
+                )
+            by_id[candidate.id] = candidate
+        if not by_id:
+            return ()
+        rows = self._connection.execute(
+            select(storage_objects)
+            .where(storage_objects.c.id.in_(sorted(by_id, key=str)))
+            .order_by(storage_objects.c.id)
+            .with_for_update()
+        ).mappings()
+        current_by_id = {
+            row["id"]: _hydrate(StorageObjectRow, row)
+            for row in rows
+        }
+        for candidate in candidates:
+            if any(item.id == candidate.id for item in ordered):
+                continue
+            current = current_by_id.get(candidate.id)
+            if current is None:
+                continue
+            if current.provider_version_id != candidate.provider_version_id:
+                raise PublishConflict(
+                    f"refusing to unregister storage object {candidate.id} with a different provider version"
+                )
+            if any(
+                getattr(current, field) != getattr(candidate, field)
+                for field in (
+                    "storage_provider",
+                    "bucket_name",
+                    "object_key",
+                    "content_hash",
+                )
+            ):
+                raise PublishConflict(
+                    f"refusing to unregister changed storage object {candidate.id}"
+                )
+            reference = _storage_object_reference_source(self._connection, candidate.id)
+            if reference is not None:
+                raise PublishConflict(
+                    f"storage object {candidate.id} is referenced by {reference}"
+                )
+            ordered.append(current)
+        return tuple(ordered)
 
     def _transition(
         self,

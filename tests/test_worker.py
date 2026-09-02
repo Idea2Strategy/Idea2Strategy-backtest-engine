@@ -29,7 +29,7 @@ import pytest
 from sqlalchemy import Engine, text
 
 from backtest_engine import worker as worker_module
-from backtest_engine.persistence import BacktestPersistence
+from backtest_engine.persistence import BacktestPersistence, RunLane
 from backtest_engine.recovery import QueueDispatchPolicy, StaleRunRecovery
 from backtest_engine.wiring import PersistenceExecutionKeyStore
 from backtest_engine.worker import (
@@ -675,7 +675,7 @@ def test_task5_real_sqs_lane_saturation_preserves_2_1_1_fairness_and_live_leases
     starts: list[BacktestLane] = []
 
     def handler_for(lane: BacktestLane) -> Any:
-        def handle(_job: Mapping[str, Any], _context: JobContext) -> JobOutcome:
+        def handle(job: Mapping[str, Any], _context: JobContext) -> JobOutcome:
             with lock:
                 active[lane] += 1
                 peaks[lane] = max(peaks[lane], active[lane])
@@ -684,10 +684,24 @@ def test_task5_real_sqs_lane_saturation_preserves_2_1_1_fairness_and_live_leases
             assert release.wait(timeout=30), f"{lane.value} saturation gate was never released"
             with lock:
                 active[lane] -= 1
-            return JobOutcome(JobResult.SUCCEEDED, result_hash="a" * 64)
+            result_hash = canonical_digest(
+                {
+                    "run_id": str(job["backtestRunId"]),
+                    "lane": lane.value,
+                    "idempotency_key": str(job["idempotencyKey"]),
+                }
+            )
+            with persistence.unit_of_work() as uow:
+                uow.runs.mark_completed(
+                    uuid.UUID(str(job["backtestRunId"])),
+                    datetime.now(timezone.utc),
+                    result_hash,
+                )
+            return JobOutcome(JobResult.SUCCEEDED, result_hash=result_hash)
 
         return handle
 
+    durable_store = PersistenceExecutionKeyStore(persistence)
     workers = {
         lane: _worker(
             sqs,
@@ -695,6 +709,7 @@ def test_task5_real_sqs_lane_saturation_preserves_2_1_1_fairness_and_live_leases
             handler_for(lane),
             worker_id=f"task5-{lane.value}-worker",
             wait_time=timedelta(0),
+            store=durable_store,
         )
         for lane in BacktestLane
     }
@@ -729,11 +744,22 @@ def test_task5_real_sqs_lane_saturation_preserves_2_1_1_fairness_and_live_leases
     try:
         for lane in BacktestLane:
             for index in range(4):
+                run_id = task5_run_id(f"lane-{lane.value}-{index}")
+                idempotency_key = f"TASK5:LANE:{lane.value.upper()}:{index}"
                 body = _body(
-                    task5_run_id(f"lane-{lane.value}-{index}"),
-                    f"TASK5:LANE:{lane.value.upper()}:{index}",
+                    run_id,
+                    idempotency_key,
                 )
                 submitted.append(json.loads(body))
+                with persistence.unit_of_work() as uow:
+                    accepted, created = uow.runs.accept(
+                        make_run(
+                            run_id=uuid.UUID(run_id),
+                            idempotency_key=idempotency_key,
+                            lane=RunLane[lane.name],
+                        )
+                    )
+                assert created and str(accepted.id) == run_id
                 sqs.send_message(
                     QueueUrl=queue_urls[lane][0],
                     MessageBody=body,
@@ -801,6 +827,47 @@ def test_task5_real_sqs_lane_saturation_preserves_2_1_1_fairness_and_live_leases
         assert all(item.disposition is MessageDisposition.DELETED for item in completed)
         assert all(_visible(sqs, queue_urls[lane][1]) == 0 for lane in BacktestLane)
 
+        submitted_run_ids = [item["backtestRunId"] for item in submitted]
+        with admin_engine.connect() as connection:
+            durable_terminals = list(
+                connection.execute(
+                    text(
+                        "SELECT r.id::text AS run_id,r.lane::text AS lane,"
+                        "r.status::text AS run_status,r.result_hash,"
+                        "a.id::text AS attempt_id,a.attempt_number,"
+                        "a.previous_attempt_id::text AS previous_attempt_id,"
+                        "a.status::text AS attempt_status,a.failure_code,"
+                        "a.terminal_reason_code "
+                        "FROM backtest.runs r "
+                        "JOIN backtest.run_attempts a ON a.run_id=r.id "
+                        "WHERE r.id::text = ANY(:run_ids) "
+                        "ORDER BY r.id,a.attempt_number"
+                    ),
+                    {"run_ids": submitted_run_ids},
+                ).mappings()
+            )
+            durable_terminal_count = connection.scalar(
+                text(
+                    "SELECT count(*) FROM backtest.runs "
+                    "WHERE id::text = ANY(:run_ids) AND status='COMPLETED'"
+                ),
+                {"run_ids": submitted_run_ids},
+            )
+        assert durable_terminal_count == 12, (
+            "lane evidence must come from 12 durable PostgreSQL terminal runs, "
+            "not in-memory execution records"
+        )
+        assert len(durable_terminals) == 12
+        assert all(item["run_status"] == "COMPLETED" for item in durable_terminals)
+        assert all(item["attempt_status"] == "SUCCEEDED" for item in durable_terminals)
+        assert all(item["attempt_number"] == 1 for item in durable_terminals)
+        assert all(item["result_hash"] for item in durable_terminals)
+        assert {item["lane"] for item in durable_terminals} == {
+            lane.name for lane in BacktestLane
+        }
+
+        durable_identities = [dict(item) for item in durable_terminals]
+
         with persistence.unit_of_work() as uow:
             uow.runs.request_cancellation(accepted_sentinel.id, reason_code="USER_CANCELLED")
         sentinel_store.finish(
@@ -818,21 +885,15 @@ def test_task5_real_sqs_lane_saturation_preserves_2_1_1_fairness_and_live_leases
                 duration_seconds=time.monotonic() - batch_started,
                 run_id=task5_run_id("lane-saturation-fairness"),
                 attempt_lineage=tuple(
-                    f"message={item.message_id};disposition={item.disposition.value};"
-                    f"reason={item.reason_code or 'NONE'}"
-                    for item in completed
+                    f"run={item['run_id']};lane={item['lane']};attempt={item['attempt_id']};"
+                    f"number={item['attempt_number']};previous={item['previous_attempt_id']};"
+                    f"run_status={item['run_status']};attempt_status={item['attempt_status']};"
+                    f"failure={item['failure_code']};reason={item['terminal_reason_code']};"
+                    f"result={item['result_hash']}"
+                    for item in durable_identities
                 ),
                 input_fingerprint=f"sha256:{canonical_digest(submitted)}",
-                result_hash=canonical_digest(
-                    [
-                        {
-                            "message_id": item.message_id,
-                            "disposition": item.disposition.value,
-                            "reason": item.reason_code,
-                        }
-                        for item in completed
-                    ]
-                ),
+                result_hash=canonical_digest(durable_identities),
                 resource_peak=peak_observer.snapshot(),
             )
         )
@@ -886,7 +947,7 @@ def _worker(
     sqs: Any,
     queues: tuple[str, str],
     handler: Any,
-    store: InMemoryExecutionKeyStore | None = None,
+    store: Any | None = None,
     **overrides: Any,
 ) -> BacktestWorker:
     main, dlq = queues

@@ -58,6 +58,7 @@ PostgreSQL and the object store hold.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import json
@@ -65,6 +66,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -119,6 +121,7 @@ from d_reproducibility_testkit import (
     INSTRUMENT_ID,
 )
 from d_task5_chaos import (
+    BoundedProcessMonitorFactory,
     ResourcePeakObserver,
     canonical_digest,
     evidence_result,
@@ -1066,18 +1069,10 @@ def test_task5_addressable_invalid_job_is_failed_once_dead_lettered_and_ui_reada
 
 
 @pytest.mark.parametrize(
-    ("failure", "reason", "sample"),
+    ("failure", "reason", "resource_mode"),
     [
-        (
-            "cpu-limit",
-            "CPU_LIMIT",
-            ResourceSample(timedelta(minutes=5, microseconds=1), 64 * 1024 * 1024),
-        ),
-        (
-            "memory-limit",
-            "MEMORY_LIMIT",
-            ResourceSample(timedelta(seconds=1), 512 * 1024 * 1024 + 1),
-        ),
+        ("cpu-limit", "CPU_LIMIT", "cpu"),
+        ("memory-limit", "MEMORY_LIMIT", "memory"),
         ("publication-failure", "RESULT_PUBLICATION_FAILED", None),
     ],
 )
@@ -1092,20 +1087,28 @@ def test_task5_retryable_resource_and_publication_failures_exhaust_finitely(
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
     reason: str,
-    sample: ResourceSample | None,
+    resource_mode: str | None,
 ) -> None:
+    if failure in {"cpu-limit", "memory-limit"}:
+        monkeypatch.setattr(
+            ScriptedMonitor,
+            "sample",
+            lambda _self: pytest.fail(
+                "resource-limit evidence must sample ProcessResourceMonitor, "
+                "not a scripted constant"
+            ),
+        )
     peak_observer = ResourcePeakObserver()
+    process_monitors = (
+        BoundedProcessMonitorFactory(resource_mode, peak_observer, tmp_path / "resource-probes")
+        if resource_mode is not None
+        else None
+    )
+    monitor = process_monitors if process_monitors is not None else ScriptedMonitor()
 
-    class ObservedMonitor:
-        def __init__(self) -> None:
-            self._delegate = ScriptedMonitor(*(() if sample is None else (sample,)))
-
-        def sample(self) -> ResourceSample:
-            measured = self._delegate.sample()
-            peak_observer.observe("cpu_seconds", measured.cpu_time.total_seconds())
-            peak_observer.observe("memory_bytes", measured.memory_bytes)
-            return measured
-
+    stack_options: dict[str, Any] = {}
+    if process_monitors is not None:
+        stack_options["attempt_policy"] = process_monitors.policy
     stack = build_stack(
         persistence=persistence,
         sqs_client=sqs,
@@ -1113,7 +1116,8 @@ def test_task5_retryable_resource_and_publication_failures_exhaust_finitely(
         queues=queues,
         bucket=bucket,
         root=tmp_path / failure,
-        monitor=ObservedMonitor,
+        monitor=monitor,
+        **stack_options,
     )
     if failure == "publication-failure":
 
@@ -1125,7 +1129,11 @@ def test_task5_retryable_resource_and_publication_failures_exhaust_finitely(
     sentinel_key, sentinel_store, sentinel_claim = _start_live_sentinel(persistence, failure)
     sentinel_run_id = task5_run_id(f"live-sentinel:{failure}")
 
-    outcomes = [stack.worker.poll_once()[0] for _ in range(3)]
+    try:
+        outcomes = [stack.worker.poll_once()[0] for _ in range(3)]
+    finally:
+        if process_monitors is not None:
+            process_monitors.close()
 
     assert [item.disposition for item in outcomes] == [
         MessageDisposition.RETURNED,
@@ -1178,7 +1186,9 @@ def test_task5_retryable_resource_and_publication_failures_exhaust_finitely(
             result_hash=_terminal_result_identity(admin_engine, run_id),
             trade_kind_counts=_trade_kind_counts(admin_engine, run_id),
             failure_reason=f"MAX_ATTEMPTS_EXHAUSTED:{reason}",
-            resource_peak=peak_observer.snapshot(),
+            resource_peak=(
+                peak_observer.snapshot() if process_monitors is not None else None
+            ),
         )
     )
 
@@ -1754,13 +1764,17 @@ def test_partial_promotion_failure_is_cleaned_before_the_idempotent_retry(
             raise OSError("injected Task 5 partial-promotion failure")
         return original_put(object_key, data)
 
-    def fail_cleanup_once(object_key: str, expected_sha256: str) -> bool:
+    def fail_cleanup_once(
+        object_key: str,
+        expected_sha256: str,
+        provider_version_id: str,
+    ) -> bool:
         nonlocal cleanup_failed_once, delete_calls
         delete_calls += 1
         if not cleanup_failed_once:
             cleanup_failed_once = True
             raise OSError("injected Task 5 transient cleanup failure")
-        return original_delete(object_key, expected_sha256)
+        return original_delete(object_key, expected_sha256, provider_version_id)
 
     monkeypatch.setattr(stack.store, "put", fail_mid_bundle_once)
     monkeypatch.setattr(stack.store, "delete_if_matches", fail_cleanup_once)
@@ -1836,6 +1850,245 @@ def test_partial_promotion_failure_is_cleaned_before_the_idempotent_retry(
     record_evidence(
         evidence_result(
             scenario="task5-publication-cleanup-retry",
+            terminal_state="COMPLETED",
+            duration_seconds=_run_duration_seconds(admin_engine, run_id),
+            run_id=run_id,
+            attempt_lineage=_attempt_evidence(admin_engine, run_id),
+            input_fingerprint=str(request["requestHash"]),
+            result_hash=str(terminal["result_hash"]),
+            trade_kind_counts=_trade_kind_counts(admin_engine, run_id),
+        )
+    )
+
+
+def test_commit_ack_ambiguity_reconciles_the_already_completed_publication(
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    sqs: Any,
+    s3: Any,
+    queues: tuple[str, str],
+    bucket: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lost commit acknowledgement cannot compensate a committed result."""
+
+    stack = build_stack(
+        persistence=persistence,
+        sqs_client=sqs,
+        s3_client=s3,
+        queues=queues,
+        bucket=bucket,
+        root=tmp_path / "commit-ack-ambiguity",
+    )
+    request, run_id = _accept_task5(stack, "commit-ack-ambiguity")
+    sentinel_key, sentinel_store, sentinel_claim = _start_live_sentinel(
+        persistence, "commit-ack-ambiguity"
+    )
+    sentinel_run_id = task5_run_id("live-sentinel:commit-ack-ambiguity")
+    original_write = DurableResultPublisher._write
+
+    def commit_then_lose_ack(self: DurableResultPublisher, *args: Any, **kwargs: Any) -> Any:
+        original_uow = self._persistence.unit_of_work
+        first = True
+
+        @contextlib.contextmanager
+        def ambiguous_uow() -> Any:
+            nonlocal first
+            if not first:
+                with original_uow() as uow:
+                    yield uow
+                return
+            first = False
+            with original_uow() as uow:
+                yield uow
+            raise OSError("injected Task 5 lost terminal commit acknowledgement")
+
+        self._persistence.unit_of_work = ambiguous_uow  # type: ignore[method-assign]
+        try:
+            return original_write(self, *args, **kwargs)
+        finally:
+            self._persistence.unit_of_work = original_uow  # type: ignore[method-assign]
+
+    monkeypatch.setattr(DurableResultPublisher, "_write", commit_then_lose_ack)
+
+    handled = stack.worker.poll_once()
+
+    assert [item.disposition for item in handled] == [MessageDisposition.DELETED]
+    terminal = sql_one(
+        admin_engine,
+        "SELECT status,result_hash FROM backtest.runs WHERE id=:id",
+        id=run_id,
+    )
+    assert terminal["status"] == "COMPLETED"
+    assert terminal["result_hash"]
+    objects = sql_all(
+        admin_engine,
+        "SELECT id::text AS id,object_key,provider_version_id,content_hash "
+        "FROM storage.objects WHERE object_key LIKE :prefix ORDER BY object_key",
+        prefix=f"backtest-results/{run_id}/%",
+    )
+    assert len(objects) == 5
+    assert all(item["provider_version_id"] for item in objects)
+    assert len(
+        sql_all(
+            admin_engine,
+            "SELECT run_id FROM backtest.performance_summaries WHERE run_id=:id",
+            id=run_id,
+        )
+    ) == 1
+    assert len(
+        sql_all(
+            admin_engine,
+            "SELECT id FROM backtest.detail_manifests WHERE run_id=:id",
+            id=run_id,
+        )
+    ) == 4
+    assert sorted(
+        item["Key"]
+        for item in s3.list_objects_v2(
+            Bucket=bucket,
+            Prefix=f"backtest-results/{run_id}/",
+        ).get("Contents", [])
+    ) == [item["object_key"] for item in objects]
+    _assert_recovery_invariants(
+        persistence,
+        admin_engine,
+        sentinel_run_id=sentinel_run_id,
+    )
+    _finish_live_sentinel(
+        persistence,
+        sentinel_run_id,
+        sentinel_key,
+        sentinel_store,
+        sentinel_claim,
+    )
+    record_evidence(
+        evidence_result(
+            scenario="task5-publication-commit-ack-ambiguity",
+            terminal_state="COMPLETED",
+            duration_seconds=_run_duration_seconds(admin_engine, run_id),
+            run_id=run_id,
+            attempt_lineage=_attempt_evidence(admin_engine, run_id),
+            input_fingerprint=str(request["requestHash"]),
+            result_hash=str(terminal["result_hash"]),
+            trade_kind_counts=_trade_kind_counts(admin_engine, run_id),
+        )
+    )
+
+
+def test_cleanup_exhaustion_is_typed_finite_and_retries_idempotently(
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    sqs: Any,
+    s3: Any,
+    queues: tuple[str, str],
+    bucket: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stack = build_stack(
+        persistence=persistence,
+        sqs_client=sqs,
+        s3_client=s3,
+        queues=queues,
+        bucket=bucket,
+        root=tmp_path / "cleanup-exhaustion",
+    )
+    request, run_id = _accept_task5(stack, "cleanup-exhaustion")
+    sentinel_key, sentinel_store, sentinel_claim = _start_live_sentinel(
+        persistence, "cleanup-exhaustion"
+    )
+    sentinel_run_id = task5_run_id("live-sentinel:cleanup-exhaustion")
+    original_put = stack.store.put
+    original_delete = stack.store.delete_if_matches
+    put_calls = 0
+    delete_calls = 0
+    uploaded_key: str | None = None
+    promotion_failed = False
+    cleanup_can_succeed = False
+
+    def fail_after_result_object(object_key: str, data: bytes) -> Any:
+        nonlocal put_calls, uploaded_key, promotion_failed
+        put_calls += 1
+        if put_calls == 2 and not promotion_failed:
+            promotion_failed = True
+            raise OSError("injected Task 5 failure after the result object")
+        receipt = original_put(object_key, data)
+        if uploaded_key is None:
+            uploaded_key = object_key
+        return receipt
+
+    def fail_exact_cleanup_three_times(
+        object_key: str,
+        expected_sha256: str,
+        *provider_version_id: str,
+    ) -> bool:
+        nonlocal delete_calls
+        if object_key == uploaded_key and not cleanup_can_succeed:
+            delete_calls += 1
+            raise OSError("injected Task 5 cleanup transport failure")
+        return original_delete(object_key, expected_sha256, *provider_version_id)
+
+    monkeypatch.setattr(stack.store, "put", fail_after_result_object)
+    monkeypatch.setattr(stack.store, "delete_if_matches", fail_exact_cleanup_three_times)
+    started = time.monotonic()
+
+    first = stack.worker.poll_once()
+
+    assert time.monotonic() - started < 30
+    assert [item.disposition for item in first] == [MessageDisposition.RETURNED]
+    assert [item.reason_code for item in first] == ["RESULT_PUBLICATION_CLEANUP_FAILED"]
+    assert delete_calls == 3
+    retained_rows = sql_all(
+        admin_engine,
+        "SELECT id::text AS id,object_key,provider_version_id,content_hash "
+        "FROM storage.objects WHERE object_key LIKE :prefix",
+        prefix=f"backtest-results/{run_id}/%",
+    )
+    assert len(retained_rows) == 1
+    assert retained_rows[0]["object_key"] == uploaded_key
+    assert retained_rows[0]["provider_version_id"]
+    assert [
+        item["failureCode"]
+        for item in stack.client.get(
+            f"/api/v1/backtests/{run_id}/attempts",
+            headers=stack.owner(),
+        ).json()["items"]
+    ] == ["RESULT_PUBLICATION_CLEANUP_FAILED"]
+
+    cleanup_can_succeed = True
+    second = stack.worker.poll_once()
+
+    assert [item.disposition for item in second] == [MessageDisposition.DELETED]
+    terminal = sql_one(
+        admin_engine,
+        "SELECT status,result_hash FROM backtest.runs WHERE id=:id",
+        id=run_id,
+    )
+    assert terminal["status"] == "COMPLETED"
+    assert len(
+        sql_all(
+            admin_engine,
+            "SELECT id FROM storage.objects WHERE object_key LIKE :prefix",
+            prefix=f"backtest-results/{run_id}/%",
+        )
+    ) == 5
+    _assert_recovery_invariants(
+        persistence,
+        admin_engine,
+        sentinel_run_id=sentinel_run_id,
+    )
+    _finish_live_sentinel(
+        persistence,
+        sentinel_run_id,
+        sentinel_key,
+        sentinel_store,
+        sentinel_claim,
+    )
+    record_evidence(
+        evidence_result(
+            scenario="task5-publication-cleanup-exhaustion",
             terminal_state="COMPLETED",
             duration_seconds=_run_duration_seconds(admin_engine, run_id),
             run_id=run_id,

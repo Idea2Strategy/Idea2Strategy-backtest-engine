@@ -157,9 +157,54 @@ class S3ObjectStore:
 
     # -- operations ---------------------------------------------------------------
 
-    def _head(self, key: str) -> dict[str, Any]:
-        head: dict[str, Any] = self._call_with_retries(self.client.head_object, Bucket=self.bucket, Key=key)
+    def _head(self, key: str, *, version_id: str | None = None) -> dict[str, Any]:
+        arguments: dict[str, Any] = {"Bucket": self.bucket, "Key": key}
+        if version_id is not None:
+            arguments["VersionId"] = version_id
+        head: dict[str, Any] = self._call_with_retries(
+            self.client.head_object,
+            **arguments,
+        )
         return head
+
+    @staticmethod
+    def _provider_version(head: Mapping[str, Any]) -> str:
+        version = head.get("VersionId")
+        if version:
+            return str(version)
+        return str(head.get("ETag", "")).strip('"')
+
+    def _head_registered_version(
+        self,
+        key: str,
+        provider_version_id: str,
+    ) -> dict[str, Any] | None:
+        """HEAD one durable provider identity, including unversioned ETag fallback."""
+
+        try:
+            return self._head(key, version_id=provider_version_id)
+        except Exception as exact_error:
+            exact_missing = self.is_missing(exact_error)
+            try:
+                current = self._head(key)
+            except Exception as current_error:
+                if self.is_missing(current_error):
+                    return None
+                raise
+            # A real VersionId means the exact historical version was requested.
+            # If it is gone, a newer current version must be left untouched.
+            if current.get("VersionId"):
+                if exact_missing:
+                    return None
+                raise exact_error
+            current_provider = self._provider_version(current)
+            if current_provider != provider_version_id:
+                raise ObjectStoreConflict(
+                    f"refusing to delete s3://{self.bucket}/{key} with a different "
+                    f"provider version: stored {current_provider or 'absent'}, "
+                    f"expected {provider_version_id}"
+                ) from exact_error
+            return current
 
     def _receipt_from_head(
         self,
@@ -268,16 +313,24 @@ class S3ObjectStore:
             raise
         return True
 
-    def delete_if_matches(self, object_key: str, expected_sha256: str) -> bool:
-        """Delete only the exact unpublished version whose digest was observed."""
-
+    def preflight_delete(
+        self,
+        object_key: str,
+        expected_sha256: str,
+        provider_version_id: str,
+    ) -> bool:
+        """HEAD and GET the exact registered version before any batch mutates."""
         key = self.full_key(object_key)
-        try:
-            head = self._head(key)
-        except Exception as exc:
-            if self.is_missing(exc):
-                return False
-            raise
+        head = self._head_registered_version(key, provider_version_id)
+        if head is None:
+            return False
+        actual_provider = self._provider_version(head)
+        if actual_provider != provider_version_id:
+            raise ObjectStoreConflict(
+                f"refusing to delete s3://{self.bucket}/{key} with a different "
+                f"provider version: stored {actual_provider or 'absent'}, "
+                f"expected {provider_version_id}"
+            )
         metadata = head.get("Metadata", {})
         actual = str(metadata.get("sha256", "")) if isinstance(metadata, Mapping) else ""
         if actual != expected_sha256:
@@ -285,27 +338,49 @@ class S3ObjectStore:
                 f"refusing to delete changed immutable object s3://{self.bucket}/{key}: "
                 f"stored {actual or 'absent'}, expected {expected_sha256}"
             )
-        version_id = head.get("VersionId")
         arguments: dict[str, Any] = {"Bucket": self.bucket, "Key": key}
+        version_id = head.get("VersionId")
         if version_id:
-            arguments["VersionId"] = str(version_id)
-        self._call_with_retries(self.client.delete_object, **arguments)
+            arguments["VersionId"] = provider_version_id
+        response = self._call_with_retries(self.client.get_object, **arguments)
+        body = response["Body"]
         try:
-            if version_id:
-                self._call_with_retries(
-                    self.client.head_object,
-                    Bucket=self.bucket,
-                    Key=key,
-                    VersionId=str(version_id),
-                )
-            else:
-                self._head(key)
-        except Exception as exc:
-            if self.is_missing(exc):
-                return True
-            raise
+            content = body.read()
+        finally:
+            close = getattr(body, "close", None)
+            if callable(close):
+                close()
+        deep_hash = hashlib.sha256(content).hexdigest()
+        if deep_hash != expected_sha256:
+            raise ObjectStoreConflict(
+                f"refusing to delete changed immutable object s3://{self.bucket}/{key}: "
+                f"body {deep_hash}, expected {expected_sha256}"
+            )
+        return True
+
+    def delete_if_matches(
+        self,
+        object_key: str,
+        expected_sha256: str,
+        provider_version_id: str,
+    ) -> bool:
+        """Delete only the exact provider version recorded in ``storage.objects``."""
+
+        key = self.full_key(object_key)
+        if not self.preflight_delete(object_key, expected_sha256, provider_version_id):
+            return False
+        head = self._head_registered_version(key, provider_version_id)
+        if head is None:
+            return False
+        arguments: dict[str, Any] = {"Bucket": self.bucket, "Key": key}
+        if head.get("VersionId"):
+            arguments["VersionId"] = provider_version_id
+        self._call_with_retries(self.client.delete_object, **arguments)
+        if self._head_registered_version(key, provider_version_id) is None:
+            return True
         raise ObjectStoreConflict(
-            f"object store acknowledged delete but retained s3://{self.bucket}/{key}"
+            f"object store acknowledged delete but retained provider version "
+            f"{provider_version_id} at s3://{self.bucket}/{key}"
         )
 
     def open(self, object_key: str) -> BinaryIO:

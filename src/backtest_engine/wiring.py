@@ -765,17 +765,40 @@ class PersistenceStorageObjectWritePort:
             row = uow.objects.find(object_id)
         return None if row is None else _record_of(row)
 
+    @contextmanager
+    def cleanup_batch(
+        self,
+        records: Sequence[StorageObjectRecord],
+    ) -> Iterator[tuple[StorageObjectRecord, ...]]:
+        """Hold exact row/reference locks through object-store compensation."""
+
+        with _as_object_store_conflict(), self._persistence.unit_of_work() as uow:
+            locked_rows = uow.objects.preflight_unregister_unreferenced(
+                tuple(record.to_row() for record in records)
+            )
+            locked = tuple(_record_of(row) for row in locked_rows)
+            yield locked
+            for row in locked_rows:
+                uow.objects.unregister_unreferenced(
+                    row.id,
+                    object_key=row.object_key,
+                    provider_version_id=row.provider_version_id,
+                    content_hash=row.content_hash,
+                )
+
     def unregister(
         self,
         object_id: uuid.UUID,
         *,
         object_key: str,
+        provider_version_id: str,
         content_hash: str,
     ) -> bool:
         with _as_object_store_conflict(), self._persistence.unit_of_work() as uow:
             return uow.objects.unregister_unreferenced(
                 object_id,
                 object_key=object_key,
+                provider_version_id=provider_version_id,
                 content_hash=content_hash,
             )
 
@@ -1382,13 +1405,17 @@ class DurableResultPublisher:
 
     # -- steps -------------------------------------------------------------
 
-    def _publish_result_object(self, result: ResultSnapshot, verified_at: datetime) -> None:
+    def _publish_result_object(
+        self,
+        result: ResultSnapshot,
+        verified_at: datetime,
+    ) -> StorageObjectRecord:
         """The result snapshot is an object too, and spec 2.5 wants a row for it."""
         manifest = result.manifest
         instants = [record.occurred_at for record in result.records]
         period_start = min(instants) if instants else manifest.completed_at
         period_end = max(instants) if instants else manifest.completed_at
-        StorageObjectRegistrar(self._store, self._port).publish(
+        return StorageObjectRegistrar(self._store, self._port).publish(
             object_id=uuid.uuid5(
                 _RESULT_OBJECT_NAMESPACE,
                 f"{manifest.run_snapshot_id}|{manifest.content_hash}",
@@ -1404,7 +1431,7 @@ class DurableResultPublisher:
             expected_content_hash=manifest.content_hash,
             media_type=manifest.media_type,
             file_format=RESULT_OBJECT_FILE_FORMAT,
-        )
+        ).record
 
     def _artifact_identities(
         self,
@@ -1433,51 +1460,93 @@ class DurableResultPublisher:
     def _cleanup_artifacts(
         self,
         artifacts: Sequence[tuple[uuid.UUID, str, str]],
+        captured: Sequence[StorageObjectRecord] = (),
     ) -> None:
-        """Compensate only this run's exact, still-unreferenced object identities."""
+        """Preflight the whole exact-version batch, then compensate with retries."""
 
-        pending = tuple(artifacts)
-        last_failures: list[tuple[str, BaseException]] = []
+        captured_by_id = {record.object_id: record for record in captured}
+        last_failure: BaseException | None = None
         for _attempt in range(3):
-            failed: list[tuple[uuid.UUID, str, str]] = []
-            failures: list[tuple[str, BaseException]] = []
-            for object_id, object_key, content_hash in pending:
-                try:
-                    if self._store.exists(object_key):
-                        verification = self._store.verify(
-                            object_key,
-                            content_hash,
-                            deep=False,
-                        )
-                        if not verification.ok:
+            try:
+                records: list[StorageObjectRecord] = []
+                for object_id, object_key, content_hash in artifacts:
+                    record = captured_by_id.get(object_id) or self._port.find(object_id)
+                    if record is None:
+                        if self._store.exists(object_key):
                             raise ObjectStoreConflict(
-                                f"refusing to compensate changed object {object_key}"
+                                f"object {object_key} has no durable provider-version identity"
                             )
-                    self._port.unregister(
-                        object_id,
-                        object_key=object_key,
-                        content_hash=content_hash,
+                        continue
+                    if record.object_key != object_key or record.content_hash != content_hash:
+                        raise ObjectStoreConflict(
+                            f"storage object {object_id} no longer matches publication identity"
+                        )
+                    records.append(record)
+                if not records:
+                    return
+                with self._port.cleanup_batch(tuple(records)) as locked:
+                    present = tuple(
+                        self._store.preflight_delete(
+                            record.object_key,
+                            record.content_hash,
+                            record.provider_version_id,
+                        )
+                        for record in locked
                     )
-                    self._store.delete_if_matches(object_key, content_hash)
-                except ObjectStoreConflict as exc:
-                    raise ResultPublicationError(
-                        f"publication cleanup refused a changed object: {object_key}",
-                        retryable=False,
-                        reason_code="RESULT_PUBLICATION_CLEANUP_CONFLICT",
-                    ) from exc
-                except Exception as exc:
-                    failed.append((object_id, object_key, content_hash))
-                    failures.append((object_key, exc))
-            if not failed:
+                    for record, exists_exactly in zip(locked, present, strict=True):
+                        if exists_exactly:
+                            self._store.delete_if_matches(
+                                record.object_key,
+                                record.content_hash,
+                                record.provider_version_id,
+                            )
                 return
-            pending = tuple(failed)
-            last_failures = failures
-        kinds = sorted({type(exc).__name__ for _key, exc in last_failures})
+            except ObjectStoreConflict as exc:
+                raise ResultPublicationError(
+                    "publication cleanup refused an ambiguous, changed, or referenced artifact",
+                    retryable=False,
+                    reason_code="RESULT_PUBLICATION_CLEANUP_CONFLICT",
+                ) from exc
+            except Exception as exc:
+                last_failure = exc
+        kind = type(last_failure).__name__ if last_failure is not None else "UnknownError"
         raise ResultPublicationError(
-            f"publication cleanup failed after 3 attempts: {kinds}",
+            f"publication cleanup failed after 3 attempts: {kind}",
             retryable=True,
             reason_code="RESULT_PUBLICATION_CLEANUP_FAILED",
         )
+
+    def _already_completed_publication(
+        self,
+        result: ResultSnapshot,
+        bundle: DetailObjectBundle,
+    ) -> bool:
+        """Reconcile a commit whose acknowledgement was lost before compensating."""
+
+        with self._persistence.read_only() as uow:
+            run = uow.runs.get(self._binding.run_id)
+            if (
+                run.status is not RunStatus.COMPLETED
+                or run.result_hash != result.summary.result_hash
+                or (
+                    run.result_manifest_id is not None
+                    and run.result_manifest_id
+                    != uuid.UUID(result.manifest.result_manifest_id)
+                )
+            ):
+                return False
+            durable_details = {
+                (row.object_id, row.detail_hash)
+                for row in uow.manifests.list_for_run(self._binding.run_id)
+            }
+        expected_details = {
+            (
+                uuid.UUID(item.descriptor.storage_object_id),
+                item.descriptor.detail_hash,
+            )
+            for item in bundle.objects
+        }
+        return durable_details == expected_details
 
     def _write(
         self,
@@ -1490,13 +1559,14 @@ class DurableResultPublisher:
         performance = result.performance_row()
         bundle_id = binding.envelope.input_bundle_id
         artifacts = self._artifact_identities(result, bundle)
+        captured: list[StorageObjectRecord] = []
         cancellation_reason: str | None = None
         published: PublishedDetails | None = None
         try:
             with self._persistence.unit_of_work() as uow:
                 locked_run = uow.runs.lock_for_terminal_publication(binding.run_id)
                 if locked_run.cancellation_requested_at is not None:
-                    self._cleanup_artifacts(artifacts)
+                    self._cleanup_artifacts(artifacts, captured)
                     if binding.attempt_id is not None and binding.claim_token is not None:
                         closed = uow.attempts.close_fenced(
                             binding.attempt_id,
@@ -1519,11 +1589,12 @@ class DurableResultPublisher:
                         cancelled_run.cancellation_reason_code or "USER_CANCELLED"
                     )
                 else:
-                    self._publish_result_object(result, completed_at)
+                    captured.append(self._publish_result_object(result, completed_at))
                     published = DetailObjectPublisher(
                         self._store,
                         storage_write_port=self._port,
                     ).publish(bundle, verified_at=completed_at)
+                    captured.extend(published.storage_object_records())
                     uow.inputs.lock(
                         InputBundleRow(
                             id=bundle_id,
@@ -1581,12 +1652,22 @@ class DurableResultPublisher:
                             "publication held the run lock but completed as cancellation"
                         )
         except Exception as exc:
+            if published is not None:
+                try:
+                    if self._already_completed_publication(result, bundle):
+                        return published
+                except Exception as fence_error:
+                    raise ResultPublicationError(
+                        "could not fence an ambiguous terminal publication before cleanup",
+                        retryable=True,
+                        reason_code="RESULT_PUBLICATION_CLEANUP_FAILED",
+                    ) from fence_error
             if isinstance(exc, ResultPublicationError) and exc.reason_code.startswith(
                 "RESULT_PUBLICATION_CLEANUP_"
             ):
                 raise
             try:
-                self._cleanup_artifacts(artifacts)
+                self._cleanup_artifacts(artifacts, captured)
             except ResultPublicationError as cleanup_error:
                 raise cleanup_error from exc
             raise
