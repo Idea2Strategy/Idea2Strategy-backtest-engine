@@ -61,18 +61,36 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-from datetime import timedelta
+import os
+import subprocess
+import sys
+import threading
+import uuid
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pyarrow.parquet as pq
 import pytest
-from sqlalchemy import Engine
+from sqlalchemy import Engine, text
 
 from backtest_engine.attempt_coordinator import ResourceSample
-from backtest_engine.persistence import BacktestPersistence
-from backtest_engine.worker import MessageDisposition
+from backtest_engine.lifecycle import StaticDatasetManifestSource
+from backtest_engine.persistence import (
+    BacktestPersistence,
+    StaleAttemptClaim,
+    WorkStatus,
+)
+from backtest_engine.recovery import QueueDispatchPolicy, StaleRunRecovery
+from backtest_engine.wiring import DurableResultPublisher, PersistenceExecutionKeyStore
+from backtest_engine.worker import (
+    BacktestWorker,
+    ExecutionRecordStatus,
+    MessageDisposition,
+    WorkerConfig,
+    worker_execution_key_for,
+)
 
 # `build_stack` builds the app *with* a real `BacktestResultQueryService` (see
 # `d_integration_stack`), which is what lets the traversal below read the published
@@ -94,6 +112,14 @@ from d_reproducibility_testkit import (
     E2E_EXECUTION_POLICY,
     INSTRUMENT_ID,
 )
+from d_task5_chaos import (
+    evidence_result,
+    record_evidence,
+    task5_request,
+    task5_run_id,
+    wait_until,
+)
+from persistence.support import make_run
 
 
 pytestmark = pytest.mark.docker
@@ -108,9 +134,7 @@ pytestmark = pytest.mark.docker
 EXPECTED_RUN_ID = "76a6a20c-0651-5748-8187-6bf0ae155194"
 
 #: `backtest.runs.configuration_hash`, published as `inputBundleFingerprint`.
-EXPECTED_INPUT_BUNDLE_FINGERPRINT = (
-    "sha256:8b73c1ad86cf42c2360989ecb14b225a95e191eccd9c8a7e3f6ead8ef84add25"
-)
+EXPECTED_INPUT_BUNDLE_FINGERPRINT = "sha256:8b73c1ad86cf42c2360989ecb14b225a95e191eccd9c8a7e3f6ead8ef84add25"
 
 #: `RunSnapshot.snapshot_id`: the pinned run inputs.
 EXPECTED_RUN_SNAPSHOT_ID = "75fd83d0c9cd6356a9c0ed1db9833881f19a0a136042bf96d82617085ba64348"
@@ -119,9 +143,7 @@ EXPECTED_RUN_SNAPSHOT_ID = "75fd83d0c9cd6356a9c0ed1db9833881f19a0a136042bf96d826
 EXPECTED_RESULT_HASH = "d32135e1775553edc037d17fea01afc1e04f30844653741b77b235cf3677470b"
 
 #: `storage.objects.content_hash` of the TRADE_DETAIL Parquet part.
-EXPECTED_TRADE_DETAIL_CONTENT_HASH = (
-    "054779480a7c8f4cd4a1d16cebd67455fe141529ac242f57cec81039031d9188"
-)
+EXPECTED_TRADE_DETAIL_CONTENT_HASH = "054779480a7c8f4cd4a1d16cebd67455fe141529ac242f57cec81039031d9188"
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +183,119 @@ def run_once(stack: Stack) -> str:
     return str(run_id)
 
 
+def _accept_task5(stack: Stack, scenario: str) -> tuple[dict[str, Any], str]:
+    request = task5_request(stack.request, scenario)
+    accepted = stack.accept(request=request)
+    assert accepted.status_code == 202, accepted.text
+    assert accepted.json()["created"] is True
+    run_id = str(accepted.json()["run"]["backtestRunId"])
+    assert run_id == request["runId"]
+    return request, run_id
+
+
+def _start_live_sentinel(
+    persistence: BacktestPersistence,
+    scenario: str,
+) -> tuple[str, PersistenceExecutionKeyStore, Any]:
+    run_id = task5_run_id(f"live-sentinel:{scenario}")
+    with persistence.unit_of_work() as uow:
+        run, created = uow.runs.accept(
+            make_run(
+                id=uuid.UUID(run_id),
+                idempotency_key=f"TASK5:LIVE-SENTINEL:{scenario.upper()}",
+            )
+        )
+    assert created
+    key = worker_execution_key_for(str(run.id), run.idempotency_key)
+    store = PersistenceExecutionKeyStore(persistence)
+    claim = store.claim(
+        key,
+        run_id=str(run.id),
+        owner=f"task5-live-{scenario}",
+        now=datetime.now(timezone.utc),
+        lease_duration=timedelta(minutes=5),
+    )
+    assert claim.acquired
+    return key, store, claim
+
+
+def _assert_recovery_invariants(
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    *,
+    sentinel_run_id: str,
+) -> Any:
+    report = StaleRunRecovery(
+        persistence,
+        max_attempts=3,
+        queue_policy=QueueDispatchPolicy.from_environment({}),
+    ).recover_once()
+    with admin_engine.connect() as connection:
+        live = (
+            connection.execute(
+                text(
+                    "SELECT r.status AS run_status,a.status AS attempt_status,"
+                    "a.claim_expires_at > clock_timestamp() AS lease_live "
+                    "FROM backtest.runs r JOIN backtest.run_attempts a ON a.run_id=r.id "
+                    "WHERE r.id=:id ORDER BY a.attempt_number DESC LIMIT 1"
+                ),
+                {"id": uuid.UUID(sentinel_run_id)},
+            )
+            .mappings()
+            .one()
+        )
+        invalid = connection.scalar(
+            text(
+                "SELECT count(*) FROM backtest.runs r WHERE "
+                "(r.status='RUNNING' AND NOT EXISTS ("
+                " SELECT 1 FROM backtest.run_attempts a WHERE a.run_id=r.id "
+                " AND a.status='RUNNING' AND a.claim_expires_at > clock_timestamp())) "
+                "OR (r.status='QUEUED' AND EXISTS ("
+                " SELECT 1 FROM backtest.run_attempts a WHERE a.run_id=r.id "
+                " AND a.status='RUNNING'))"
+            )
+        )
+    assert dict(live) == {
+        "run_status": "RUNNING",
+        "attempt_status": "RUNNING",
+        "lease_live": True,
+    }
+    assert invalid == 0
+    return report
+
+
+def _finish_live_sentinel(
+    persistence: BacktestPersistence,
+    sentinel_run_id: str,
+    key: str,
+    store: PersistenceExecutionKeyStore,
+    claim: Any,
+) -> None:
+    with persistence.unit_of_work() as uow:
+        uow.runs.request_cancellation(
+            uuid.UUID(sentinel_run_id),
+            reason_code="USER_CANCELLED",
+        )
+    store.finish(
+        key,
+        ExecutionRecordStatus.CANCELLED,
+        now=datetime.now(timezone.utc),
+        claim=claim,
+        reason_code="USER_CANCELLED",
+        run_id=sentinel_run_id,
+    )
+
+
+def _attempt_evidence(admin_engine: Engine, run_id: str) -> tuple[str, ...]:
+    rows = sql_all(
+        admin_engine,
+        "SELECT attempt_number,status,COALESCE(terminal_reason_code,'NONE') AS reason "
+        "FROM backtest.run_attempts WHERE run_id=:id ORDER BY attempt_number",
+        id=run_id,
+    )
+    return tuple(f"{row['attempt_number']}:{row['status']}:{row['reason']}" for row in rows) or ("no-attempt",)
+
+
 # ===========================================================================
 # The end-to-end traversal
 # ===========================================================================
@@ -181,9 +316,7 @@ def test_an_official_request_traverses_http_sqs_worker_postgres_and_the_object_s
     assert body["dispatched"] is True
 
     # -- the run row exists in PostgreSQL before any worker ran ------------
-    queued = sql_one(
-        admin_engine, "SELECT status, configuration_hash FROM backtest.runs WHERE id = :id", id=run_id
-    )
+    queued = sql_one(admin_engine, "SELECT status, configuration_hash FROM backtest.runs WHERE id = :id", id=run_id)
     assert queued["status"] == "QUEUED"
     assert queued["configuration_hash"] == EXPECTED_INPUT_BUNDLE_FINGERPRINT
 
@@ -199,8 +332,7 @@ def test_an_official_request_traverses_http_sqs_worker_postgres_and_the_object_s
     # -- PostgreSQL: the nine canonical tables the run touches --------------
     run_row = sql_one(
         admin_engine,
-        "SELECT status, result_hash, completed_at, started_at, initial_cash_amount "
-        "FROM backtest.runs WHERE id = :id",
+        "SELECT status, result_hash, completed_at, started_at, initial_cash_amount FROM backtest.runs WHERE id = :id",
         id=run_id,
     )
     assert run_row["status"] == "COMPLETED"
@@ -243,10 +375,7 @@ def test_an_official_request_traverses_http_sqs_worker_postgres_and_the_object_s
     assert monthly[0]["trade_event_count"] == 2  # the accepted order and its fill
     assert monthly[0]["rejected_count"] == 0
 
-    bundle = sql_one(
-        admin_engine,
-        "SELECT bundle_hash FROM backtest.input_bundles WHERE run_id = :id", id=run_id
-    )
+    bundle = sql_one(admin_engine, "SELECT bundle_hash FROM backtest.input_bundles WHERE run_id = :id", id=run_id)
     assert bundle["bundle_hash"] == EXPECTED_INPUT_BUNDLE_FINGERPRINT
     datasets = sql_all(
         admin_engine,
@@ -320,28 +449,21 @@ def test_an_official_request_traverses_http_sqs_worker_postgres_and_the_object_s
     assert fill["cash_after"] == "551.90080000"
 
     # -- HTTP out: the five owner-scoped query endpoints --------------------
-    assert stack.client.get(
-        f"/api/v1/backtests/{run_id}", headers=stack.owner()
-    ).json()["status"] == "COMPLETED"
+    assert stack.client.get(f"/api/v1/backtests/{run_id}", headers=stack.owner()).json()["status"] == "COMPLETED"
     assert [
-        item["backtestRunId"]
-        for item in stack.client.get("/api/v1/backtests", headers=stack.owner()).json()["items"]
+        item["backtestRunId"] for item in stack.client.get("/api/v1/backtests", headers=stack.owner()).json()["items"]
     ] == [run_id]
-    api_attempts = stack.client.get(
-        f"/api/v1/backtests/{run_id}/attempts", headers=stack.owner()
-    ).json()["items"]
+    api_attempts = stack.client.get(f"/api/v1/backtests/{run_id}/attempts", headers=stack.owner()).json()["items"]
     assert [item["status"] for item in api_attempts] == ["SUCCEEDED"]
-    api_performance = stack.client.get(
-        f"/api/v1/backtests/{run_id}/performance", headers=stack.owner()
-    ).json()
+    api_performance = stack.client.get(f"/api/v1/backtests/{run_id}/performance", headers=stack.owner()).json()
     assert api_performance["resultHash"] == EXPECTED_RESULT_HASH
-    api_monthly = stack.client.get(
-        f"/api/v1/backtests/{run_id}/monthly-summaries", headers=stack.owner()
-    ).json()["items"]
+    api_monthly = stack.client.get(f"/api/v1/backtests/{run_id}/monthly-summaries", headers=stack.owner()).json()[
+        "items"
+    ]
     assert [item["etYearMonth"] for item in api_monthly] == ["2024-01"]
-    api_manifests = stack.client.get(
-        f"/api/v1/backtests/{run_id}/detail-manifests", headers=stack.owner()
-    ).json()["items"]
+    api_manifests = stack.client.get(f"/api/v1/backtests/{run_id}/detail-manifests", headers=stack.owner()).json()[
+        "items"
+    ]
     assert len(api_manifests) == len(manifests)
 
     # -- D29's whole point: the published trade detail, read back over HTTP --
@@ -370,19 +492,18 @@ def test_an_official_request_traverses_http_sqs_worker_postgres_and_the_object_s
     # `trade_event_count` for the month is 2 (the accepted order and its fill), and the
     # read model cross-checks the Parquet rows against exactly that summary.
     assert [item["kind"] for item in body["items"]] == ["ORDER", "FILL"]
-    assert {item["recordId"] for item in body["items"]} == {
-        str(row["record_id"]) for row in trades_rows
-    }
+    assert {item["recordId"] for item in body["items"]} == {str(row["record_id"]) for row in trades_rows}
     # A month the run never traded in is empty, not a 404 and not an error.
-    assert stack.client.get(
-        f"/api/v1/backtests/{run_id}/monthly-trades?et_month=2024-02",
-        headers=stack.owner(),
-    ).json()["items"] == []
+    assert (
+        stack.client.get(
+            f"/api/v1/backtests/{run_id}/monthly-trades?et_month=2024-02",
+            headers=stack.owner(),
+        ).json()["items"]
+        == []
+    )
 
     # -- and the pinned inputs the acceptance transaction recorded ----------
-    api_inputs = stack.client.get(
-        f"/api/v1/backtests/{run_id}/inputs", headers=stack.owner()
-    )
+    api_inputs = stack.client.get(f"/api/v1/backtests/{run_id}/inputs", headers=stack.owner())
     assert api_inputs.status_code == 200, api_inputs.text
     reported = api_inputs.json()
     assert reported["status"] == "COMPLETED"
@@ -675,21 +796,744 @@ def test_a_dataset_too_short_for_the_warmup_fails_the_run_and_dead_letters_the_j
         "SELECT status, failure_code FROM backtest.runs WHERE id = :id",
         id=run_id,
     )
-    assert row["status"] == "FAILED"
+    assert row["status"] == "UNAVAILABLE"
     assert row["failure_code"] == "REQUIRED_INPUT_UNAVAILABLE"
-    assert sql_all(
-        admin_engine, "SELECT run_id FROM backtest.performance_summaries WHERE run_id = :id", id=run_id
-    ) == []
-    assert sql_all(
-        admin_engine, "SELECT id FROM backtest.detail_manifests WHERE run_id = :id", id=run_id
-    ) == []
+    assert (
+        sql_all(admin_engine, "SELECT run_id FROM backtest.performance_summaries WHERE run_id = :id", id=run_id) == []
+    )
+    assert sql_all(admin_engine, "SELECT id FROM backtest.detail_manifests WHERE run_id = :id", id=run_id) == []
+
+
+@pytest.mark.parametrize("drift", ["missing", "version-changed"])
+def test_task5_missing_or_version_changed_pinned_input_is_finite_and_ui_readable(
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    sqs: Any,
+    s3: Any,
+    queues: tuple[str, str],
+    bucket: str,
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    stack = build_stack(
+        persistence=persistence,
+        sqs_client=sqs,
+        s3_client=s3,
+        queues=queues,
+        bucket=bucket,
+        root=tmp_path / f"input-{drift}",
+    )
+    _request, run_id = _accept_task5(stack, f"input-{drift}")
+    if drift == "missing":
+        changed: dict[Any, Any] = {}
+    else:
+        manifest = dict(stack.market_data.manifest)
+        manifest["dataset_hash"] = "f" * 64
+        changed = {DATASET_MANIFEST_ID: manifest}
+    stack.handler._manifests = StaticDatasetManifestSource(changed)  # type: ignore[attr-defined]
+    sentinel_key, sentinel_store, sentinel_claim = _start_live_sentinel(persistence, f"input-{drift}")
+    sentinel_run_id = task5_run_id(f"live-sentinel:input-{drift}")
+
+    handled = stack.worker.poll_once()
+
+    expected_reason = (
+        "REQUIRED_INPUT_UNAVAILABLE" if drift == "missing" else "INPUT_DATASET_UNREADABLE"
+    )
+    expected_status = "UNAVAILABLE" if drift == "missing" else "FAILED"
+    assert [item.disposition for item in handled] == [MessageDisposition.DEAD_LETTERED]
+    assert [item.reason_code for item in handled] == [expected_reason]
+    assert stack.visible(stack.dead_letter_queue) == 1
+    api = stack.client.get(f"/api/v1/backtests/{run_id}", headers=stack.owner())
+    assert api.status_code == 200, api.text
+    assert api.json()["status"] == expected_status
+    assert api.json()["failureCode"] == expected_reason
+    _assert_recovery_invariants(
+        persistence,
+        admin_engine,
+        sentinel_run_id=sentinel_run_id,
+    )
+    _finish_live_sentinel(
+        persistence,
+        sentinel_run_id,
+        sentinel_key,
+        sentinel_store,
+        sentinel_claim,
+    )
+    record_evidence(
+        evidence_result(
+            scenario=f"task5-input-{drift}",
+            terminal_state=expected_status,
+            duration_seconds=0,
+            run_id=run_id,
+            attempt_lineage=_attempt_evidence(admin_engine, run_id),
+            failure_reason=expected_reason,
+            observations={
+                "drift": drift,
+                "dlq_depth": 1,
+                "ui_failure_code": expected_reason,
+                "live_lease_preserved": True,
+            },
+        )
+    )
+
+
+def test_task5_addressable_invalid_job_is_failed_once_dead_lettered_and_ui_readable(
+    stack: Stack,
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+) -> None:
+    request, run_id = _accept_task5(stack, "invalid-input")
+    original = stack.sqs.receive_message(
+        QueueUrl=stack.main_queue,
+        MaxNumberOfMessages=1,
+        WaitTimeSeconds=1,
+    )["Messages"][0]
+    stack.sqs.delete_message(
+        QueueUrl=stack.main_queue,
+        ReceiptHandle=original["ReceiptHandle"],
+    )
+    stack.sqs.send_message(
+        QueueUrl=stack.main_queue,
+        MessageBody=json.dumps(
+            {
+                "backtestRunId": run_id,
+                "idempotencyKey": request["metadata"]["idempotencyKey"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+    sentinel_key, sentinel_store, sentinel_claim = _start_live_sentinel(persistence, "invalid-input")
+    sentinel_run_id = task5_run_id("live-sentinel:invalid-input")
+
+    handled = stack.worker.poll_once()
+
+    assert [item.disposition for item in handled] == [MessageDisposition.DEAD_LETTERED]
+    assert [item.reason_code for item in handled] == ["MESSAGE_NOT_PARSEABLE"]
+    assert stack.visible(stack.dead_letter_queue) == 1
+    api = stack.client.get(f"/api/v1/backtests/{run_id}", headers=stack.owner()).json()
+    assert api["status"] == "FAILED"
+    assert api["failureCode"] == "MESSAGE_NOT_PARSEABLE"
+    _assert_recovery_invariants(
+        persistence,
+        admin_engine,
+        sentinel_run_id=sentinel_run_id,
+    )
+    _finish_live_sentinel(
+        persistence,
+        sentinel_run_id,
+        sentinel_key,
+        sentinel_store,
+        sentinel_claim,
+    )
+    record_evidence(
+        evidence_result(
+            scenario="task5-invalid-input",
+            terminal_state="FAILED",
+            duration_seconds=0,
+            run_id=run_id,
+            attempt_lineage=_attempt_evidence(admin_engine, run_id),
+            failure_reason="MESSAGE_NOT_PARSEABLE",
+            observations={
+                "dlq_depth": 1,
+                "ui_failure_code": api["failureCode"],
+                "attempt_count": 1,
+                "live_lease_preserved": True,
+            },
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure", "reason", "sample"),
+    [
+        (
+            "cpu-limit",
+            "CPU_LIMIT",
+            ResourceSample(timedelta(minutes=5, microseconds=1), 64 * 1024 * 1024),
+        ),
+        (
+            "memory-limit",
+            "MEMORY_LIMIT",
+            ResourceSample(timedelta(seconds=1), 512 * 1024 * 1024 + 1),
+        ),
+        ("publication-failure", "RESULT_PUBLICATION_FAILED", None),
+    ],
+)
+def test_task5_retryable_resource_and_publication_failures_exhaust_finitely(
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    sqs: Any,
+    s3: Any,
+    queues: tuple[str, str],
+    bucket: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    reason: str,
+    sample: ResourceSample | None,
+) -> None:
+    monitor: Any = (lambda: ScriptedMonitor(sample)) if sample is not None else ScriptedMonitor()
+    stack = build_stack(
+        persistence=persistence,
+        sqs_client=sqs,
+        s3_client=s3,
+        queues=queues,
+        bucket=bucket,
+        root=tmp_path / failure,
+        monitor=monitor,
+    )
+    if failure == "publication-failure":
+
+        def fail_publication(*_args: Any, **_kwargs: Any) -> None:
+            raise OSError("injected Task 5 publication boundary failure")
+
+        monkeypatch.setattr(DurableResultPublisher, "_write", fail_publication)
+    _request, run_id = _accept_task5(stack, failure)
+    sentinel_key, sentinel_store, sentinel_claim = _start_live_sentinel(persistence, failure)
+    sentinel_run_id = task5_run_id(f"live-sentinel:{failure}")
+
+    outcomes = [stack.worker.poll_once()[0] for _ in range(3)]
+
+    assert [item.disposition for item in outcomes] == [
+        MessageDisposition.RETURNED,
+        MessageDisposition.RETURNED,
+        MessageDisposition.DEAD_LETTERED,
+    ]
+    assert [item.reason_code for item in outcomes[:2]] == [reason, reason]
+    assert outcomes[2].reason_code == f"MAX_ATTEMPTS_EXHAUSTED:{reason}"
+    assert stack.visible(stack.main_queue) == 0
+    assert stack.visible(stack.dead_letter_queue) == 1
+    api = stack.client.get(f"/api/v1/backtests/{run_id}", headers=stack.owner()).json()
+    assert api["status"] == "FAILED"
+    assert api["failureCode"] == "MAX_ATTEMPTS_EXHAUSTED"
+    attempts = sql_all(
+        admin_engine,
+        "SELECT attempt_number,status,failure_code FROM backtest.run_attempts WHERE run_id=:id ORDER BY attempt_number",
+        id=run_id,
+    )
+    assert attempts == [
+        {"attempt_number": number, "status": "FAILED", "failure_code": reason} for number in range(1, 4)
+    ]
+    _assert_recovery_invariants(
+        persistence,
+        admin_engine,
+        sentinel_run_id=sentinel_run_id,
+    )
+    _finish_live_sentinel(
+        persistence,
+        sentinel_run_id,
+        sentinel_key,
+        sentinel_store,
+        sentinel_claim,
+    )
+    resource_peak = {}
+    if failure == "cpu-limit":
+        resource_peak = {"cpu_seconds": 300.000001}
+    elif failure == "memory-limit":
+        resource_peak = {"memory_bytes": float(512 * 1024 * 1024 + 1)}
+    record_evidence(
+        evidence_result(
+            scenario=f"task5-{failure}",
+            terminal_state="FAILED",
+            duration_seconds=0,
+            run_id=run_id,
+            attempt_lineage=_attempt_evidence(admin_engine, run_id),
+            failure_reason=f"MAX_ATTEMPTS_EXHAUSTED:{reason}",
+            observations={
+                "attempt_count": 3,
+                "dlq_depth": 1,
+                "ui_failure_code": api["failureCode"],
+                "typed_attempt_reason": reason,
+                "live_lease_preserved": True,
+            },
+            resource_peak=resource_peak,
+        )
+    )
+
+
+@pytest.mark.parametrize("checkpoint", ["binding", "replay", "upload", "publication"])
+def test_task5_process_kill_restart_preserves_lineage_and_one_terminal_publication(
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    postgres_url: str,
+    sqs: Any,
+    s3: Any,
+    queues: tuple[str, str],
+    bucket: str,
+    tmp_path: Path,
+    checkpoint: str,
+) -> None:
+    stack = build_stack(
+        persistence=persistence,
+        sqs_client=sqs,
+        s3_client=s3,
+        queues=queues,
+        bucket=bucket,
+        root=tmp_path / "parent-market",
+    )
+    request, run_id = _accept_task5(stack, f"kill-restart-{checkpoint}")
+    sentinel_key, sentinel_store, sentinel_claim = _start_live_sentinel(persistence, f"kill-restart-{checkpoint}")
+    sentinel_run_id = task5_run_id(f"live-sentinel:kill-restart-{checkpoint}")
+    marker = tmp_path / f"task5-{checkpoint}.checkpoint.json"
+    error_marker = tmp_path / f"task5-{checkpoint}.error.txt"
+    child_environment = os.environ.copy()
+    child_environment.update(
+        {
+            "TASK5_DATABASE_URL": postgres_url,
+            "TASK5_SQS_ENDPOINT": str(sqs.meta.endpoint_url),
+            "TASK5_S3_ENDPOINT": str(s3.meta.endpoint_url),
+            "TASK5_MAIN_QUEUE": stack.main_queue,
+            "TASK5_DLQ": stack.dead_letter_queue,
+            "TASK5_BUCKET": bucket,
+            "TASK5_MARKET_ROOT": str(tmp_path / "child-market"),
+            "TASK5_REQUEST_JSON": json.dumps(request, sort_keys=True, separators=(",", ":")),
+            "TASK5_CHECKPOINT": checkpoint,
+            "TASK5_RUN_ID": run_id,
+            "TASK5_CHECKPOINT_MARKER": str(marker),
+            "TASK5_ERROR_MARKER": str(error_marker),
+        }
+    )
+    process = subprocess.Popen(
+        [sys.executable, str(Path(__file__).with_name("d_task5_chaos_worker.py"))],
+        cwd=Path(__file__).parents[1],
+        env=child_environment,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        wait_until(
+            lambda: marker.exists() or process.poll() is not None,
+            description=f"child worker to reach {checkpoint}",
+            timeout_seconds=45,
+        )
+        assert marker.exists(), (
+            f"child exited before {checkpoint}: "
+            f"{error_marker.read_text(encoding='utf-8').strip() if error_marker.exists() else process.returncode}"
+        )
+        assert not error_marker.exists()
+        first_claim = sql_one(
+            admin_engine,
+            "SELECT id,claim_token,status FROM backtest.run_attempts WHERE run_id=:id ORDER BY attempt_number LIMIT 1",
+            id=run_id,
+        )
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=15)
+
+    wait_until(
+        lambda: stack.visible(stack.main_queue) == 1,
+        description=f"{checkpoint} delivery visibility after process kill",
+        timeout_seconds=30,
+    )
+    if checkpoint != "publication":
+        wait_until(
+            lambda: bool(
+                sql_one(
+                    admin_engine,
+                    "SELECT claim_expires_at <= clock_timestamp() AS expired FROM backtest.run_attempts WHERE id=:id",
+                    id=first_claim["id"],
+                )["expired"]
+            ),
+            description=f"{checkpoint} lease expiry",
+            timeout_seconds=30,
+        )
+        recovery = _assert_recovery_invariants(
+            persistence,
+            admin_engine,
+            sentinel_run_id=sentinel_run_id,
+        )
+        assert recovery.requeued == 1
+        recovered = sql_one(
+            admin_engine,
+            "SELECT status FROM backtest.runs WHERE id=:id",
+            id=run_id,
+        )
+        assert recovered["status"] == "QUEUED"
+    else:
+        assert first_claim["status"] == "SUCCEEDED"
+        recovery = _assert_recovery_invariants(
+            persistence,
+            admin_engine,
+            sentinel_run_id=sentinel_run_id,
+        )
+        assert recovery.requeued == recovery.failed == recovery.cancelled == 0
+
+    restarted = stack.worker.poll_once()
+    assert [item.disposition for item in restarted] == [MessageDisposition.DELETED]
+    if checkpoint == "publication":
+        assert [item.reason_code for item in restarted] == ["DUPLICATE_ALREADY_SUCCEEDED"]
+    else:
+        assert [item.reason_code for item in restarted] == [None]
+
+    terminal = sql_one(
+        admin_engine,
+        "SELECT status,result_hash FROM backtest.runs WHERE id=:id",
+        id=run_id,
+    )
+    assert terminal["status"] == "COMPLETED"
+    assert terminal["result_hash"]
+    attempts = sql_all(
+        admin_engine,
+        "SELECT id,attempt_number,status,terminal_reason_code,previous_attempt_id "
+        "FROM backtest.run_attempts WHERE run_id=:id ORDER BY attempt_number",
+        id=run_id,
+    )
+    if checkpoint == "publication":
+        assert len(attempts) == 1
+        assert attempts[0]["status"] == "SUCCEEDED"
+    else:
+        assert len(attempts) == 2
+        assert [item["status"] for item in attempts] == ["FAILED", "SUCCEEDED"]
+        assert attempts[0]["terminal_reason_code"] == "LEASE_EXPIRED"
+        assert attempts[1]["previous_attempt_id"] == attempts[0]["id"]
+        with persistence.unit_of_work() as uow, pytest.raises(StaleAttemptClaim):
+            uow.attempts.close_fenced(
+                uuid.UUID(str(first_claim["id"])),
+                uuid.UUID(str(first_claim["claim_token"])),
+                status=WorkStatus.SUCCEEDED,
+                terminal_reason_code="LATE_COMPLETION_MUST_BE_FENCED",
+            )
+    assert (
+        len(
+            sql_all(
+                admin_engine,
+                "SELECT run_id FROM backtest.performance_summaries WHERE run_id=:id",
+                id=run_id,
+            )
+        )
+        == 1
+    )
+    assert (
+        len(
+            sql_all(
+                admin_engine,
+                "SELECT id FROM backtest.detail_manifests WHERE run_id=:id",
+                id=run_id,
+            )
+        )
+        > 0
+    )
+    assert stack.visible(stack.main_queue) == 0
+    _assert_recovery_invariants(
+        persistence,
+        admin_engine,
+        sentinel_run_id=sentinel_run_id,
+    )
+    _finish_live_sentinel(
+        persistence,
+        sentinel_run_id,
+        sentinel_key,
+        sentinel_store,
+        sentinel_claim,
+    )
+    record_evidence(
+        evidence_result(
+            scenario=f"task5-kill-restart-{checkpoint}",
+            terminal_state="COMPLETED",
+            duration_seconds=0,
+            run_id=run_id,
+            attempt_lineage=_attempt_evidence(admin_engine, run_id),
+            observations={
+                "checkpoint": checkpoint,
+                "attempt_count": len(attempts),
+                "late_completion_fenced": checkpoint != "publication",
+                "terminal_publications": 1,
+                "live_lease_preserved": True,
+            },
+            result_hash=str(terminal["result_hash"]),
+        )
+    )
+
+
+def test_cancellation_at_completion_cannot_publish_success_or_result_rows(
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    sqs: Any,
+    s3: Any,
+    queues: tuple[str, str],
+    bucket: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation after replay still wins the atomic publication boundary.
+
+    Moving the cancellation check after result inserts, or treating a cancelled
+    fenced close as successful publication, must make this test expose COMPLETED
+    state, result rows, a failed worker call, or a redeliverable queue message.
+    """
+
+    stack = build_stack(
+        persistence=persistence,
+        sqs_client=sqs,
+        s3_client=s3,
+        queues=queues,
+        bucket=bucket,
+        root=tmp_path / "cancel-at-completion",
+    )
+
+    _request, run_id = _accept_task5(stack, "cancellation-completion")
+    sentinel_key, sentinel_store, sentinel_claim = _start_live_sentinel(persistence, "cancellation-completion")
+    sentinel_run_id = task5_run_id("live-sentinel:cancellation-completion")
+
+    publication_reached = threading.Event()
+    continue_publication = threading.Event()
+    original_write = DurableResultPublisher._write
+
+    def gated_write(self: DurableResultPublisher, *args: Any, **kwargs: Any) -> None:
+        publication_reached.set()
+        assert continue_publication.wait(timeout=30), "publication gate was never released"
+        original_write(self, *args, **kwargs)
+
+    monkeypatch.setattr(DurableResultPublisher, "_write", gated_write)
+    handled: list[Any] = []
+    errors: list[BaseException] = []
+
+    def execute() -> None:
+        try:
+            handled.extend(stack.worker.poll_once())
+        except BaseException as exc:  # surfaced below with its exact exception type
+            errors.append(exc)
+
+    worker_thread = threading.Thread(target=execute, name="task5-cancel-completion")
+    worker_thread.start()
+    assert publication_reached.wait(timeout=30), "worker never reached publication"
+
+    cancellation = stack.client.post(
+        f"/api/v1/backtests/{run_id}/cancellation",
+        json={"reasonCode": "USER_CANCELLED"},
+        headers=stack.owner(),
+    )
+    assert cancellation.status_code == 202, cancellation.text
+    assert cancellation.json()["run"]["status"] == "RUNNING"
+    continue_publication.set()
+    worker_thread.join(timeout=30)
+
+    assert not worker_thread.is_alive(), "worker did not finish after publication was released"
+    assert errors == []
+    assert [item.disposition for item in handled] == [MessageDisposition.DELETED]
+    assert [item.reason_code for item in handled] == ["USER_CANCELLED"]
+    row = sql_one(
+        admin_engine,
+        "SELECT status, result_hash, failure_code, cancellation_reason_code FROM backtest.runs WHERE id=:id",
+        id=run_id,
+    )
+    assert row == {
+        "status": "CANCELLED",
+        "result_hash": None,
+        "failure_code": None,
+        "cancellation_reason_code": "USER_CANCELLED",
+    }
+    attempts = sql_all(
+        admin_engine,
+        "SELECT attempt_number,status,terminal_reason_code FROM backtest.run_attempts "
+        "WHERE run_id=:id ORDER BY attempt_number",
+        id=run_id,
+    )
+    assert attempts == [
+        {
+            "attempt_number": 1,
+            "status": "CANCELLED",
+            "terminal_reason_code": "CANCELLED_BY_REQUEST",
+        }
+    ]
+    assert (
+        sql_all(
+            admin_engine,
+            "SELECT run_id FROM backtest.performance_summaries WHERE run_id=:id",
+            id=run_id,
+        )
+        == []
+    )
+    assert (
+        sql_all(
+            admin_engine,
+            "SELECT id FROM backtest.detail_manifests WHERE run_id=:id",
+            id=run_id,
+        )
+        == []
+    )
+    assert stack.visible(stack.main_queue) == 0
+    _assert_recovery_invariants(
+        persistence,
+        admin_engine,
+        sentinel_run_id=sentinel_run_id,
+    )
+    _finish_live_sentinel(
+        persistence,
+        sentinel_run_id,
+        sentinel_key,
+        sentinel_store,
+        sentinel_claim,
+    )
+    record_evidence(
+        evidence_result(
+            scenario="task5-cancellation-race-completion",
+            terminal_state="CANCELLED",
+            duration_seconds=0,
+            run_id=run_id,
+            attempt_lineage=_attempt_evidence(admin_engine, run_id),
+            failure_reason="USER_CANCELLED",
+            observations={
+                "result_rows": 0,
+                "detail_rows": 0,
+                "queue_visible": 0,
+                "live_lease_preserved": True,
+            },
+        )
+    )
+
+
+def test_cancellation_raced_with_heartbeat_is_observed_at_the_next_replay_checkpoint(
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    sqs: Any,
+    s3: Any,
+    queues: tuple[str, str],
+    bucket: str,
+    tmp_path: Path,
+) -> None:
+    """A durable heartbeat carries cancellation into the next replay checkpoint."""
+
+    checkpoint_reached = threading.Event()
+    continue_checkpoint = threading.Event()
+
+    class GatedCheckpointMonitor:
+        def sample(self) -> ResourceSample:
+            checkpoint_reached.set()
+            assert continue_checkpoint.wait(timeout=30), "checkpoint gate was never released"
+            return ResourceSample(timedelta(seconds=1), 64 * 1024 * 1024)
+
+    stack = build_stack(
+        persistence=persistence,
+        sqs_client=sqs,
+        s3_client=s3,
+        queues=queues,
+        bucket=bucket,
+        root=tmp_path / "cancel-heartbeat-checkpoint",
+        monitor=GatedCheckpointMonitor(),
+    )
+    _request, run_id = _accept_task5(stack, "cancellation-heartbeat-checkpoint")
+    stack.worker = BacktestWorker(
+        client=sqs,
+        config=WorkerConfig(
+            queue_url=stack.main_queue,
+            dead_letter_queue_url=stack.dead_letter_queue,
+            worker_id="task5-cancellation-checkpoint-worker",
+            max_receive_count=3,
+            visibility_timeout=timedelta(seconds=3),
+            wait_time=timedelta(0),
+            max_messages=1,
+            heartbeat_interval=timedelta(seconds=1),
+        ),
+        handler=stack.handler,
+        store=PersistenceExecutionKeyStore(persistence),
+    )
+    sentinel_key, sentinel_store, sentinel_claim = _start_live_sentinel(
+        persistence, "cancellation-heartbeat-checkpoint"
+    )
+    sentinel_run_id = task5_run_id("live-sentinel:cancellation-heartbeat-checkpoint")
+    handled: list[Any] = []
+    errors: list[BaseException] = []
+
+    def execute() -> None:
+        try:
+            handled.extend(stack.worker.poll_once())
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker_thread = threading.Thread(target=execute, name="task5-cancel-checkpoint")
+    worker_thread.start()
+    assert checkpoint_reached.wait(timeout=30), "worker never reached replay checkpoint"
+    cancellation = stack.client.post(
+        f"/api/v1/backtests/{run_id}/cancellation",
+        json={"reasonCode": "USER_CANCELLED"},
+        headers=stack.owner(),
+    )
+    assert cancellation.status_code == 202, cancellation.text
+
+    def cancellation_crossed_heartbeat() -> bool:
+        with admin_engine.connect() as connection:
+            return bool(
+                connection.scalar(
+                    text(
+                        "SELECT a.last_heartbeat_at >= r.cancellation_requested_at "
+                        "FROM backtest.runs r JOIN backtest.run_attempts a ON a.run_id=r.id "
+                        "WHERE r.id=:id AND a.status='RUNNING'"
+                    ),
+                    {"id": uuid.UUID(run_id)},
+                )
+            )
+
+    wait_until(
+        cancellation_crossed_heartbeat,
+        description="worker heartbeat to observe the cancellation request",
+        timeout_seconds=30,
+    )
+    continue_checkpoint.set()
+    worker_thread.join(timeout=30)
+
+    assert not worker_thread.is_alive()
+    assert errors == []
+    assert [item.disposition for item in handled] == [MessageDisposition.DELETED]
+    assert [item.reason_code for item in handled] == ["USER_CANCELLED"]
+    terminal = sql_one(
+        admin_engine,
+        "SELECT status,result_hash,cancellation_reason_code FROM backtest.runs WHERE id=:id",
+        id=run_id,
+    )
+    assert terminal == {
+        "status": "CANCELLED",
+        "result_hash": None,
+        "cancellation_reason_code": "USER_CANCELLED",
+    }
+    _assert_recovery_invariants(
+        persistence,
+        admin_engine,
+        sentinel_run_id=sentinel_run_id,
+    )
+    _finish_live_sentinel(
+        persistence,
+        sentinel_run_id,
+        sentinel_key,
+        sentinel_store,
+        sentinel_claim,
+    )
+    observations = {
+        "heartbeat_observed_cancellation": True,
+        "checkpoint_terminal": "CANCELLED",
+        "success_result_excluded": True,
+        "live_lease_preserved": True,
+    }
+    for scenario in (
+        "task5-cancellation-race-heartbeat",
+        "task5-cancellation-race-checkpoint",
+    ):
+        record_evidence(
+            evidence_result(
+                scenario=scenario,
+                terminal_state="CANCELLED",
+                duration_seconds=0,
+                run_id=run_id,
+                attempt_lineage=_attempt_evidence(admin_engine, run_id),
+                failure_reason="USER_CANCELLED",
+                observations=observations,
+            )
+        )
 
 
 def test_a_redelivered_completed_job_is_acknowledged_without_running_twice(
-    stack: Stack, admin_engine: Engine
+    stack: Stack,
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
 ) -> None:
     """At-least-once delivery must not produce a second official result."""
-    run_id = run_once(stack)
+    request, run_id = _accept_task5(stack, "duplicate-delivery")
+    first = stack.worker.poll_once()
+    assert [item.disposition for item in first] == [MessageDisposition.DELETED]
+    sentinel_key, sentinel_store, sentinel_claim = _start_live_sentinel(persistence, "duplicate-delivery")
+    sentinel_run_id = task5_run_id("live-sentinel:duplicate-delivery")
     # A duplicate of the very same message, as the queue would redeliver it.
     stack.sqs.send_message(
         QueueUrl=stack.main_queue,
@@ -698,7 +1542,7 @@ def test_a_redelivered_completed_job_is_acknowledged_without_running_twice(
                 "backtestRunId": run_id,
                 "botId": str(BOT_ID),
                 "ownerAccountId": str(ACCOUNT_ID),
-                "idempotencyKey": stack.request["metadata"]["idempotencyKey"],
+                "idempotencyKey": request["metadata"]["idempotencyKey"],
                 "inputBundleFingerprint": EXPECTED_INPUT_BUNDLE_FINGERPRINT,
                 "executionPolicyVersion": E2E_EXECUTION_POLICY.version,
                 "compiledPlanChecksum": stack.request["compiledPlanChecksum"],
@@ -719,6 +1563,48 @@ def test_a_redelivered_completed_job_is_acknowledged_without_running_twice(
         "SELECT attempt_number FROM backtest.run_attempts WHERE run_id = :id",
         id=run_id,
     ) == [{"attempt_number": 1}]
+    assert (
+        len(
+            sql_all(
+                admin_engine,
+                "SELECT run_id FROM backtest.performance_summaries WHERE run_id=:id",
+                id=run_id,
+            )
+        )
+        == 1
+    )
+    _assert_recovery_invariants(
+        persistence,
+        admin_engine,
+        sentinel_run_id=sentinel_run_id,
+    )
+    _finish_live_sentinel(
+        persistence,
+        sentinel_run_id,
+        sentinel_key,
+        sentinel_store,
+        sentinel_claim,
+    )
+    record_evidence(
+        evidence_result(
+            scenario="task5-duplicate-delivery-idempotency",
+            terminal_state="COMPLETED",
+            duration_seconds=0,
+            run_id=run_id,
+            attempt_lineage=_attempt_evidence(admin_engine, run_id),
+            observations={
+                "duplicate_reason": handled[0].reason_code,
+                "attempt_count": 1,
+                "terminal_publications": 1,
+                "live_lease_preserved": True,
+            },
+            result_hash=sql_one(
+                admin_engine,
+                "SELECT result_hash FROM backtest.runs WHERE id=:id",
+                id=run_id,
+            )["result_hash"],
+        )
+    )
 
 
 def test_a_second_acceptance_of_the_same_request_neither_re_creates_nor_re_queues(

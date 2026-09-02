@@ -490,6 +490,12 @@ class RunAttemptRepository(_Repository):
                 "RETRY_RELEASED",
             }:
                 return None
+            if latest["status"] == WorkStatus.FAILED.value:
+                # Recovery may have closed the expired attempt in an earlier
+                # transaction and moved the run back to QUEUED.  The successor
+                # must retain the same lineage as the single-transaction reclaim
+                # path below instead of silently becoming a second root attempt.
+                previous_attempt_id = latest["id"]
             if latest["status"] == WorkStatus.RUNNING.value:
                 expires_at = latest["claim_expires_at"]
                 if expires_at is not None and expires_at > now:

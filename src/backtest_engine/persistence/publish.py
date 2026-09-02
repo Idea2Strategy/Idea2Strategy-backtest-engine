@@ -25,6 +25,7 @@ from .rows import (
     MonthlyJudgmentSummaryRow,
     PerformanceSummaryRow,
     RunRow,
+    RunStatus,
     WorkStatus,
 )
 
@@ -96,6 +97,19 @@ def publish_completed_run(uow: BacktestUnitOfWork, publication: RunPublication) 
     but correctness does not depend on the ordering: the transaction is the guarantee.
     """
 
+    if publication.attempt_id is not None and publication.claim_token is not None:
+        closed = uow.attempts.close_fenced(
+            publication.attempt_id,
+            publication.claim_token,
+            status=WorkStatus.SUCCEEDED,
+            terminal_reason_code=WorkStatus.SUCCEEDED.value,
+        )
+        if closed.status is WorkStatus.CANCELLED:
+            cancelled = uow.runs.get(publication.run_id)
+            if cancelled.status is not RunStatus.CANCELLED:
+                raise PublishConflict("cancelled completion did not cancel its run")
+            return cancelled
+
     if publication.require_objects_available and publication.detail_manifests:
         uow.objects.require_available([manifest.object_id for manifest in publication.detail_manifests])
 
@@ -108,14 +122,7 @@ def publish_completed_run(uow: BacktestUnitOfWork, publication: RunPublication) 
     for manifest in publication.detail_manifests:
         uow.manifests.insert(manifest)
 
-    if publication.attempt_id is not None and publication.claim_token is not None:
-        uow.attempts.close_fenced(
-            publication.attempt_id,
-            publication.claim_token,
-            status=WorkStatus.SUCCEEDED,
-            terminal_reason_code=WorkStatus.SUCCEEDED.value,
-        )
-    elif publication.worker_execution_key is not None:
+    if publication.attempt_id is None and publication.worker_execution_key is not None:
         uow.attempts.complete(
             publication.worker_execution_key,
             status=WorkStatus.SUCCEEDED,

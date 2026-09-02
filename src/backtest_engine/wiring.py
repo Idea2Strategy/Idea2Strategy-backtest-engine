@@ -148,6 +148,7 @@ from .orchestrator import (
     PublishRequest,
     ReplayOutcome,
     ReplayStatus,
+    ResultPublicationCancelled,
     ResultPublicationError,
     SessionCalendar,
 )
@@ -857,10 +858,21 @@ class PersistenceExecutionKeyStore:
                     claim_token=str(attempt.claim_token),
                 )
             existing = uow.attempts.latest_for_run(run_uuid)
+            existing_status = None
+            if existing is not None:
+                existing_status = _execution_status(existing.status)
+            else:
+                run = uow.runs.get(run_uuid)
+                existing_status = {
+                    RunStatus.COMPLETED: ExecutionRecordStatus.SUCCEEDED,
+                    RunStatus.CANCELLED: ExecutionRecordStatus.CANCELLED,
+                    RunStatus.FAILED: ExecutionRecordStatus.FAILED,
+                    RunStatus.UNAVAILABLE: ExecutionRecordStatus.FAILED,
+                }.get(run.status)
             return ExecutionClaim(
                 acquired=False,
                 attempt_number=0 if existing is None else existing.attempt_number,
-                existing_status=None if existing is None else _execution_status(existing.status),
+                existing_status=existing_status,
             )
 
     @staticmethod
@@ -1420,7 +1432,7 @@ class DurableResultPublisher:
                     for pin in binding.envelope.feature_materializations
                 ),
             )
-            publish_completed_run(
+            published_run = publish_completed_run(
                 uow,
                 RunPublication(
                     run_id=binding.run_id,
@@ -1443,6 +1455,8 @@ class DurableResultPublisher:
                     claim_token=binding.claim_token,
                 ),
             )
+        if published_run.status is RunStatus.CANCELLED:
+            raise ResultPublicationCancelled(published_run.cancellation_reason_code or "USER_CANCELLED")
 
 
 def _monthly_judgment(run_id: uuid.UUID, summary: MonthlyJudgmentSummary) -> MonthlyJudgment:

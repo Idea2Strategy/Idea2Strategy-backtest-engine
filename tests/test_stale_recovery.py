@@ -143,6 +143,45 @@ def test_expired_running_lease_is_requeued_but_live_heartbeat_is_never_recovered
     assert _state(admin_engine, live_id)["status"] == "RUNNING"
 
 
+def test_recovery_requeued_attempt_is_the_durable_predecessor_of_its_successor(
+    persistence: BacktestPersistence, admin_engine: Engine
+) -> None:
+    """Recovery and direct reclaim must build the same auditable attempt chain."""
+
+    run_id = _run(persistence)
+    store = PersistenceExecutionKeyStore(persistence)
+    key = worker_execution_key_for(str(run_id), "TASK5:RECOVERY-LINEAGE")
+    first = store.claim(
+        key,
+        run_id=str(run_id),
+        owner="task5-killed-worker",
+        now=datetime.now(UTC),
+        lease_duration=timedelta(minutes=1),
+    )
+    assert first.acquired
+    _expire(admin_engine, run_id)
+
+    report = StaleRunRecovery(
+        persistence,
+        max_attempts=5,
+        queue_policy=POLICY,
+    ).recover_once()
+    successor = store.claim(
+        key,
+        run_id=str(run_id),
+        owner="task5-restarted-worker",
+        now=datetime.now(UTC),
+        lease_duration=timedelta(minutes=1),
+    )
+
+    assert report.requeued == 1
+    assert successor.acquired and successor.attempt_number == 2
+    with persistence.unit_of_work() as uow:
+        row = uow.attempts.latest_for_run(run_id)
+    assert row is not None
+    assert str(row.previous_attempt_id) == first.attempt_id
+
+
 @pytest.mark.parametrize("max_attempts", [1, 5])
 def test_heartbeat_renewed_after_candidate_read_prevents_requeue_or_failure(
     persistence: BacktestPersistence, admin_engine: Engine, max_attempts: int
