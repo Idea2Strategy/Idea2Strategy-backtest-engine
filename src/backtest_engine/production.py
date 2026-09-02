@@ -39,7 +39,7 @@ from backtest_engine.execution_model import (
 )
 from backtest_engine.execution_policy import ExecutionPolicy, ExecutionPolicyCatalog
 from backtest_engine.lifecycle import DeadLetteredMessage
-from backtest_engine.market_data import ParquetMarketDataReader
+from backtest_engine.market_data import MarketDataValidationError, ParquetMarketDataReader
 from backtest_engine.money import PRECISION_RULES_VERSION
 from backtest_engine.object_store import S3ObjectStore
 from backtest_engine.persistence import BacktestPersistence, create_backtest_engine
@@ -59,6 +59,17 @@ from backtest_engine.wiring import (
 
 class ConfigurationError(RuntimeError):
     """A production process cannot safely start with the supplied configuration."""
+
+
+class _PinnedMarketDataObjectError(ConfigurationError, MarketDataValidationError):
+    """An immutable S3 pin failed both bootstrap and replay validation.
+
+    Direct production bootstrap callers historically receive ``ConfigurationError``.
+    During replay the same exact-version failure is invalid input evidence and must
+    participate in the orchestrator's finite ``MarketDataValidationError``
+    classification.  This narrow dual contract keeps unrelated configuration errors
+    out of the dataset-failure path.
+    """
 
 
 class MonotonicUtcClock:
@@ -805,15 +816,27 @@ class S3ParquetMarketDataReader:
                 target.unlink()
             target.parent.mkdir(parents=True, exist_ok=True)
             temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.part")
-            response = self._client.get_object(Bucket=bucket, Key=key, VersionId=version_id)
-            body = response["Body"]
             try:
-                actual = self._copy_and_hash(body, temporary)
-            finally:
-                body.close()
+                response = self._client.get_object(
+                    Bucket=bucket,
+                    Key=key,
+                    VersionId=version_id,
+                )
+                body = response["Body"]
+                try:
+                    actual = self._copy_and_hash(body, temporary)
+                finally:
+                    body.close()
+            except Exception as exc:
+                temporary.unlink(missing_ok=True)
+                raise _PinnedMarketDataObjectError(
+                    f"pinned market-data object version is unavailable: {key}"
+                ) from exc
             if not hmac.compare_digest(actual, expected):
                 temporary.unlink(missing_ok=True)
-                raise ConfigurationError(f"downloaded market-data object checksum does not match: {key}")
+                raise _PinnedMarketDataObjectError(
+                    f"downloaded market-data object checksum does not match: {key}"
+                )
             temporary.replace(target)
 
     def iter_batches(

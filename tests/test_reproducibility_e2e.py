@@ -77,13 +77,19 @@ from sqlalchemy import Engine, text
 
 from backtest_engine.attempt_coordinator import ResourceSample
 from backtest_engine.lifecycle import StaticDatasetManifestSource
+from backtest_engine.object_store.registration import StorageObjectRegistrar
 from backtest_engine.persistence import (
     BacktestPersistence,
     StaleAttemptClaim,
     WorkStatus,
 )
+from backtest_engine.production import S3ParquetMarketDataReader
 from backtest_engine.recovery import QueueDispatchPolicy, StaleRunRecovery
-from backtest_engine.wiring import DurableResultPublisher, PersistenceExecutionKeyStore
+from backtest_engine.wiring import (
+    DurableResultPublisher,
+    PersistenceExecutionKeyStore,
+    PersistenceStorageObjectWritePort,
+)
 from backtest_engine.worker import (
     BacktestWorker,
     ExecutionRecordStatus,
@@ -113,6 +119,8 @@ from d_reproducibility_testkit import (
     INSTRUMENT_ID,
 )
 from d_task5_chaos import (
+    ResourcePeakObserver,
+    canonical_digest,
     evidence_result,
     record_evidence,
     task5_request,
@@ -289,11 +297,76 @@ def _finish_live_sentinel(
 def _attempt_evidence(admin_engine: Engine, run_id: str) -> tuple[str, ...]:
     rows = sql_all(
         admin_engine,
-        "SELECT attempt_number,status,COALESCE(terminal_reason_code,'NONE') AS reason "
+        "SELECT id::text AS id,attempt_number,"
+        "COALESCE(previous_attempt_id::text,'ROOT') AS previous_attempt_id,status,"
+        "COALESCE(failure_code,'NONE') AS failure_code,"
+        "COALESCE(terminal_reason_code,'NONE') AS reason "
         "FROM backtest.run_attempts WHERE run_id=:id ORDER BY attempt_number",
         id=run_id,
     )
-    return tuple(f"{row['attempt_number']}:{row['status']}:{row['reason']}" for row in rows) or ("no-attempt",)
+    return tuple(
+        f"id={row['id']};number={row['attempt_number']};previous={row['previous_attempt_id']};"
+        f"status={row['status']};failure={row['failure_code']};reason={row['reason']}"
+        for row in rows
+    ) or ("no-attempt",)
+
+
+def _run_duration_seconds(admin_engine: Engine, run_id: str) -> float:
+    attempt_interval = sql_one(
+        admin_engine,
+        "SELECT min(started_at) AS started_at,max(completed_at) AS completed_at "
+        "FROM backtest.run_attempts WHERE run_id=:id",
+        id=run_id,
+    )
+    started_at = attempt_interval["started_at"]
+    completed_at = attempt_interval["completed_at"]
+    if started_at is None or completed_at is None:
+        run_interval = sql_one(
+            admin_engine,
+            "SELECT queued_at AS started_at,completed_at FROM backtest.runs WHERE id=:id",
+            id=run_id,
+        )
+        started_at = run_interval["started_at"]
+        completed_at = run_interval["completed_at"]
+    assert started_at is not None and completed_at is not None
+    duration = (completed_at - started_at).total_seconds()
+    assert duration > 0, "durable terminal timestamps must define a positive interval"
+    return duration
+
+
+def _terminal_result_identity(admin_engine: Engine, run_id: str) -> str:
+    run = sql_one(
+        admin_engine,
+        "SELECT status,COALESCE(result_hash,'') AS result_hash,"
+        "COALESCE(failure_code,'') AS failure_code,"
+        "COALESCE(cancellation_reason_code,'') AS cancellation_reason_code,"
+        "COALESCE(completed_at::text,'') AS completed_at "
+        "FROM backtest.runs WHERE id=:id",
+        id=run_id,
+    )
+    if run["status"] == "COMPLETED" and run["result_hash"]:
+        return str(run["result_hash"])
+    attempts = sql_all(
+        admin_engine,
+        "SELECT id::text AS id,attempt_number,status,"
+        "COALESCE(previous_attempt_id::text,'') AS previous_attempt_id,"
+        "COALESCE(failure_code,'') AS failure_code,"
+        "COALESCE(terminal_reason_code,'') AS terminal_reason_code,"
+        "COALESCE(completed_at::text,'') AS completed_at "
+        "FROM backtest.run_attempts WHERE run_id=:id ORDER BY attempt_number",
+        id=run_id,
+    )
+    return canonical_digest({"run": dict(run), "attempts": attempts})
+
+
+def _trade_kind_counts(admin_engine: Engine, run_id: str) -> dict[str, int]:
+    row = sql_one(
+        admin_engine,
+        "SELECT COALESCE(sum(trade_event_count),0)::int AS trade_events "
+        "FROM backtest.monthly_judgment_summaries WHERE run_id=:id",
+        id=run_id,
+    )
+    return {"trade_events": int(row["trade_events"])}
 
 
 # ===========================================================================
@@ -823,23 +896,69 @@ def test_task5_missing_or_version_changed_pinned_input_is_finite_and_ui_readable
         bucket=bucket,
         root=tmp_path / f"input-{drift}",
     )
-    _request, run_id = _accept_task5(stack, f"input-{drift}")
+    s3.put_bucket_versioning(
+        Bucket=bucket,
+        VersioningConfiguration={"Status": "Enabled"},
+    )
+    key = f"task5-inputs/{task5_run_id(f'exact-version:{drift}')}/bars.parquet"
+    original_put = s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=stack.market_data.parquet_bytes,
+    )
+    original_version = str(original_put["VersionId"])
+    pinned_version = original_version
     if drift == "missing":
-        changed: dict[Any, Any] = {}
+        deleted = s3.delete_object(
+            Bucket=bucket,
+            Key=key,
+            VersionId=original_version,
+        )
+        assert deleted["VersionId"] == original_version
+        with pytest.raises(Exception) as missing_exact_version:
+            s3.get_object(Bucket=bucket, Key=key, VersionId=original_version)
+        assert "NoSuchVersion" in str(missing_exact_version.value)
     else:
-        manifest = dict(stack.market_data.manifest)
-        manifest["dataset_hash"] = "f" * 64
-        changed = {DATASET_MANIFEST_ID: manifest}
-    stack.handler._manifests = StaticDatasetManifestSource(changed)  # type: ignore[attr-defined]
+        changed_put = s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=b"task5-version-changed-object",
+        )
+        pinned_version = str(changed_put["VersionId"])
+        assert pinned_version != original_version
+        assert (
+            s3.get_object(Bucket=bucket, Key=key, VersionId=original_version)["Body"].read()
+            == stack.market_data.parquet_bytes
+        )
+        assert (
+            s3.get_object(Bucket=bucket, Key=key, VersionId=pinned_version)["Body"].read()
+            == b"task5-version-changed-object"
+        )
+
+    manifest = json.loads(json.dumps(stack.market_data.manifest))
+    manifest_object = manifest["objects"][0]
+    manifest_object.update(
+        object_key=key,
+        storage_provider="S3",
+        bucket_name=bucket,
+        provider_version_id=pinned_version,
+    )
+    source = StaticDatasetManifestSource({DATASET_MANIFEST_ID: manifest})
+    stack.lifecycle.manifests = source
+    stack.handler._manifests = source  # type: ignore[attr-defined]
+    stack.handler._reader = S3ParquetMarketDataReader(  # type: ignore[attr-defined]
+        bucket=bucket,
+        cache_root=tmp_path / f"exact-version-cache-{drift}",
+        client=s3,
+    )
+    request, run_id = _accept_task5(stack, f"input-{drift}")
     sentinel_key, sentinel_store, sentinel_claim = _start_live_sentinel(persistence, f"input-{drift}")
     sentinel_run_id = task5_run_id(f"live-sentinel:input-{drift}")
 
     handled = stack.worker.poll_once()
 
-    expected_reason = (
-        "REQUIRED_INPUT_UNAVAILABLE" if drift == "missing" else "INPUT_DATASET_UNREADABLE"
-    )
-    expected_status = "UNAVAILABLE" if drift == "missing" else "FAILED"
+    expected_reason = "INPUT_DATASET_UNREADABLE"
+    expected_status = "FAILED"
     assert [item.disposition for item in handled] == [MessageDisposition.DEAD_LETTERED]
     assert [item.reason_code for item in handled] == [expected_reason]
     assert stack.visible(stack.dead_letter_queue) == 1
@@ -847,6 +966,14 @@ def test_task5_missing_or_version_changed_pinned_input_is_finite_and_ui_readable
     assert api.status_code == 200, api.text
     assert api.json()["status"] == expected_status
     assert api.json()["failureCode"] == expected_reason
+    attempts_api = stack.client.get(
+        f"/api/v1/backtests/{run_id}/attempts", headers=stack.owner()
+    )
+    assert attempts_api.status_code == 200, attempts_api.text
+    assert [
+        (item["attemptNumber"], item["status"], item["failureCode"])
+        for item in attempts_api.json()["items"]
+    ] == [(1, "FAILED", expected_reason)]
     _assert_recovery_invariants(
         persistence,
         admin_engine,
@@ -863,16 +990,13 @@ def test_task5_missing_or_version_changed_pinned_input_is_finite_and_ui_readable
         evidence_result(
             scenario=f"task5-input-{drift}",
             terminal_state=expected_status,
-            duration_seconds=0,
+            duration_seconds=_run_duration_seconds(admin_engine, run_id),
             run_id=run_id,
             attempt_lineage=_attempt_evidence(admin_engine, run_id),
+            input_fingerprint=str(request["requestHash"]),
+            result_hash=_terminal_result_identity(admin_engine, run_id),
+            trade_kind_counts=_trade_kind_counts(admin_engine, run_id),
             failure_reason=expected_reason,
-            observations={
-                "drift": drift,
-                "dlq_depth": 1,
-                "ui_failure_code": expected_reason,
-                "live_lease_preserved": True,
-            },
         )
     )
 
@@ -930,16 +1054,13 @@ def test_task5_addressable_invalid_job_is_failed_once_dead_lettered_and_ui_reada
         evidence_result(
             scenario="task5-invalid-input",
             terminal_state="FAILED",
-            duration_seconds=0,
+            duration_seconds=_run_duration_seconds(admin_engine, run_id),
             run_id=run_id,
             attempt_lineage=_attempt_evidence(admin_engine, run_id),
+            input_fingerprint=str(request["requestHash"]),
+            result_hash=_terminal_result_identity(admin_engine, run_id),
+            trade_kind_counts=_trade_kind_counts(admin_engine, run_id),
             failure_reason="MESSAGE_NOT_PARSEABLE",
-            observations={
-                "dlq_depth": 1,
-                "ui_failure_code": api["failureCode"],
-                "attempt_count": 1,
-                "live_lease_preserved": True,
-            },
         )
     )
 
@@ -973,7 +1094,18 @@ def test_task5_retryable_resource_and_publication_failures_exhaust_finitely(
     reason: str,
     sample: ResourceSample | None,
 ) -> None:
-    monitor: Any = (lambda: ScriptedMonitor(sample)) if sample is not None else ScriptedMonitor()
+    peak_observer = ResourcePeakObserver()
+
+    class ObservedMonitor:
+        def __init__(self) -> None:
+            self._delegate = ScriptedMonitor(*(() if sample is None else (sample,)))
+
+        def sample(self) -> ResourceSample:
+            measured = self._delegate.sample()
+            peak_observer.observe("cpu_seconds", measured.cpu_time.total_seconds())
+            peak_observer.observe("memory_bytes", measured.memory_bytes)
+            return measured
+
     stack = build_stack(
         persistence=persistence,
         sqs_client=sqs,
@@ -981,7 +1113,7 @@ def test_task5_retryable_resource_and_publication_failures_exhaust_finitely(
         queues=queues,
         bucket=bucket,
         root=tmp_path / failure,
-        monitor=monitor,
+        monitor=ObservedMonitor,
     )
     if failure == "publication-failure":
 
@@ -989,7 +1121,7 @@ def test_task5_retryable_resource_and_publication_failures_exhaust_finitely(
             raise OSError("injected Task 5 publication boundary failure")
 
         monkeypatch.setattr(DurableResultPublisher, "_write", fail_publication)
-    _request, run_id = _accept_task5(stack, failure)
+    request, run_id = _accept_task5(stack, failure)
     sentinel_key, sentinel_store, sentinel_claim = _start_live_sentinel(persistence, failure)
     sentinel_run_id = task5_run_id(f"live-sentinel:{failure}")
 
@@ -1007,6 +1139,14 @@ def test_task5_retryable_resource_and_publication_failures_exhaust_finitely(
     api = stack.client.get(f"/api/v1/backtests/{run_id}", headers=stack.owner()).json()
     assert api["status"] == "FAILED"
     assert api["failureCode"] == "MAX_ATTEMPTS_EXHAUSTED"
+    attempts_api_response = stack.client.get(
+        f"/api/v1/backtests/{run_id}/attempts", headers=stack.owner()
+    )
+    assert attempts_api_response.status_code == 200, attempts_api_response.text
+    attempts_api = attempts_api_response.json()["items"]
+    assert [item["attemptNumber"] for item in attempts_api] == [1, 2, 3]
+    assert [item["status"] for item in attempts_api] == ["FAILED", "FAILED", "FAILED"]
+    assert [item["failureCode"] for item in attempts_api] == [reason, reason, reason]
     attempts = sql_all(
         admin_engine,
         "SELECT attempt_number,status,failure_code FROM backtest.run_attempts WHERE run_id=:id ORDER BY attempt_number",
@@ -1027,27 +1167,18 @@ def test_task5_retryable_resource_and_publication_failures_exhaust_finitely(
         sentinel_store,
         sentinel_claim,
     )
-    resource_peak = {}
-    if failure == "cpu-limit":
-        resource_peak = {"cpu_seconds": 300.000001}
-    elif failure == "memory-limit":
-        resource_peak = {"memory_bytes": float(512 * 1024 * 1024 + 1)}
     record_evidence(
         evidence_result(
             scenario=f"task5-{failure}",
             terminal_state="FAILED",
-            duration_seconds=0,
+            duration_seconds=_run_duration_seconds(admin_engine, run_id),
             run_id=run_id,
             attempt_lineage=_attempt_evidence(admin_engine, run_id),
+            input_fingerprint=str(request["requestHash"]),
+            result_hash=_terminal_result_identity(admin_engine, run_id),
+            trade_kind_counts=_trade_kind_counts(admin_engine, run_id),
             failure_reason=f"MAX_ATTEMPTS_EXHAUSTED:{reason}",
-            observations={
-                "attempt_count": 3,
-                "dlq_depth": 1,
-                "ui_failure_code": api["failureCode"],
-                "typed_attempt_reason": reason,
-                "live_lease_preserved": True,
-            },
-            resource_peak=resource_peak,
+            resource_peak=peak_observer.snapshot(),
         )
     )
 
@@ -1232,17 +1363,12 @@ def test_task5_process_kill_restart_preserves_lineage_and_one_terminal_publicati
         evidence_result(
             scenario=f"task5-kill-restart-{checkpoint}",
             terminal_state="COMPLETED",
-            duration_seconds=0,
+            duration_seconds=_run_duration_seconds(admin_engine, run_id),
             run_id=run_id,
             attempt_lineage=_attempt_evidence(admin_engine, run_id),
-            observations={
-                "checkpoint": checkpoint,
-                "attempt_count": len(attempts),
-                "late_completion_fenced": checkpoint != "publication",
-                "terminal_publications": 1,
-                "live_lease_preserved": True,
-            },
+            input_fingerprint=str(request["requestHash"]),
             result_hash=str(terminal["result_hash"]),
+            trade_kind_counts=_trade_kind_counts(admin_engine, run_id),
         )
     )
 
@@ -1273,7 +1399,7 @@ def test_cancellation_at_completion_cannot_publish_success_or_result_rows(
         root=tmp_path / "cancel-at-completion",
     )
 
-    _request, run_id = _accept_task5(stack, "cancellation-completion")
+    request, run_id = _accept_task5(stack, "cancellation-completion")
     sentinel_key, sentinel_store, sentinel_claim = _start_live_sentinel(persistence, "cancellation-completion")
     sentinel_run_id = task5_run_id("live-sentinel:cancellation-completion")
 
@@ -1354,6 +1480,15 @@ def test_cancellation_at_completion_cannot_publish_success_or_result_rows(
         )
         == []
     )
+    assert sql_all(
+        admin_engine,
+        "SELECT id,object_key FROM storage.objects "
+        "WHERE object_key LIKE :prefix ORDER BY object_key",
+        prefix=f"backtest-results/{run_id}/%",
+    ) == []
+    listed = s3.list_objects_v2(Bucket=bucket, Prefix=f"backtest-results/{run_id}/")
+    assert listed.get("KeyCount", 0) == 0
+    assert listed.get("Contents", []) == []
     assert stack.visible(stack.main_queue) == 0
     _assert_recovery_invariants(
         persistence,
@@ -1371,16 +1506,343 @@ def test_cancellation_at_completion_cannot_publish_success_or_result_rows(
         evidence_result(
             scenario="task5-cancellation-race-completion",
             terminal_state="CANCELLED",
-            duration_seconds=0,
+            duration_seconds=_run_duration_seconds(admin_engine, run_id),
             run_id=run_id,
             attempt_lineage=_attempt_evidence(admin_engine, run_id),
+            input_fingerprint=str(request["requestHash"]),
+            result_hash=_terminal_result_identity(admin_engine, run_id),
+            trade_kind_counts=_trade_kind_counts(admin_engine, run_id),
             failure_reason="USER_CANCELLED",
-            observations={
-                "result_rows": 0,
-                "detail_rows": 0,
-                "queue_visible": 0,
-                "live_lease_preserved": True,
+        )
+    )
+
+
+def test_publication_lock_wins_before_late_cancellation_and_duplicate_is_idempotent(
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    sqs: Any,
+    s3: Any,
+    queues: tuple[str, str],
+    bucket: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other run-lock serialization completes once and rejects late cancel."""
+
+    stack = build_stack(
+        persistence=persistence,
+        sqs_client=sqs,
+        s3_client=s3,
+        queues=queues,
+        bucket=bucket,
+        root=tmp_path / "publication-wins-cancellation",
+    )
+    request, run_id = _accept_task5(stack, "publication-wins-cancellation")
+    sentinel_key, sentinel_store, sentinel_claim = _start_live_sentinel(
+        persistence, "publication-wins-cancellation"
+    )
+    sentinel_run_id = task5_run_id("live-sentinel:publication-wins-cancellation")
+
+    promotion_reached = threading.Event()
+    continue_promotion = threading.Event()
+    original_put = stack.store.put
+
+    def gated_put(object_key: str, data: bytes) -> Any:
+        if not promotion_reached.is_set():
+            promotion_reached.set()
+            assert continue_promotion.wait(timeout=30), "promotion gate was never released"
+        return original_put(object_key, data)
+
+    monkeypatch.setattr(stack.store, "put", gated_put)
+    handled: list[Any] = []
+    worker_errors: list[BaseException] = []
+
+    def execute() -> None:
+        try:
+            handled.extend(stack.worker.poll_once())
+        except BaseException as exc:
+            worker_errors.append(exc)
+
+    worker_thread = threading.Thread(target=execute, name="task5-publication-wins")
+    worker_thread.start()
+    assert promotion_reached.wait(timeout=30), "publisher never reached object promotion"
+
+    cancellation_started = threading.Event()
+    cancellation_responses: list[Any] = []
+
+    def cancel() -> None:
+        cancellation_started.set()
+        cancellation_responses.append(
+            stack.client.post(
+                f"/api/v1/backtests/{run_id}/cancellation",
+                json={"reasonCode": "USER_CANCELLED"},
+                headers=stack.owner(),
+            )
+        )
+
+    cancellation_thread = threading.Thread(target=cancel, name="task5-late-cancellation")
+    cancellation_thread.start()
+    assert cancellation_started.wait(timeout=30)
+
+    def cancellation_waits_on_the_publication_lock() -> bool:
+        with admin_engine.connect() as connection:
+            return bool(
+                connection.scalar(
+                    text(
+                        "SELECT count(*) FROM pg_stat_activity "
+                        "WHERE wait_event_type='Lock' AND query ILIKE '%backtest.runs%'"
+                    )
+                )
+            )
+
+    wait_until(
+        cancellation_waits_on_the_publication_lock,
+        description="late cancellation to block on the publication run lock",
+        timeout_seconds=30,
+    )
+    continue_promotion.set()
+    worker_thread.join(timeout=30)
+    cancellation_thread.join(timeout=30)
+
+    assert not worker_thread.is_alive() and not cancellation_thread.is_alive()
+    assert worker_errors == []
+    assert [item.disposition for item in handled] == [MessageDisposition.DELETED]
+    assert [item.reason_code for item in handled] == [None]
+    assert len(cancellation_responses) == 1
+    assert cancellation_responses[0].status_code == 409, cancellation_responses[0].text
+
+    terminal = sql_one(
+        admin_engine,
+        "SELECT status,result_hash,cancellation_requested_at FROM backtest.runs WHERE id=:id",
+        id=run_id,
+    )
+    assert terminal["status"] == "COMPLETED"
+    assert terminal["result_hash"]
+    assert terminal["cancellation_requested_at"] is None
+    attempts_before = _attempt_evidence(admin_engine, run_id)
+    objects_before = sql_all(
+        admin_engine,
+        "SELECT id::text AS id,object_key,content_hash FROM storage.objects "
+        "WHERE object_key LIKE :prefix ORDER BY object_key",
+        prefix=f"backtest-results/{run_id}/%",
+    )
+    assert len(objects_before) == 5
+    keys_before = sorted(
+        item["Key"]
+        for item in s3.list_objects_v2(
+            Bucket=bucket, Prefix=f"backtest-results/{run_id}/"
+        ).get("Contents", [])
+    )
+    assert keys_before == [item["object_key"] for item in objects_before]
+
+    stack.sqs.send_message(
+        QueueUrl=stack.main_queue,
+        MessageBody=json.dumps(
+            {
+                "backtestRunId": run_id,
+                "botId": str(BOT_ID),
+                "ownerAccountId": str(ACCOUNT_ID),
+                "idempotencyKey": request["metadata"]["idempotencyKey"],
+                "inputBundleFingerprint": EXPECTED_INPUT_BUNDLE_FINGERPRINT,
+                "executionPolicyVersion": E2E_EXECUTION_POLICY.version,
+                "compiledPlanChecksum": stack.request["compiledPlanChecksum"],
+                "datasetManifestId": str(DATASET_MANIFEST_ID),
+                "expectedSnapshotHash": stack.request["expectedSnapshotHash"],
             },
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+    )
+    duplicate = stack.worker.poll_once()
+    assert [item.reason_code for item in duplicate] == ["DUPLICATE_ALREADY_SUCCEEDED"]
+    assert _attempt_evidence(admin_engine, run_id) == attempts_before
+    assert sql_all(
+        admin_engine,
+        "SELECT id::text AS id,object_key,content_hash FROM storage.objects "
+        "WHERE object_key LIKE :prefix ORDER BY object_key",
+        prefix=f"backtest-results/{run_id}/%",
+    ) == objects_before
+    assert sorted(
+        item["Key"]
+        for item in s3.list_objects_v2(
+            Bucket=bucket, Prefix=f"backtest-results/{run_id}/"
+        ).get("Contents", [])
+    ) == keys_before
+
+    _assert_recovery_invariants(
+        persistence,
+        admin_engine,
+        sentinel_run_id=sentinel_run_id,
+    )
+    _finish_live_sentinel(
+        persistence,
+        sentinel_run_id,
+        sentinel_key,
+        sentinel_store,
+        sentinel_claim,
+    )
+    record_evidence(
+        evidence_result(
+            scenario="task5-cancellation-race-completion-success-wins",
+            terminal_state="COMPLETED",
+            duration_seconds=_run_duration_seconds(admin_engine, run_id),
+            run_id=run_id,
+            attempt_lineage=attempts_before,
+            input_fingerprint=str(request["requestHash"]),
+            result_hash=str(terminal["result_hash"]),
+            trade_kind_counts=_trade_kind_counts(admin_engine, run_id),
+        )
+    )
+
+
+def test_partial_promotion_failure_is_cleaned_before_the_idempotent_retry(
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    sqs: Any,
+    s3: Any,
+    queues: tuple[str, str],
+    bucket: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed bundle promotion cannot leave success-shaped rows or objects."""
+
+    stack = build_stack(
+        persistence=persistence,
+        sqs_client=sqs,
+        s3_client=s3,
+        queues=queues,
+        bucket=bucket,
+        root=tmp_path / "partial-promotion-cleanup",
+    )
+    request, run_id = _accept_task5(stack, "partial-promotion-cleanup")
+    guard_key = f"backtest-results/{run_id}/unrelated-task5-guard.json"
+    guard_bytes = b'{"kind":"unrelated-task5-guard"}'
+    guard_time = datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc)
+    guard = StorageObjectRegistrar(
+        stack.store,
+        PersistenceStorageObjectWritePort(persistence),
+    ).publish(
+        object_id=uuid.uuid5(uuid.NAMESPACE_URL, f"task5-unrelated:{bucket}:{run_id}"),
+        object_key=guard_key,
+        data=guard_bytes,
+        schema_version="task5-unrelated-v1",
+        row_count=1,
+        period_start=guard_time,
+        period_end=guard_time,
+        created_at=guard_time,
+        verified_at=guard_time,
+        media_type="application/json",
+        file_format="JSON",
+    )
+    sentinel_key, sentinel_store, sentinel_claim = _start_live_sentinel(
+        persistence, "partial-promotion-cleanup"
+    )
+    sentinel_run_id = task5_run_id("live-sentinel:partial-promotion-cleanup")
+    original_put = stack.store.put
+    original_delete = stack.store.delete_if_matches
+    put_calls = 0
+    delete_calls = 0
+    failed_once = False
+    cleanup_failed_once = False
+
+    def fail_mid_bundle_once(object_key: str, data: bytes) -> Any:
+        nonlocal failed_once, put_calls
+        put_calls += 1
+        if put_calls == 3 and not failed_once:
+            failed_once = True
+            raise OSError("injected Task 5 partial-promotion failure")
+        return original_put(object_key, data)
+
+    def fail_cleanup_once(object_key: str, expected_sha256: str) -> bool:
+        nonlocal cleanup_failed_once, delete_calls
+        delete_calls += 1
+        if not cleanup_failed_once:
+            cleanup_failed_once = True
+            raise OSError("injected Task 5 transient cleanup failure")
+        return original_delete(object_key, expected_sha256)
+
+    monkeypatch.setattr(stack.store, "put", fail_mid_bundle_once)
+    monkeypatch.setattr(stack.store, "delete_if_matches", fail_cleanup_once)
+
+    first = stack.worker.poll_once()
+
+    assert [item.disposition for item in first] == [MessageDisposition.RETURNED]
+    assert [item.reason_code for item in first] == ["RESULT_PUBLICATION_FAILED"]
+    assert cleanup_failed_once and delete_calls >= 2
+    registered_after_failure = sql_all(
+        admin_engine,
+        "SELECT id,object_key,content_hash,status FROM storage.objects "
+        "WHERE object_key LIKE :prefix",
+        prefix=f"backtest-results/{run_id}/%",
+    )
+    assert registered_after_failure == [
+        {
+            "id": guard.record.object_id,
+            "object_key": guard_key,
+            "content_hash": guard.receipt.content_hash,
+            "status": "AVAILABLE",
+        }
+    ]
+    keys_after_failure = [
+        item["Key"]
+        for item in s3.list_objects_v2(
+            Bucket=bucket, Prefix=f"backtest-results/{run_id}/"
+        ).get("Contents", [])
+    ]
+    assert keys_after_failure == [guard_key]
+    assert s3.get_object(Bucket=bucket, Key=guard_key)["Body"].read() == guard_bytes
+
+    second = stack.worker.poll_once()
+
+    assert [item.disposition for item in second] == [MessageDisposition.DELETED]
+    terminal = sql_one(
+        admin_engine,
+        "SELECT status,result_hash FROM backtest.runs WHERE id=:id",
+        id=run_id,
+    )
+    assert terminal["status"] == "COMPLETED"
+    registered_after_success = sql_all(
+        admin_engine,
+        "SELECT id,object_key,content_hash,status FROM storage.objects "
+        "WHERE object_key LIKE :prefix",
+        prefix=f"backtest-results/{run_id}/%",
+    )
+    assert len(registered_after_success) == 6
+    assert [row for row in registered_after_success if row["id"] == guard.record.object_id] == [
+        registered_after_failure[0]
+    ]
+    stored_keys = [
+        item["Key"]
+        for item in s3.list_objects_v2(
+            Bucket=bucket, Prefix=f"backtest-results/{run_id}/"
+        ).get("Contents", [])
+    ]
+    assert len(stored_keys) == 6
+    assert guard_key in stored_keys
+    assert s3.get_object(Bucket=bucket, Key=guard_key)["Body"].read() == guard_bytes
+    _assert_recovery_invariants(
+        persistence,
+        admin_engine,
+        sentinel_run_id=sentinel_run_id,
+    )
+    _finish_live_sentinel(
+        persistence,
+        sentinel_run_id,
+        sentinel_key,
+        sentinel_store,
+        sentinel_claim,
+    )
+    record_evidence(
+        evidence_result(
+            scenario="task5-publication-cleanup-retry",
+            terminal_state="COMPLETED",
+            duration_seconds=_run_duration_seconds(admin_engine, run_id),
+            run_id=run_id,
+            attempt_lineage=_attempt_evidence(admin_engine, run_id),
+            input_fingerprint=str(request["requestHash"]),
+            result_hash=str(terminal["result_hash"]),
+            trade_kind_counts=_trade_kind_counts(admin_engine, run_id),
         )
     )
 
@@ -1414,7 +1876,7 @@ def test_cancellation_raced_with_heartbeat_is_observed_at_the_next_replay_checkp
         root=tmp_path / "cancel-heartbeat-checkpoint",
         monitor=GatedCheckpointMonitor(),
     )
-    _request, run_id = _accept_task5(stack, "cancellation-heartbeat-checkpoint")
+    request, run_id = _accept_task5(stack, "cancellation-heartbeat-checkpoint")
     stack.worker = BacktestWorker(
         client=sqs,
         config=WorkerConfig(
@@ -1500,12 +1962,6 @@ def test_cancellation_raced_with_heartbeat_is_observed_at_the_next_replay_checkp
         sentinel_store,
         sentinel_claim,
     )
-    observations = {
-        "heartbeat_observed_cancellation": True,
-        "checkpoint_terminal": "CANCELLED",
-        "success_result_excluded": True,
-        "live_lease_preserved": True,
-    }
     for scenario in (
         "task5-cancellation-race-heartbeat",
         "task5-cancellation-race-checkpoint",
@@ -1514,11 +1970,13 @@ def test_cancellation_raced_with_heartbeat_is_observed_at_the_next_replay_checkp
             evidence_result(
                 scenario=scenario,
                 terminal_state="CANCELLED",
-                duration_seconds=0,
+                duration_seconds=_run_duration_seconds(admin_engine, run_id),
                 run_id=run_id,
                 attempt_lineage=_attempt_evidence(admin_engine, run_id),
+                input_fingerprint=str(request["requestHash"]),
+                result_hash=_terminal_result_identity(admin_engine, run_id),
+                trade_kind_counts=_trade_kind_counts(admin_engine, run_id),
                 failure_reason="USER_CANCELLED",
-                observations=observations,
             )
         )
 
@@ -1589,20 +2047,16 @@ def test_a_redelivered_completed_job_is_acknowledged_without_running_twice(
         evidence_result(
             scenario="task5-duplicate-delivery-idempotency",
             terminal_state="COMPLETED",
-            duration_seconds=0,
+            duration_seconds=_run_duration_seconds(admin_engine, run_id),
             run_id=run_id,
             attempt_lineage=_attempt_evidence(admin_engine, run_id),
-            observations={
-                "duplicate_reason": handled[0].reason_code,
-                "attempt_count": 1,
-                "terminal_publications": 1,
-                "live_lease_preserved": True,
-            },
+            input_fingerprint=str(request["requestHash"]),
             result_hash=sql_one(
                 admin_engine,
                 "SELECT result_hash FROM backtest.runs WHERE id=:id",
                 id=run_id,
             )["result_hash"],
+            trade_kind_counts=_trade_kind_counts(admin_engine, run_id),
         )
     )
 

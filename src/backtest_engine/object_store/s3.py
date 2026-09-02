@@ -57,7 +57,7 @@ RETRYABLE_ERROR_CODES = frozenset(
     }
 )
 _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
-_MISSING_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+_MISSING_CODES = frozenset({"404", "NoSuchKey", "NoSuchVersion", "NotFound"})
 _PRECONDITION_CODES = frozenset({"412", "PreconditionFailed"})
 
 
@@ -267,6 +267,46 @@ class S3ObjectStore:
                 return False
             raise
         return True
+
+    def delete_if_matches(self, object_key: str, expected_sha256: str) -> bool:
+        """Delete only the exact unpublished version whose digest was observed."""
+
+        key = self.full_key(object_key)
+        try:
+            head = self._head(key)
+        except Exception as exc:
+            if self.is_missing(exc):
+                return False
+            raise
+        metadata = head.get("Metadata", {})
+        actual = str(metadata.get("sha256", "")) if isinstance(metadata, Mapping) else ""
+        if actual != expected_sha256:
+            raise ObjectStoreConflict(
+                f"refusing to delete changed immutable object s3://{self.bucket}/{key}: "
+                f"stored {actual or 'absent'}, expected {expected_sha256}"
+            )
+        version_id = head.get("VersionId")
+        arguments: dict[str, Any] = {"Bucket": self.bucket, "Key": key}
+        if version_id:
+            arguments["VersionId"] = str(version_id)
+        self._call_with_retries(self.client.delete_object, **arguments)
+        try:
+            if version_id:
+                self._call_with_retries(
+                    self.client.head_object,
+                    Bucket=self.bucket,
+                    Key=key,
+                    VersionId=str(version_id),
+                )
+            else:
+                self._head(key)
+        except Exception as exc:
+            if self.is_missing(exc):
+                return True
+            raise
+        raise ObjectStoreConflict(
+            f"object store acknowledged delete but retained s3://{self.bucket}/{key}"
+        )
 
     def open(self, object_key: str) -> BinaryIO:
         response = self._call_with_retries(

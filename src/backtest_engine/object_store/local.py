@@ -98,6 +98,21 @@ class LocalObjectStore:
     def exists(self, object_key: str) -> bool:
         return self.path_for(object_key).is_file()
 
+    def delete_if_matches(self, object_key: str, expected_sha256: str) -> bool:
+        """Compensate an unpublished write without deleting different bytes."""
+
+        path = self.path_for(object_key)
+        if not path.is_file():
+            return False
+        actual = _sha256_file(path)
+        if actual != expected_sha256:
+            raise ObjectStoreConflict(
+                f"refusing to delete changed immutable object {object_key}: "
+                f"stored {actual}, expected {expected_sha256}"
+            )
+        path.unlink()
+        return True
+
     def open(self, object_key: str) -> BinaryIO:
         return self.path_for(object_key).open("rb")
 

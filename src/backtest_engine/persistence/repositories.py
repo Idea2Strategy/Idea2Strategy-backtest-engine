@@ -25,7 +25,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Connection, Row, Select, case, func, select, update
+from sqlalchemy import Connection, Row, Select, case, delete, exists, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .errors import (
@@ -186,6 +186,17 @@ class RunRepository(_Repository):
 
     def get(self, run_id: UUID) -> RunRow:
         found = self._fetch_one(select(runs).where(runs.c.id == run_id), RunRow)
+        if found is None:
+            raise RowNotFound(f"backtest run not found: {run_id}")
+        return found
+
+    def lock_for_terminal_publication(self, run_id: UUID) -> RunRow:
+        """Serialize result promotion with cancellation on the run row."""
+
+        found = self._fetch_one(
+            select(runs).where(runs.c.id == run_id).with_for_update(),
+            RunRow,
+        )
         if found is None:
             raise RowNotFound(f"backtest run not found: {run_id}")
         return found
@@ -1299,6 +1310,49 @@ class StorageObjectRepository(StorageObjectReader):
             allowed_from=(ObjectStatus.STAGED, ObjectStatus.AVAILABLE),
             quarantined_at=quarantined_at,
         )
+
+    def unregister_unreferenced(
+        self,
+        object_id: UUID,
+        *,
+        object_key: str,
+        content_hash: str,
+    ) -> bool:
+        """Remove an uncommitted publication artifact by exact immutable identity."""
+
+        statement = (
+            delete(storage_objects)
+            .where(
+                storage_objects.c.id == object_id,
+                storage_objects.c.object_key == object_key,
+                storage_objects.c.content_hash == content_hash,
+                ~exists(
+                    select(detail_manifests.c.id).where(
+                        detail_manifests.c.object_id == object_id
+                    )
+                ),
+            )
+            .returning(storage_objects.c.id)
+        )
+        removed = self._connection.execute(statement).scalar_one_or_none()
+        if removed is not None:
+            return True
+        current = self.find(object_id)
+        if current is None:
+            return False
+        if current.object_key != object_key or current.content_hash != content_hash:
+            raise PublishConflict(
+                f"refusing to unregister changed storage object {object_id}"
+            )
+        if self._connection.execute(
+            select(detail_manifests.c.id)
+            .where(detail_manifests.c.object_id == object_id)
+            .limit(1)
+        ).first() is not None:
+            raise PublishConflict(
+                f"storage object {object_id} is referenced by a durable detail manifest"
+            )
+        raise PublishConflict(f"storage object {object_id} changed during compensation")
 
     def _transition(
         self,

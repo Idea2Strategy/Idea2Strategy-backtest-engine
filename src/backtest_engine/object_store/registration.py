@@ -273,7 +273,7 @@ class StorageObjectRecord:
 class StorageObjectWritePort(Protocol):
     """The narrow seam an authorised `storage.objects` writer plugs into.
 
-    Four operations, matching the canonical lifecycle exactly:
+    Five operations, matching the canonical lifecycle exactly:
 
     * `register` inserts the `STAGED` row and is idempotent on `object_id`. Offering a
       *different* object under an `object_id` that already exists is a conflict, never
@@ -282,6 +282,8 @@ class StorageObjectWritePort(Protocol):
       the verification time it is being granted for.
     * `quarantine` records a verification failure against the row that already exists.
     * `find` reads one row back, so a caller can prove the row is there.
+    * `unregister` removes only an exact, unreferenced staged/publication artifact
+      during compensating cleanup; key and content hash are mandatory fences.
 
     Implementing this against Postgres is a schema-ownership decision (see the module
     docstring), not a code change at any call site.
@@ -294,6 +296,14 @@ class StorageObjectWritePort(Protocol):
     def quarantine(self, object_id: UUID, quarantined_at: datetime) -> StorageObjectRecord: ...
 
     def find(self, object_id: UUID) -> StorageObjectRecord | None: ...
+
+    def unregister(
+        self,
+        object_id: UUID,
+        *,
+        object_key: str,
+        content_hash: str,
+    ) -> bool: ...
 
 
 class UnauthorizedStorageObjectWritePort:
@@ -324,6 +334,15 @@ class UnauthorizedStorageObjectWritePort:
         raise StorageWriteNotAuthorized(f"{self.reason} (offered object_id={object_id})")
 
     def find(self, object_id: UUID) -> StorageObjectRecord | None:
+        raise StorageWriteNotAuthorized(f"{self.reason} (offered object_id={object_id})")
+
+    def unregister(
+        self,
+        object_id: UUID,
+        *,
+        object_key: str,
+        content_hash: str,
+    ) -> bool:
         raise StorageWriteNotAuthorized(f"{self.reason} (offered object_id={object_id})")
 
 
@@ -419,6 +438,25 @@ class InMemoryStorageObjectRegistry:
     def find(self, object_id: UUID) -> StorageObjectRecord | None:
         with self._lock:
             return self._rows.get(object_id)
+
+    def unregister(
+        self,
+        object_id: UUID,
+        *,
+        object_key: str,
+        content_hash: str,
+    ) -> bool:
+        with self._lock:
+            current = self._rows.get(object_id)
+            if current is None:
+                return False
+            if current.object_key != object_key or current.content_hash != content_hash:
+                raise ObjectStoreConflict(
+                    f"refusing to unregister changed storage object {object_id}"
+                )
+            del self._rows[object_id]
+            self._object_id_by_key.pop(self._key(current), None)
+            return True
 
     def rows(self) -> tuple[StorageObjectRecord, ...]:
         """Every row, ordered by object key so assertions are stable."""

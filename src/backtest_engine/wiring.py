@@ -95,6 +95,7 @@ from .detail_object_manifest import (
     DetailObjectBundle,
     DetailObjectPublisher,
     PerformancePoint,
+    PublishedDetails,
     ReplayLedgerDetail,
 )
 from .elements import PinnedFeatureSeries
@@ -162,7 +163,6 @@ from .performance.equity_curve import (
 )
 from .persistence import (
     BacktestPersistence,
-    DetailManifestRow,
     FailureConditionCountRow,
     InputBundleRow,
     InputDatasetRow,
@@ -765,6 +765,20 @@ class PersistenceStorageObjectWritePort:
             row = uow.objects.find(object_id)
         return None if row is None else _record_of(row)
 
+    def unregister(
+        self,
+        object_id: uuid.UUID,
+        *,
+        object_key: str,
+        content_hash: str,
+    ) -> bool:
+        with _as_object_store_conflict(), self._persistence.unit_of_work() as uow:
+            return uow.objects.unregister_unreferenced(
+                object_id,
+                object_key=object_key,
+                content_hash=content_hash,
+            )
+
 
 @contextmanager
 def _as_object_store_conflict() -> Iterator[None]:
@@ -1248,17 +1262,19 @@ class DurableResultPublisher:
 
     The order is the one spec 2.5 mandates and is not an implementation detail:
 
-    1. the immutable result-snapshot object and every ET-week detail Parquet part
+    1. the run row is locked, serializing cancellation with publication;
+    2. the immutable result-snapshot object and every ET-week detail Parquet part
        are written to the object store and registered in ``storage.objects``,
        reaching ``AVAILABLE`` only after their bytes were re-hashed;
-    2. **then**, in a single transaction, ``publish_completed_run`` locks the
+    3. **then**, in that same run transaction, ``publish_completed_run`` locks the
        input bundle, inserts the performance summary, the monthly judgment
        summaries with all six canonical counters, the ``detail_manifests`` rows
        and completes the attempt -- refusing to proceed unless every object it
        points at is already ``AVAILABLE``.
 
-    A crash between the two leaves orphan objects, which are inert; a crash
-    inside the second leaves nothing at all.
+    Cancellation that committed before the lock is observed before any success
+    artifact is promoted. Cancellation that arrives after the lock waits for the
+    completed result, so exactly one terminal serialization can win.
     """
 
     def __init__(
@@ -1348,18 +1364,13 @@ class DurableResultPublisher:
         )
         bundle = DetailObjectBuilder().build(result, ledger, points, request.completed_at)
 
-        self._publish_result_object(result, request.completed_at)
-        published = DetailObjectPublisher(self._store, storage_write_port=self._port).publish(
-            bundle, verified_at=request.completed_at
-        )
-
         monthly = MonthlyJudgmentBuilder().build(
             snapshot.snapshot_id,
             result.manifest.result_manifest_id,
             _judgment_evaluations(snapshot.snapshot_id, request.evaluations),
             result.records,
         )
-        self._write(result, published.manifest_rows(), monthly, request.completed_at)
+        self._write(result, bundle, monthly, request.completed_at)
 
         self._published = result
         self._bundle = bundle
@@ -1395,68 +1406,195 @@ class DurableResultPublisher:
             file_format=RESULT_OBJECT_FILE_FORMAT,
         )
 
+    def _artifact_identities(
+        self,
+        result: ResultSnapshot,
+        bundle: DetailObjectBundle,
+    ) -> tuple[tuple[uuid.UUID, str, str], ...]:
+        manifest = result.manifest
+        result_object = (
+            uuid.uuid5(
+                _RESULT_OBJECT_NAMESPACE,
+                f"{manifest.run_snapshot_id}|{manifest.content_hash}",
+            ),
+            manifest.object_key,
+            manifest.content_hash,
+        )
+        detail_objects = tuple(
+            (
+                uuid.UUID(item.descriptor.storage_object_id),
+                item.descriptor.object_key,
+                item.descriptor.content_hash,
+            )
+            for item in bundle.objects
+        )
+        return (result_object, *detail_objects)
+
+    def _cleanup_artifacts(
+        self,
+        artifacts: Sequence[tuple[uuid.UUID, str, str]],
+    ) -> None:
+        """Compensate only this run's exact, still-unreferenced object identities."""
+
+        pending = tuple(artifacts)
+        last_failures: list[tuple[str, BaseException]] = []
+        for _attempt in range(3):
+            failed: list[tuple[uuid.UUID, str, str]] = []
+            failures: list[tuple[str, BaseException]] = []
+            for object_id, object_key, content_hash in pending:
+                try:
+                    if self._store.exists(object_key):
+                        verification = self._store.verify(
+                            object_key,
+                            content_hash,
+                            deep=False,
+                        )
+                        if not verification.ok:
+                            raise ObjectStoreConflict(
+                                f"refusing to compensate changed object {object_key}"
+                            )
+                    self._port.unregister(
+                        object_id,
+                        object_key=object_key,
+                        content_hash=content_hash,
+                    )
+                    self._store.delete_if_matches(object_key, content_hash)
+                except ObjectStoreConflict as exc:
+                    raise ResultPublicationError(
+                        f"publication cleanup refused a changed object: {object_key}",
+                        retryable=False,
+                        reason_code="RESULT_PUBLICATION_CLEANUP_CONFLICT",
+                    ) from exc
+                except Exception as exc:
+                    failed.append((object_id, object_key, content_hash))
+                    failures.append((object_key, exc))
+            if not failed:
+                return
+            pending = tuple(failed)
+            last_failures = failures
+        kinds = sorted({type(exc).__name__ for _key, exc in last_failures})
+        raise ResultPublicationError(
+            f"publication cleanup failed after 3 attempts: {kinds}",
+            retryable=True,
+            reason_code="RESULT_PUBLICATION_CLEANUP_FAILED",
+        )
+
     def _write(
         self,
         result: ResultSnapshot,
-        manifest_rows: Sequence[DetailManifestRow],
+        bundle: DetailObjectBundle,
         monthly: Sequence[MonthlyJudgmentSummary],
         completed_at: datetime,
-    ) -> None:
+    ) -> PublishedDetails:
         binding = self._binding
         performance = result.performance_row()
         bundle_id = binding.envelope.input_bundle_id
-        with self._persistence.unit_of_work() as uow:
-            uow.inputs.lock(
-                InputBundleRow(
-                    id=bundle_id,
-                    run_id=binding.run_id,
-                    bundle_hash=binding.input_bundle_fingerprint,
-                    as_of_at=binding.policy.period_end,
-                    locked_at=completed_at,
-                ),
-                datasets=tuple(
-                    InputDatasetRow(
-                        input_bundle_id=bundle_id,
-                        dataset_manifest_id=pin.manifest_id,
-                        purpose_code=pin.purpose_code,
-                        locked_dataset_hash=str(manifest["dataset_hash"]),
+        artifacts = self._artifact_identities(result, bundle)
+        cancellation_reason: str | None = None
+        published: PublishedDetails | None = None
+        try:
+            with self._persistence.unit_of_work() as uow:
+                locked_run = uow.runs.lock_for_terminal_publication(binding.run_id)
+                if locked_run.cancellation_requested_at is not None:
+                    self._cleanup_artifacts(artifacts)
+                    if binding.attempt_id is not None and binding.claim_token is not None:
+                        closed = uow.attempts.close_fenced(
+                            binding.attempt_id,
+                            binding.claim_token,
+                            status=WorkStatus.SUCCEEDED,
+                            terminal_reason_code=WorkStatus.SUCCEEDED.value,
+                        )
+                        if closed.status is not WorkStatus.CANCELLED:
+                            raise PublishConflict(
+                                "cancellation-requested publication did not cancel its attempt"
+                            )
+                        cancelled_run = uow.runs.get(binding.run_id)
+                    else:
+                        cancelled_run = uow.runs.mark_cancelled(
+                            binding.run_id,
+                            completed_at,
+                            locked_run.cancellation_reason_code or "USER_CANCELLED",
+                        )
+                    cancellation_reason = (
+                        cancelled_run.cancellation_reason_code or "USER_CANCELLED"
                     )
-                    for pin, manifest in binding.manifests
-                ),
-                features=tuple(
-                    InputFeatureMaterializationRow(
-                        input_bundle_id=bundle_id,
-                        feature_materialization_id=pin.materialization_id,
-                        locked_result_hash=pin.locked_result_hash,
+                else:
+                    self._publish_result_object(result, completed_at)
+                    published = DetailObjectPublisher(
+                        self._store,
+                        storage_write_port=self._port,
+                    ).publish(bundle, verified_at=completed_at)
+                    uow.inputs.lock(
+                        InputBundleRow(
+                            id=bundle_id,
+                            run_id=binding.run_id,
+                            bundle_hash=binding.input_bundle_fingerprint,
+                            as_of_at=binding.policy.period_end,
+                            locked_at=completed_at,
+                        ),
+                        datasets=tuple(
+                            InputDatasetRow(
+                                input_bundle_id=bundle_id,
+                                dataset_manifest_id=pin.manifest_id,
+                                purpose_code=pin.purpose_code,
+                                locked_dataset_hash=str(manifest["dataset_hash"]),
+                            )
+                            for pin, manifest in binding.manifests
+                        ),
+                        features=tuple(
+                            InputFeatureMaterializationRow(
+                                input_bundle_id=bundle_id,
+                                feature_materialization_id=pin.materialization_id,
+                                locked_result_hash=pin.locked_result_hash,
+                            )
+                            for pin in binding.envelope.feature_materializations
+                        ),
                     )
-                    for pin in binding.envelope.feature_materializations
-                ),
-            )
-            published_run = publish_completed_run(
-                uow,
-                RunPublication(
-                    run_id=binding.run_id,
-                    completed_at=completed_at,
-                    result_hash=result.summary.result_hash,
-                    performance=PerformanceSummaryRow(
-                        run_id=binding.run_id,
-                        metric_catalog_version=performance.metric_catalog_version,
-                        metrics_document=dict(performance.metrics_document),
-                        calculation_rules_version=performance.calculation_rules_version,
-                        source_set_hash=performance.source_set_hash,
-                        input_hash=performance.input_hash,
-                        result_hash=performance.result_hash,
-                        calculated_at=performance.calculated_at,
-                    ),
-                    monthly=tuple(_monthly_judgment(binding.run_id, summary) for summary in monthly),
-                    detail_manifests=tuple(manifest_rows),
-                    worker_execution_key=binding.worker_execution_key,
-                    attempt_id=binding.attempt_id,
-                    claim_token=binding.claim_token,
-                ),
-            )
-        if published_run.status is RunStatus.CANCELLED:
-            raise ResultPublicationCancelled(published_run.cancellation_reason_code or "USER_CANCELLED")
+                    published_run = publish_completed_run(
+                        uow,
+                        RunPublication(
+                            run_id=binding.run_id,
+                            completed_at=completed_at,
+                            result_hash=result.summary.result_hash,
+                            performance=PerformanceSummaryRow(
+                                run_id=binding.run_id,
+                                metric_catalog_version=performance.metric_catalog_version,
+                                metrics_document=dict(performance.metrics_document),
+                                calculation_rules_version=performance.calculation_rules_version,
+                                source_set_hash=performance.source_set_hash,
+                                input_hash=performance.input_hash,
+                                result_hash=performance.result_hash,
+                                calculated_at=performance.calculated_at,
+                            ),
+                            monthly=tuple(
+                                _monthly_judgment(binding.run_id, summary)
+                                for summary in monthly
+                            ),
+                            detail_manifests=published.manifest_rows(),
+                            worker_execution_key=binding.worker_execution_key,
+                            attempt_id=binding.attempt_id,
+                            claim_token=binding.claim_token,
+                        ),
+                    )
+                    if published_run.status is RunStatus.CANCELLED:
+                        raise PublishConflict(
+                            "publication held the run lock but completed as cancellation"
+                        )
+        except Exception as exc:
+            if isinstance(exc, ResultPublicationError) and exc.reason_code.startswith(
+                "RESULT_PUBLICATION_CLEANUP_"
+            ):
+                raise
+            try:
+                self._cleanup_artifacts(artifacts)
+            except ResultPublicationError as cleanup_error:
+                raise cleanup_error from exc
+            raise
+        if cancellation_reason is not None:
+            raise ResultPublicationCancelled(cancellation_reason)
+        if published is None:  # pragma: no cover - both terminal branches assign
+            raise AssertionError("publication produced neither cancellation nor detail objects")
+        return published
 
 
 def _monthly_judgment(run_id: uuid.UUID, summary: MonthlyJudgmentSummary) -> MonthlyJudgment:

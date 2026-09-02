@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +82,37 @@ def canonical_digest(value: Mapping[str, Any] | Sequence[Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+@dataclass(frozen=True, slots=True)
+class ObservedResourcePeaks:
+    """Peak values that a boundary observer actually sampled."""
+
+    values: Mapping[str, float]
+    observation_count: int
+
+
+class ResourcePeakObserver:
+    """Thread-safe recorder for production-boundary resource/concurrency samples."""
+
+    def __init__(self) -> None:
+        self._values: dict[str, float] = {}
+        self._count = 0
+        self._lock = threading.Lock()
+
+    def observe(self, resource: str, value: int | float) -> None:
+        measured = float(value)
+        if not resource.strip() or not math.isfinite(measured) or measured < 0:
+            raise ValueError("resource observations must be named, finite, and non-negative")
+        with self._lock:
+            self._count += 1
+            self._values[resource] = max(measured, self._values.get(resource, measured))
+
+    def snapshot(self) -> ObservedResourcePeaks:
+        with self._lock:
+            if self._count < 1:
+                raise ValueError("no resource peak was observed")
+            return ObservedResourcePeaks(dict(self._values), self._count)
+
+
 def evidence_result(
     *,
     scenario: str,
@@ -87,26 +120,51 @@ def evidence_result(
     duration_seconds: float,
     run_id: str,
     attempt_lineage: Sequence[str],
-    observations: Mapping[str, Any],
+    input_fingerprint: str,
+    result_hash: str,
+    observations: Mapping[str, Any] | None = None,
     trade_kind_counts: Mapping[str, int] | None = None,
     failure_reason: str | None = None,
-    resource_peak: Mapping[str, float] | None = None,
-    result_hash: str | None = None,
+    resource_peak: ObservedResourcePeaks | None = None,
 ) -> dict[str, Any]:
     """Create one Task 2-shaped result from independently observed facts."""
+
+    if observations:
+        raise ValueError(
+            "output observations cannot establish an independent canonical input identity"
+        )
+    if not isinstance(input_fingerprint, str) or not input_fingerprint.startswith("sha256:"):
+        raise ValueError("input_fingerprint must be a canonical sha256 identity")
+    input_digest = input_fingerprint.removeprefix("sha256:")
+    result_digest = str(result_hash).removeprefix("sha256:")
+    if len(input_digest) != 64 or any(char not in "0123456789abcdef" for char in input_digest):
+        raise ValueError("input_fingerprint must be a canonical sha256 identity")
+    if len(result_digest) != 64 or any(char not in "0123456789abcdef" for char in result_digest):
+        raise ValueError("result_hash must be a canonical sha256 identity")
+    if input_digest == result_digest:
+        raise ValueError("input and terminal/result identities must be independent")
+    duration = float(duration_seconds)
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("duration_seconds must be a positive observed interval")
+    if resource_peak is not None and not isinstance(resource_peak, ObservedResourcePeaks):
+        raise TypeError("resource_peak must come from an observed production boundary")
 
     return {
         "scenario": scenario,
         "seed": TASK5_SEED,
-        "input_fingerprint": f"sha256:{canonical_digest(observations)}",
+        "input_fingerprint": input_fingerprint,
         "terminal_state": terminal_state,
-        "duration_seconds": max(0.0, float(duration_seconds)),
+        "duration_seconds": duration,
         "run_id": run_id,
         "attempt_lineage": list(attempt_lineage),
-        "result_hash": result_hash or canonical_digest(observations),
+        "result_hash": result_hash,
         "trade_kind_counts": dict(trade_kind_counts or {}),
         "failure_reason": failure_reason,
-        "resource_peak": {key: float(value) for key, value in (resource_peak or {}).items()},
+        "resource_peak": (
+            {}
+            if resource_peak is None
+            else {key: float(value) for key, value in resource_peak.values.items()}
+        ),
     }
 
 
