@@ -18,24 +18,26 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 from typing import Any
 
 import pytest
 from sqlalchemy import Engine, text
+from sqlalchemy.exc import IntegrityError
 
 from backtest_engine.object_store import (
     LocalObjectStore,
     ObjectStoreConflict,
+    S3ObjectStore,
     StorageObjectRegistrar,
 )
 from backtest_engine.persistence import BacktestPersistence, ObjectStatus, RunStatus
-from backtest_engine.persistence import repositories as persistence_repositories
 from backtest_engine.wiring import (
     PersistenceExecutionKeyStore,
     PersistenceStorageObjectWritePort,
 )
 from backtest_engine.worker import ExecutionRecordStatus, worker_execution_key_for
+from d_task5_chaos import wait_until
 from persistence.support import make_detail_manifest, make_run
 
 
@@ -506,6 +508,39 @@ def test_cleanup_batch_fences_the_durable_provider_version(
     assert object_row(admin_engine, object_id)["object_key"] == key
 
 
+@pytest.mark.parametrize(
+    ("field", "foreign_value"),
+    [
+        ("storage_provider", "FOREIGN_PROVIDER"),
+        ("bucket_name", "foreign-bucket"),
+    ],
+)
+def test_unregister_fences_the_durable_provider_and_bucket_identity(
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    tmp_path: Path,
+    field: str,
+    foreign_value: str,
+) -> None:
+    port = PersistenceStorageObjectWritePort(persistence)
+    object_id = uuid.uuid4()
+    key = f"backtest-results/{uuid.uuid4()}/RESULT_SNAPSHOT/{'0' * 64}.parquet"
+    published = _publish(port, tmp_path, object_id=object_id, key=key, body=BODY)
+    identity = {
+        "storage_provider": published.record.storage_provider,
+        "bucket_name": published.record.bucket_name,
+        "object_key": published.record.object_key,
+        "provider_version_id": published.record.provider_version_id,
+        "content_hash": published.record.content_hash,
+    }
+    identity[field] = foreign_value
+
+    with pytest.raises(ObjectStoreConflict):
+        port.unregister(object_id, **identity)
+
+    assert object_row(admin_engine, object_id)["object_key"] == key
+
+
 def test_cleanup_batch_refuses_a_result_object_referenced_as_durable_evidence(
     persistence: BacktestPersistence,
     admin_engine: Engine,
@@ -566,7 +601,7 @@ def test_cleanup_batch_refuses_a_detail_object_referenced_by_a_manifest(
     assert object_row(admin_engine, object_id)["object_key"] == key
 
 
-def test_cleanup_reference_fence_covers_every_canonical_storage_object_fk(
+def test_live_catalog_exposes_every_canonical_storage_object_fk(
     admin_engine: Engine,
 ) -> None:
     with admin_engine.connect() as connection:
@@ -591,6 +626,476 @@ def test_cleanup_reference_fence_covers_every_canonical_storage_object_fk(
             ).mappings()
         }
 
-    assert set(persistence_repositories.STORAGE_OBJECT_REFERENCE_COLUMNS) == (
-        canonical_references
+    assert canonical_references == {
+        ("identity.account_sanction_events", "evidence_object_id"),
+        ("market_data.dataset_objects", "object_id"),
+        ("market_data.feature_snapshot_batches", "snapshot_object_id"),
+        ("market_data.quality_incidents", "evidence_object_id"),
+        ("bot.bot_events", "evidence_object_id"),
+        ("backtest.detail_manifests", "object_id"),
+        ("performance.series_manifests", "object_id"),
+        ("operations.audit_events", "evidence_object_id"),
+        ("operations.case_evidence_references", "storage_object_id"),
+    }
+
+
+def _future_fk_schema(
+    admin_engine: Engine,
+    *,
+    object_id: uuid.UUID | None = None,
+    with_constraint: bool = True,
+) -> str:
+    """Create one test-owned oddly-named future reference table."""
+
+    schema = f"task5_fk_{uuid.uuid4().hex}"
+    with admin_engine.begin() as connection:
+        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+        connection.execute(
+            text(
+                f'CREATE TABLE "{schema}"."future object refs" '
+                '("storage object id" uuid)'
+            )
+        )
+        if with_constraint:
+            connection.execute(
+                text(
+                    f'ALTER TABLE "{schema}"."future object refs" '
+                    'ADD CONSTRAINT "future storage object fk" '
+                    'FOREIGN KEY ("storage object id") REFERENCES storage.objects(id)'
+                )
+            )
+        if object_id is not None:
+            connection.execute(
+                text(
+                    f'INSERT INTO "{schema}"."future object refs" '
+                    '("storage object id") VALUES (:object_id)'
+                ),
+                {"object_id": object_id},
+            )
+    return schema
+
+
+def _drop_test_schema(admin_engine: Engine, schema: str) -> None:
+    assert schema.startswith("task5_fk_")
+    with admin_engine.begin() as connection:
+        connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+
+
+def _cleanup_owned_object(
+    port: PersistenceStorageObjectWritePort,
+    object_store: Any,
+    record: Any,
+) -> None:
+    """Remove only the exact test-owned row/provider version, if still present."""
+
+    current = port.find(record.object_id)
+    if current is None:
+        object_store.delete_if_matches(
+            record.object_key,
+            record.content_hash,
+            record.provider_version_id,
+        )
+        return
+    with port.cleanup_batch((current,)) as locked:
+        for item in locked:
+            if object_store.preflight_delete(
+                item.object_key,
+                item.content_hash,
+                item.provider_version_id,
+            ):
+                object_store.delete_if_matches(
+                    item.object_key,
+                    item.content_hash,
+                    item.provider_version_id,
+                )
+
+
+def test_future_storage_object_fk_blocks_every_external_delete(
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    s3: Any,
+    bucket: str,
+) -> None:
+    """A provider-owned FK added later is a fence without a code release here."""
+
+    port = PersistenceStorageObjectWritePort(persistence)
+    prefix = f"task5-fk-proof/{uuid.uuid4().hex}"
+    object_store = S3ObjectStore(bucket, prefix=prefix, client=s3)
+    object_id = uuid.uuid4()
+    key = f"future-fk/{hashlib.sha256(BODY).hexdigest()}.parquet"
+    published = StorageObjectRegistrar(object_store, port).publish(
+        object_id=object_id,
+        object_key=key,
+        data=BODY,
+        schema_version="1.0.0",
+        row_count=3,
+        period_start=datetime(2024, 1, 2, 14, 30, tzinfo=UTC),
+        period_end=datetime(2024, 1, 2, 14, 50, tzinfo=UTC),
+        created_at=T0,
+        verified_at=T0,
+        expected_content_hash=hashlib.sha256(BODY).hexdigest(),
     )
+    schema = _future_fk_schema(admin_engine, object_id=object_id)
+    entered_external_delete = False
+    caught: BaseException | None = None
+    survived_exactly = False
+    try:
+        try:
+            with port.cleanup_batch((published.record,)):
+                entered_external_delete = True
+                object_store.delete_if_matches(
+                    published.record.object_key,
+                    published.record.content_hash,
+                    published.record.provider_version_id,
+                )
+        except BaseException as exc:  # asserted below as the typed boundary error
+            caught = exc
+        survived_exactly = object_store.preflight_delete(
+            published.record.object_key,
+            published.record.content_hash,
+            published.record.provider_version_id,
+        )
+        assert (
+            type(caught),
+            entered_external_delete,
+            survived_exactly,
+        ) == (ObjectStoreConflict, False, True)
+    finally:
+        _drop_test_schema(admin_engine, schema)
+        _cleanup_owned_object(port, object_store, published.record)
+
+
+def test_cleanup_table_lock_allows_an_unrelated_storage_object_insert(
+    persistence: BacktestPersistence,
+    tmp_path: Path,
+) -> None:
+    """The catalog fence must not stop ordinary storage publication traffic."""
+
+    port = PersistenceStorageObjectWritePort(persistence)
+    candidate_store = LocalObjectStore(tmp_path / "candidate", bucket_name="task5-candidate")
+    unrelated_store = LocalObjectStore(tmp_path / "unrelated", bucket_name="task5-unrelated")
+    candidate = StorageObjectRegistrar(candidate_store, port).publish(
+        object_id=uuid.uuid4(),
+        object_key=f"candidate/{uuid.uuid4().hex}.parquet",
+        data=BODY,
+        schema_version="1.0.0",
+        row_count=3,
+        period_start=T0,
+        period_end=T0,
+        created_at=T0,
+        verified_at=T0,
+    )
+    unrelated_id = uuid.uuid4()
+
+    def publish_unrelated() -> Any:
+        return StorageObjectRegistrar(unrelated_store, port).publish(
+            object_id=unrelated_id,
+            object_key=f"unrelated/{uuid.uuid4().hex}.parquet",
+            data=OTHER_BODY,
+            schema_version="1.0.0",
+            row_count=3,
+            period_start=T0,
+            period_end=T0,
+            created_at=T0,
+            verified_at=T0,
+        )
+
+    with (
+        ThreadPoolExecutor(max_workers=1) as pool,
+        port.cleanup_batch((candidate.record,)) as locked,
+    ):
+        assert locked == (candidate.record,)
+        unrelated = pool.submit(publish_unrelated).result(timeout=10)
+
+    assert port.find(candidate.record.object_id) is None
+    assert port.find(unrelated_id) == unrelated.record
+    _cleanup_owned_object(port, candidate_store, candidate.record)
+    _cleanup_owned_object(port, unrelated_store, unrelated.record)
+
+
+def _blocked_relation_lock(
+    admin_engine: Engine,
+    *,
+    application_name: str,
+) -> str | None:
+    with admin_engine.connect() as connection:
+        return connection.execute(
+            text(
+                "SELECT namespace.nspname || '.' || relation.relname || ':' || "
+                "locks.mode FROM pg_locks locks "
+                "JOIN pg_stat_activity activity ON activity.pid=locks.pid "
+                "JOIN pg_class relation ON relation.oid=locks.relation "
+                "JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace "
+                "WHERE activity.application_name=:application_name "
+                "AND NOT locks.granted "
+                "ORDER BY namespace.nspname,relation.relname,locks.mode LIMIT 1"
+            ),
+            {"application_name": application_name},
+        ).scalar_one_or_none()
+
+
+def _blocked_backend_lock(
+    admin_engine: Engine,
+    *,
+    application_name: str,
+) -> str | None:
+    with admin_engine.connect() as connection:
+        return connection.execute(
+            text(
+                "SELECT locks.locktype || ':' || locks.mode FROM pg_locks locks "
+                "JOIN pg_stat_activity activity ON activity.pid=locks.pid "
+                "WHERE activity.application_name=:application_name "
+                "AND NOT locks.granted ORDER BY locks.locktype,locks.mode LIMIT 1"
+            ),
+            {"application_name": application_name},
+        ).scalar_one_or_none()
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["add", "drop", "rename"],
+)
+def test_cleanup_serializes_concurrent_storage_fk_ddl(
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    """FK catalog shape cannot change between enumeration and external deletion."""
+
+    port = PersistenceStorageObjectWritePort(persistence)
+    object_store = LocalObjectStore(tmp_path / operation, bucket_name=f"task5-ddl-{operation}")
+    published = StorageObjectRegistrar(object_store, port).publish(
+        object_id=uuid.uuid4(),
+        object_key=f"ddl/{operation}/{uuid.uuid4().hex}.parquet",
+        data=BODY,
+        schema_version="1.0.0",
+        row_count=3,
+        period_start=T0,
+        period_end=T0,
+        created_at=T0,
+        verified_at=T0,
+    )
+    schema = _future_fk_schema(
+        admin_engine,
+        with_constraint=operation != "add",
+    )
+    application_name = f"task5-fk-ddl-{operation}-{uuid.uuid4().hex}"
+    ready = Event()
+    if operation == "add":
+        ddl = (
+            f'ALTER TABLE "{schema}"."future object refs" '
+            'ADD CONSTRAINT "future storage object fk" '
+            'FOREIGN KEY ("storage object id") REFERENCES storage.objects(id)'
+        )
+    elif operation == "drop":
+        ddl = (
+            f'ALTER TABLE "{schema}"."future object refs" '
+            'DROP CONSTRAINT "future storage object fk"'
+        )
+    else:
+        ddl = (
+            f'ALTER TABLE "{schema}"."future object refs" '
+            'RENAME CONSTRAINT "future storage object fk" '
+            'TO "renamed future storage fk"'
+        )
+
+    def mutate_catalog() -> None:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                text("SELECT set_config('application_name', :name, true)"),
+                {"name": application_name},
+            )
+            ready.set()
+            connection.execute(text(ddl))
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = None
+    try:
+        with port.cleanup_batch((published.record,)):
+            future = pool.submit(mutate_catalog)
+            assert ready.wait(timeout=10), "DDL worker never reached its boundary"
+
+            def ddl_state() -> str | None:
+                if future is not None and future.done():
+                    return "completed"
+                mode = _blocked_relation_lock(
+                    admin_engine,
+                    application_name=application_name,
+                )
+                return None if mode is None else f"blocked:{mode}"
+
+            state = wait_until(
+                ddl_state,
+                description=f"{operation} FK DDL to block on cleanup catalog fence",
+                timeout_seconds=10,
+            )
+            assert state.startswith("blocked:"), state
+            assert state.split(":", 2)[1] in {
+                "storage.objects",
+                f"{schema}.future object refs",
+            }
+        assert future is not None
+        future.result(timeout=10)
+    finally:
+        pool.shutdown(wait=True)
+        _drop_test_schema(admin_engine, schema)
+        _cleanup_owned_object(port, object_store, published.record)
+
+
+def test_candidate_row_lock_serializes_a_concurrent_future_fk_insert(
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    """A new reference cannot land after reference scan but before unregister."""
+
+    port = PersistenceStorageObjectWritePort(persistence)
+    object_store = LocalObjectStore(tmp_path / "fk-insert", bucket_name="task5-fk-insert")
+    published = StorageObjectRegistrar(object_store, port).publish(
+        object_id=uuid.uuid4(),
+        object_key=f"fk-insert/{uuid.uuid4().hex}.parquet",
+        data=BODY,
+        schema_version="1.0.0",
+        row_count=3,
+        period_start=T0,
+        period_end=T0,
+        created_at=T0,
+        verified_at=T0,
+    )
+    schema = _future_fk_schema(admin_engine)
+    application_name = f"task5-fk-insert-{uuid.uuid4().hex}"
+    ready = Event()
+
+    def insert_reference() -> None:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                text("SELECT set_config('application_name', :name, true)"),
+                {"name": application_name},
+            )
+            ready.set()
+            connection.execute(
+                text(
+                    f'INSERT INTO "{schema}"."future object refs" '
+                    '("storage object id") VALUES (:object_id)'
+                ),
+                {"object_id": published.record.object_id},
+            )
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = None
+    try:
+        with port.cleanup_batch((published.record,)):
+            future = pool.submit(insert_reference)
+            assert ready.wait(timeout=10), "reference writer never reached its boundary"
+
+            def insert_state() -> str | None:
+                if future is not None and future.done():
+                    return "completed"
+                mode = _blocked_backend_lock(
+                    admin_engine,
+                    application_name=application_name,
+                )
+                return None if mode is None else f"blocked:{mode}"
+
+            state = wait_until(
+                insert_state,
+                description="future FK insert to wait on candidate row fence",
+                timeout_seconds=10,
+            )
+            assert state.startswith("blocked:transactionid:"), state
+        assert future is not None
+        with pytest.raises(IntegrityError):
+            future.result(timeout=10)
+    finally:
+        pool.shutdown(wait=True)
+        _drop_test_schema(admin_engine, schema)
+        _cleanup_owned_object(port, object_store, published.record)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    ["composite", "partition", "inheritance"],
+)
+def test_cleanup_fails_closed_for_unsupported_future_fk_shapes(
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    tmp_path: Path,
+    shape: str,
+) -> None:
+    port = PersistenceStorageObjectWritePort(persistence)
+    object_store = LocalObjectStore(tmp_path / shape, bucket_name=f"task5-shape-{shape}")
+    published = StorageObjectRegistrar(object_store, port).publish(
+        object_id=uuid.uuid4(),
+        object_key=f"shape/{shape}/{uuid.uuid4().hex}.parquet",
+        data=BODY,
+        schema_version="1.0.0",
+        row_count=3,
+        period_start=T0,
+        period_end=T0,
+        created_at=T0,
+        verified_at=T0,
+    )
+    schema = f"task5_fk_{uuid.uuid4().hex}"
+    target_constraint = f"task5_composite_{uuid.uuid4().hex}"
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+            if shape == "composite":
+                connection.execute(
+                    text(
+                        "ALTER TABLE storage.objects "
+                        f'ADD CONSTRAINT "{target_constraint}" '
+                        "UNIQUE (id, storage_provider)"
+                    )
+                )
+                connection.execute(
+                    text(
+                        f'CREATE TABLE "{schema}"."composite refs" ('
+                        '"storage object id" uuid, "provider" varchar(32), '
+                        'CONSTRAINT "composite storage fk" FOREIGN KEY '
+                        '("storage object id", "provider") '
+                        "REFERENCES storage.objects(id, storage_provider))"
+                    )
+                )
+            elif shape == "partition":
+                connection.execute(
+                    text(
+                        f'CREATE TABLE "{schema}"."partition refs" ('
+                        '"storage object id" uuid REFERENCES storage.objects(id), '
+                        '"shard" integer NOT NULL) PARTITION BY HASH ("shard")'
+                    )
+                )
+            else:
+                connection.execute(
+                    text(
+                        f'CREATE TABLE "{schema}"."parent refs" ('
+                        '"storage object id" uuid REFERENCES storage.objects(id))'
+                    )
+                )
+                connection.execute(
+                        text(
+                            f'CREATE TABLE "{schema}"."child refs" ('
+                            f'"marker" integer) INHERITS ("{schema}"."parent refs")'
+                        )
+                    )
+
+        entered_external_delete = False
+        with (
+            pytest.raises(ObjectStoreConflict, match="unsupported"),
+            port.cleanup_batch((published.record,)),
+        ):
+            entered_external_delete = True
+        assert entered_external_delete is False
+        assert port.find(published.record.object_id) == published.record
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            if shape == "composite":
+                connection.execute(
+                    text(
+                        "ALTER TABLE storage.objects "
+                        f'DROP CONSTRAINT IF EXISTS "{target_constraint}"'
+                    )
+                )
+        _cleanup_owned_object(port, object_store, published.record)

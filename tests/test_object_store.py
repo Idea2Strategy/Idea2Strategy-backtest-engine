@@ -1118,6 +1118,35 @@ def test_registry_preflights_every_candidate_before_removing_any_row() -> None:
     assert registry.rows() == tuple(sorted((first, second), key=lambda item: item.object_key))
 
 
+@pytest.mark.parametrize(
+    ("field", "foreign_value"),
+    [
+        ("storage_provider", "FOREIGN_PROVIDER"),
+        ("bucket_name", "foreign-bucket"),
+    ],
+)
+def test_registry_unregister_fences_provider_and_bucket_identity(
+    field: str,
+    foreign_value: str,
+) -> None:
+    registry = InMemoryStorageObjectRegistry()
+    record = _record()
+    registry.register(record)
+    identity = {
+        "storage_provider": record.storage_provider,
+        "bucket_name": record.bucket_name,
+        "object_key": record.object_key,
+        "provider_version_id": record.provider_version_id,
+        "content_hash": record.content_hash,
+    }
+    identity[field] = foreign_value
+
+    with pytest.raises(ObjectStoreConflict):
+        registry.unregister(record.object_id, **identity)
+
+    assert registry.rows() == (record,)
+
+
 def replace_receipt(*, object_key: str, content_hash: str) -> ObjectReceipt:
     return ObjectReceipt(
         storage_provider="S3_COMPATIBLE",

@@ -68,6 +68,7 @@ import sys
 import threading
 import time
 import uuid
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -79,6 +80,7 @@ from sqlalchemy import Engine, text
 
 from backtest_engine.attempt_coordinator import ResourceSample
 from backtest_engine.lifecycle import StaticDatasetManifestSource
+from backtest_engine.object_store import S3ObjectStore
 from backtest_engine.object_store.registration import StorageObjectRegistrar
 from backtest_engine.persistence import (
     BacktestPersistence,
@@ -2098,6 +2100,183 @@ def test_cleanup_exhaustion_is_typed_finite_and_retries_idempotently(
             trade_kind_counts=_trade_kind_counts(admin_engine, run_id),
         )
     )
+
+
+@pytest.mark.parametrize(
+    ("conflict_at", "mismatch", "preexisting"),
+    [
+        (1, "provider", False),
+        (1, "bucket", False),
+        (3, "bucket", False),
+        (1, "provider", True),
+        (3, "bucket", True),
+    ],
+    ids=[
+        "result-provider-new",
+        "result-bucket-new",
+        "partial-promotion-bucket-new",
+        "result-provider-reconciled",
+        "partial-promotion-bucket-reconciled",
+    ],
+)
+def test_registration_conflict_cleans_only_the_new_active_store_versions(
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    sqs: Any,
+    s3: Any,
+    queues: tuple[str, str],
+    bucket: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    conflict_at: int,
+    mismatch: str,
+    preexisting: bool,
+) -> None:
+    scenario = (
+        f"registration-conflict-{conflict_at}-{mismatch}-"
+        f"{'reconciled' if preexisting else 'new'}"
+    )
+    stack = build_stack(
+        persistence=persistence,
+        sqs_client=sqs,
+        s3_client=s3,
+        queues=queues,
+        bucket=bucket,
+        root=tmp_path / scenario,
+    )
+    _request, run_id = _accept_task5(stack, scenario)
+    original_put = S3ObjectStore.put
+    original_register = PersistenceStorageObjectWritePort.register
+    put_calls = 0
+    register_calls = 0
+    foreign_record: Any | None = None
+    preexisting_receipt: Any | None = None
+
+    def reconcile_preexisting_target(
+        self: S3ObjectStore,
+        object_key: str,
+        data: bytes,
+    ) -> Any:
+        nonlocal preexisting_receipt, put_calls
+        put_calls += 1
+        if preexisting and put_calls == conflict_at:
+            content_hash = hashlib.sha256(data).hexdigest()
+            s3.put_object(
+                Bucket=bucket,
+                Key=self.full_key(object_key),
+                Body=data,
+                Metadata={"sha256": content_hash},
+            )
+        receipt = original_put(self, object_key, data)
+        if put_calls == conflict_at:
+            assert receipt.reconciled is preexisting
+            if preexisting:
+                preexisting_receipt = receipt
+        return receipt
+
+    def inject_foreign_registration(
+        self: PersistenceStorageObjectWritePort,
+        record: Any,
+    ) -> uuid.UUID:
+        nonlocal foreign_record, register_calls
+        register_calls += 1
+        if register_calls == conflict_at:
+            foreign_record = replace(
+                record,
+                storage_provider=("LOCAL" if mismatch == "provider" else record.storage_provider),
+                bucket_name=(
+                    f"task5-foreign-{uuid.uuid4().hex}"
+                    if mismatch == "bucket"
+                    else record.bucket_name
+                ),
+            )
+            with persistence.unit_of_work() as uow:
+                inserted, created = uow.objects.register(foreign_record.to_row())
+                assert created
+                uow.objects.mark_available(inserted.id, record.created_at)
+        return original_register(self, record)
+
+    monkeypatch.setattr(
+        S3ObjectStore,
+        "put",
+        reconcile_preexisting_target,
+    )
+    monkeypatch.setattr(
+        PersistenceStorageObjectWritePort,
+        "register",
+        inject_foreign_registration,
+    )
+
+    handled = stack.worker.poll_once()
+
+    assert foreign_record is not None
+    durable_rows = sql_all(
+        admin_engine,
+        "SELECT status,storage_provider,bucket_name,object_key,provider_version_id,"
+        "content_hash FROM storage.objects WHERE id=:id",
+        id=foreign_record.object_id,
+    )
+    assert durable_rows == [
+        {
+            "status": "AVAILABLE",
+            "storage_provider": foreign_record.storage_provider,
+            "bucket_name": foreign_record.bucket_name,
+            "object_key": foreign_record.object_key,
+            "provider_version_id": foreign_record.provider_version_id,
+            "content_hash": foreign_record.content_hash,
+        }
+    ]
+    assert sql_all(
+        admin_engine,
+        "SELECT id FROM storage.objects WHERE object_key LIKE :prefix AND id<>:foreign_id",
+        prefix=f"backtest-results/{run_id}/%",
+        foreign_id=foreign_record.object_id,
+    ) == []
+    stored_keys = [
+        item["Key"]
+        for item in s3.list_objects_v2(
+        Bucket=bucket,
+        Prefix=f"backtest-results/{run_id}/",
+        ).get("Contents", [])
+    ]
+    assert stored_keys == (
+        [foreign_record.object_key]
+        if preexisting
+        else []
+    )
+    if preexisting:
+        assert preexisting_receipt is not None
+        active_store = S3ObjectStore(bucket, client=s3)
+        assert active_store.preflight_delete(
+            preexisting_receipt.object_key,
+            preexisting_receipt.content_hash,
+            preexisting_receipt.provider_version_id,
+        )
+    assert [item.disposition for item in handled] == [MessageDisposition.DEAD_LETTERED]
+    assert [item.reason_code for item in handled] == [
+        "RESULT_PUBLICATION_CLEANUP_CONFLICT"
+    ]
+    assert stack.visible(stack.dead_letter_queue) == 1
+    run = stack.client.get(f"/api/v1/backtests/{run_id}", headers=stack.owner()).json()
+    attempts = stack.client.get(
+        f"/api/v1/backtests/{run_id}/attempts",
+        headers=stack.owner(),
+    ).json()["items"]
+    assert run["status"] == "FAILED"
+    assert run["failureCode"] == "RESULT_PUBLICATION_CLEANUP_CONFLICT"
+    assert [item["failureCode"] for item in attempts] == [
+        "RESULT_PUBLICATION_CLEANUP_CONFLICT"
+    ]
+    assert sql_all(
+        admin_engine,
+        "SELECT run_id FROM backtest.performance_summaries WHERE run_id=:id",
+        id=run_id,
+    ) == []
+    assert sql_all(
+        admin_engine,
+        "SELECT id FROM backtest.detail_manifests WHERE run_id=:id",
+        id=run_id,
+    ) == []
 
 
 def test_cancellation_raced_with_heartbeat_is_observed_at_the_next_replay_checkpoint(

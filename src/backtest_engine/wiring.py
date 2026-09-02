@@ -138,6 +138,7 @@ from .object_store import (
     ObjectStoreConflict,
     StorageObjectRecord,
     StorageObjectRegistrar,
+    StorageObjectUpload,
 )
 from .orchestrator import (
     BacktestJob,
@@ -773,23 +774,16 @@ class PersistenceStorageObjectWritePort:
         """Hold exact row/reference locks through object-store compensation."""
 
         with _as_object_store_conflict(), self._persistence.unit_of_work() as uow:
-            locked_rows = uow.objects.preflight_unregister_unreferenced(
-                tuple(record.to_row() for record in records)
-            )
-            locked = tuple(_record_of(row) for row in locked_rows)
-            yield locked
-            for row in locked_rows:
-                uow.objects.unregister_unreferenced(
-                    row.id,
-                    object_key=row.object_key,
-                    provider_version_id=row.provider_version_id,
-                    content_hash=row.content_hash,
-                )
+            candidates = tuple(record.to_row() for record in records)
+            with uow.objects.cleanup_unreferenced_batch(candidates) as locked_rows:
+                yield tuple(_record_of(row) for row in locked_rows)
 
     def unregister(
         self,
         object_id: uuid.UUID,
         *,
+        storage_provider: str,
+        bucket_name: str,
         object_key: str,
         provider_version_id: str,
         content_hash: str,
@@ -797,6 +791,8 @@ class PersistenceStorageObjectWritePort:
         with _as_object_store_conflict(), self._persistence.unit_of_work() as uow:
             return uow.objects.unregister_unreferenced(
                 object_id,
+                storage_provider=storage_provider,
+                bucket_name=bucket_name,
                 object_key=object_key,
                 provider_version_id=provider_version_id,
                 content_hash=content_hash,
@@ -1280,6 +1276,47 @@ class JobBinding:
         return self.envelope.dataset_manifest_id
 
 
+@dataclass(frozen=True, slots=True)
+class _PublicationArtifact:
+    """Expected durable identity for one object produced by a publication."""
+
+    object_id: uuid.UUID
+    storage_provider: str
+    bucket_name: str
+    object_key: str
+    content_hash: str
+
+    def matches(self, record: StorageObjectRecord) -> bool:
+        return all(
+            (
+                record.object_id == self.object_id,
+                record.storage_provider == self.storage_provider,
+                record.bucket_name == self.bucket_name,
+                record.object_key == self.object_key,
+                record.content_hash == self.content_hash,
+            )
+        )
+
+
+def _same_stored_version(
+    left: StorageObjectRecord,
+    right: StorageObjectRecord,
+) -> bool:
+    """Whether two records name the same exact provider version of the bytes."""
+
+    return all(
+        getattr(left, field) == getattr(right, field)
+        for field in (
+            "object_id",
+            "storage_provider",
+            "bucket_name",
+            "object_key",
+            "provider_version_id",
+            "content_hash",
+        )
+    )
+
+
 class DurableResultPublisher:
     """Writes one completed run's evidence to the object store and PostgreSQL.
 
@@ -1409,13 +1446,18 @@ class DurableResultPublisher:
         self,
         result: ResultSnapshot,
         verified_at: datetime,
+        upload_observer: Callable[[StorageObjectUpload], None],
     ) -> StorageObjectRecord:
         """The result snapshot is an object too, and spec 2.5 wants a row for it."""
         manifest = result.manifest
         instants = [record.occurred_at for record in result.records]
         period_start = min(instants) if instants else manifest.completed_at
         period_end = max(instants) if instants else manifest.completed_at
-        return StorageObjectRegistrar(self._store, self._port).publish(
+        return StorageObjectRegistrar(
+            self._store,
+            self._port,
+            upload_observer=upload_observer,
+        ).publish(
             object_id=uuid.uuid5(
                 _RESULT_OBJECT_NAMESPACE,
                 f"{manifest.run_snapshot_id}|{manifest.content_hash}",
@@ -1437,21 +1479,25 @@ class DurableResultPublisher:
         self,
         result: ResultSnapshot,
         bundle: DetailObjectBundle,
-    ) -> tuple[tuple[uuid.UUID, str, str], ...]:
+    ) -> tuple[_PublicationArtifact, ...]:
         manifest = result.manifest
-        result_object = (
-            uuid.uuid5(
+        result_object = _PublicationArtifact(
+            object_id=uuid.uuid5(
                 _RESULT_OBJECT_NAMESPACE,
                 f"{manifest.run_snapshot_id}|{manifest.content_hash}",
             ),
-            manifest.object_key,
-            manifest.content_hash,
+            storage_provider=self._store.storage_provider,
+            bucket_name=self._store.bucket_name,
+            object_key=manifest.object_key,
+            content_hash=manifest.content_hash,
         )
         detail_objects = tuple(
-            (
-                uuid.UUID(item.descriptor.storage_object_id),
-                item.descriptor.object_key,
-                item.descriptor.content_hash,
+            _PublicationArtifact(
+                object_id=uuid.UUID(item.descriptor.storage_object_id),
+                storage_provider=self._store.storage_provider,
+                bucket_name=self._store.bucket_name,
+                object_key=item.descriptor.object_key,
+                content_hash=item.descriptor.content_hash,
             )
             for item in bundle.objects
         )
@@ -1459,47 +1505,118 @@ class DurableResultPublisher:
 
     def _cleanup_artifacts(
         self,
-        artifacts: Sequence[tuple[uuid.UUID, str, str]],
-        captured: Sequence[StorageObjectRecord] = (),
+        artifacts: Sequence[_PublicationArtifact],
+        captured: Sequence[StorageObjectUpload] = (),
     ) -> None:
         """Preflight the whole exact-version batch, then compensate with retries."""
 
-        captured_by_id = {record.object_id: record for record in captured}
+        captured_by_id: dict[uuid.UUID, StorageObjectUpload] = {}
+        for observed_upload in captured:
+            previous = captured_by_id.get(observed_upload.record.object_id)
+            if previous is not None and not _same_stored_version(
+                previous.record,
+                observed_upload.record,
+            ):
+                raise ResultPublicationError(
+                    "publication cleanup observed conflicting uploaded versions",
+                    retryable=False,
+                    reason_code="RESULT_PUBLICATION_CLEANUP_CONFLICT",
+                )
+            captured_by_id[observed_upload.record.object_id] = observed_upload
         last_failure: BaseException | None = None
         for _attempt in range(3):
             try:
-                records: list[StorageObjectRecord] = []
-                for object_id, object_key, content_hash in artifacts:
-                    record = captured_by_id.get(object_id) or self._port.find(object_id)
-                    if record is None:
-                        if self._store.exists(object_key):
+                registered: list[StorageObjectRecord] = []
+                direct: list[StorageObjectRecord] = []
+                preserved: list[StorageObjectRecord] = []
+                foreign_registration = False
+                for artifact in artifacts:
+                    upload = captured_by_id.get(artifact.object_id)
+                    current = self._port.find(artifact.object_id)
+                    if upload is None:
+                        if current is None:
+                            if self._store.exists(artifact.object_key):
+                                raise ObjectStoreConflict(
+                                    f"object {artifact.object_key} has no durable "
+                                    "provider-version identity"
+                                )
+                            continue
+                        if not artifact.matches(current):
                             raise ObjectStoreConflict(
-                                f"object {object_key} has no durable provider-version identity"
+                                f"storage object {artifact.object_id} no longer matches "
+                                "publication provider, bucket, key, or hash"
                             )
+                        registered.append(current)
                         continue
-                    if record.object_key != object_key or record.content_hash != content_hash:
+
+                    uploaded = upload.record
+                    if not artifact.matches(uploaded):
                         raise ObjectStoreConflict(
-                            f"storage object {object_id} no longer matches publication identity"
+                            f"uploaded object {artifact.object_id} does not match the "
+                            "publication provider, bucket, key, or hash"
                         )
-                    records.append(record)
-                if not records:
-                    return
-                with self._port.cleanup_batch(tuple(records)) as locked:
+                    if (
+                        uploaded.storage_provider != self._store.storage_provider
+                        or uploaded.bucket_name != self._store.bucket_name
+                    ):
+                        raise ObjectStoreConflict(
+                            f"uploaded object {artifact.object_id} is outside the active store"
+                        )
+                    if current is not None and _same_stored_version(current, uploaded):
+                        registered.append(current)
+                        continue
+
+                    # The upload was observed before registration. A conflicting row
+                    # cannot be unregistered, even when id/key/hash happen to agree.
+                    # Only bytes this call actually created can be removed directly.
+                    if not upload.newly_created:
+                        # The active-store version predates this publication. Keep it,
+                        # but include it in whole-batch preflight before compensating
+                        # any earlier objects this call did create and register.
+                        preserved.append(uploaded)
+                        foreign_registration = True
+                        continue
+                    direct.append(uploaded)
+                    if current is not None:
+                        foreign_registration = True
+
+                with self._port.cleanup_batch(tuple(registered)) as locked:
+                    locked_by_id = {record.object_id: record for record in locked}
+                    if set(locked_by_id) != {record.object_id for record in registered}:
+                        raise ObjectStoreConflict(
+                            "a registered publication artifact vanished before cleanup"
+                        )
+                    delete_candidates = tuple(locked) + tuple(direct)
+                    preflight_candidates = delete_candidates + tuple(preserved)
                     present = tuple(
                         self._store.preflight_delete(
                             record.object_key,
                             record.content_hash,
                             record.provider_version_id,
                         )
-                        for record in locked
+                        for record in preflight_candidates
                     )
-                    for record, exists_exactly in zip(locked, present, strict=True):
+                    preserved_present = present[len(delete_candidates) :]
+                    if not all(preserved_present):
+                        raise ObjectStoreConflict(
+                            "a reconciled pre-existing publication artifact changed "
+                            "before cleanup"
+                        )
+                    for record, exists_exactly in zip(
+                        delete_candidates,
+                        present[: len(delete_candidates)],
+                        strict=True,
+                    ):
                         if exists_exactly:
                             self._store.delete_if_matches(
                                 record.object_key,
                                 record.content_hash,
                                 record.provider_version_id,
                             )
+                if foreign_registration:
+                    raise ObjectStoreConflict(
+                        "a foreign provider or bucket registration owns a publication object id"
+                    )
                 return
             except ObjectStoreConflict as exc:
                 raise ResultPublicationError(
@@ -1559,7 +1676,7 @@ class DurableResultPublisher:
         performance = result.performance_row()
         bundle_id = binding.envelope.input_bundle_id
         artifacts = self._artifact_identities(result, bundle)
-        captured: list[StorageObjectRecord] = []
+        captured: list[StorageObjectUpload] = []
         cancellation_reason: str | None = None
         published: PublishedDetails | None = None
         try:
@@ -1589,12 +1706,16 @@ class DurableResultPublisher:
                         cancelled_run.cancellation_reason_code or "USER_CANCELLED"
                     )
                 else:
-                    captured.append(self._publish_result_object(result, completed_at))
+                    self._publish_result_object(
+                        result,
+                        completed_at,
+                        captured.append,
+                    )
                     published = DetailObjectPublisher(
                         self._store,
                         storage_write_port=self._port,
+                        upload_observer=captured.append,
                     ).publish(bundle, verified_at=completed_at)
-                    captured.extend(published.storage_object_records())
                     uow.inputs.lock(
                         InputBundleRow(
                             id=bundle_id,

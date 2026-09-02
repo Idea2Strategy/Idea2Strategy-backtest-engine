@@ -52,7 +52,7 @@ persistence package and one binding changes; no call site does. Nothing here aut
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -74,6 +74,7 @@ __all__ = [
     "RegisteredObject",
     "StorageObjectRecord",
     "StorageObjectRegistrar",
+    "StorageObjectUpload",
     "StorageObjectWritePort",
     "UnauthorizedStorageObjectWritePort",
 ]
@@ -309,6 +310,8 @@ class StorageObjectWritePort(Protocol):
         self,
         object_id: UUID,
         *,
+        storage_provider: str,
+        bucket_name: str,
         object_key: str,
         provider_version_id: str,
         content_hash: str,
@@ -358,6 +361,8 @@ class UnauthorizedStorageObjectWritePort:
         self,
         object_id: UUID,
         *,
+        storage_provider: str,
+        bucket_name: str,
         object_key: str,
         provider_version_id: str,
         content_hash: str,
@@ -509,6 +514,8 @@ class InMemoryStorageObjectRegistry:
         self,
         object_id: UUID,
         *,
+        storage_provider: str,
+        bucket_name: str,
         object_key: str,
         provider_version_id: str,
         content_hash: str,
@@ -522,7 +529,14 @@ class InMemoryStorageObjectRegistry:
                     f"refusing to unregister storage object {object_id} with a "
                     "different provider version"
                 )
-            if current.object_key != object_key or current.content_hash != content_hash:
+            if any(
+                (
+                    current.storage_provider != storage_provider,
+                    current.bucket_name != bucket_name,
+                    current.object_key != object_key,
+                    current.content_hash != content_hash,
+                )
+            ):
                 raise ObjectStoreConflict(
                     f"refusing to unregister changed storage object {object_id}"
                 )
@@ -551,12 +565,31 @@ class RegisteredObject:
     record: StorageObjectRecord
 
 
+@dataclass(frozen=True, slots=True)
+class StorageObjectUpload:
+    """Exact candidate identity observed after upload and before registration."""
+
+    receipt: ObjectReceipt
+    record: StorageObjectRecord
+
+    @property
+    def newly_created(self) -> bool:
+        return not self.receipt.reconciled
+
+
 class StorageObjectRegistrar:
     """Publish bytes and register the single `storage.objects` row for them."""
 
-    def __init__(self, store: ObjectStore, port: StorageObjectWritePort) -> None:
+    def __init__(
+        self,
+        store: ObjectStore,
+        port: StorageObjectWritePort,
+        *,
+        upload_observer: Callable[[StorageObjectUpload], None] | None = None,
+    ) -> None:
         self._store = store
         self._port = port
+        self._upload_observer = upload_observer
 
     @property
     def store(self) -> ObjectStore:
@@ -612,6 +645,8 @@ class StorageObjectRegistrar:
             retention_until=retention_until,
             legal_hold=legal_hold,
         )
+        if self._upload_observer is not None:
+            self._upload_observer(StorageObjectUpload(receipt=receipt, record=staged))
         registered_id = self._port.register(staged)
 
         check = self._store.verify(object_key, receipt.content_hash, deep=True)

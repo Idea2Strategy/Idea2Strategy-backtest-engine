@@ -37,6 +37,7 @@ from .registration import (
     RegisteredObject,
     StorageObjectRecord,
     StorageObjectRegistrar,
+    StorageObjectUpload,
     StorageObjectWritePort,
     UnauthorizedStorageObjectWritePort,
 )
@@ -67,6 +68,7 @@ __all__ = [
     "Sleeper",
     "StorageObjectRecord",
     "StorageObjectRegistrar",
+    "StorageObjectUpload",
     "StorageObjectWritePort",
     "StorageWriteNotAuthorized",
     "UnauthorizedStorageObjectWritePort",
