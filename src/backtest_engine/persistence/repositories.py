@@ -20,15 +20,16 @@ controls they are:
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import Connection, Row, Select, case, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import DBAPIError
 
 from .errors import (
     AttemptNumberConflict,
@@ -88,186 +89,33 @@ __all__ = [
 ]
 
 
-@dataclass(frozen=True, slots=True)
-class _StorageObjectForeignKey:
-    """One live PostgreSQL FK whose target relation is ``storage.objects``."""
-
-    constraint_oid: int
-    constraint_name: str
-    source_oid: int
-    source_schema: str
-    source_table: str
-    source_relkind: str
-    source_is_partition: bool
-    source_has_inheritance: bool
-    source_columns: tuple[str, ...]
-    target_relkind: str
-    target_is_partition: bool
-    target_has_inheritance: bool
-    target_columns: tuple[str, ...]
-    validated: bool
-    deferrable: bool
-
-    @property
-    def source_label(self) -> str:
-        columns = ",".join(self.source_columns)
-        return (
-            f"{self.source_schema}.{self.source_table}.{columns} "
-            f"(constraint {self.constraint_name})"
-        )
-
-
-_STORAGE_OBJECT_FOREIGN_KEYS = text(
-    "SELECT fk.oid AS constraint_oid,fk.conname AS constraint_name,"
-    "source.oid AS source_oid,source_ns.nspname AS source_schema,"
-    "source.relname AS source_table,source.relkind AS source_relkind,"
-    "source.relispartition AS source_is_partition,"
-    "EXISTS (SELECT 1 FROM pg_inherits inheritance "
-    "WHERE inheritance.inhrelid=source.oid OR inheritance.inhparent=source.oid) "
-    "AS source_has_inheritance,"
-    "ARRAY(SELECT source_column.attname FROM unnest(fk.conkey) "
-    "WITH ORDINALITY AS source_key(attnum,ordinality) "
-    "JOIN pg_attribute source_column ON source_column.attrelid=source.oid "
-    "AND source_column.attnum=source_key.attnum ORDER BY source_key.ordinality) "
-    "AS source_columns,"
-    "target.relkind AS target_relkind,target.relispartition AS target_is_partition,"
-    "EXISTS (SELECT 1 FROM pg_inherits inheritance "
-    "WHERE inheritance.inhrelid=target.oid OR inheritance.inhparent=target.oid) "
-    "AS target_has_inheritance,"
-    "ARRAY(SELECT target_column.attname FROM unnest(fk.confkey) "
-    "WITH ORDINALITY AS target_key(attnum,ordinality) "
-    "JOIN pg_attribute target_column ON target_column.attrelid=target.oid "
-    "AND target_column.attnum=target_key.attnum ORDER BY target_key.ordinality) "
-    "AS target_columns,fk.convalidated AS validated,fk.condeferrable AS deferrable "
-    "FROM pg_constraint fk "
-    "JOIN pg_class source ON source.oid=fk.conrelid "
-    "JOIN pg_namespace source_ns ON source_ns.oid=source.relnamespace "
-    "JOIN pg_class target ON target.oid=fk.confrelid "
-    "JOIN pg_namespace target_ns ON target_ns.oid=target.relnamespace "
-    "WHERE fk.contype='f' AND target_ns.nspname='storage' "
-    "AND target.relname='objects' "
-    "ORDER BY source_ns.nspname,source.relname,fk.conname,fk.oid"
+_PREPARE_BACKTEST_OBJECT_CLEANUP = text(
+    "SELECT * FROM storage.prepare_backtest_object_cleanup(CAST(:candidates AS jsonb))"
 )
 
 
-def _storage_object_foreign_keys(
-    connection: Connection,
-) -> tuple[_StorageObjectForeignKey, ...]:
-    return tuple(
-        _StorageObjectForeignKey(
-            constraint_oid=int(row["constraint_oid"]),
-            constraint_name=str(row["constraint_name"]),
-            source_oid=int(row["source_oid"]),
-            source_schema=str(row["source_schema"]),
-            source_table=str(row["source_table"]),
-            source_relkind=str(row["source_relkind"]),
-            source_is_partition=bool(row["source_is_partition"]),
-            source_has_inheritance=bool(row["source_has_inheritance"]),
-            source_columns=tuple(str(value) for value in row["source_columns"]),
-            target_relkind=str(row["target_relkind"]),
-            target_is_partition=bool(row["target_is_partition"]),
-            target_has_inheritance=bool(row["target_has_inheritance"]),
-            target_columns=tuple(str(value) for value in row["target_columns"]),
-            validated=bool(row["validated"]),
-            deferrable=bool(row["deferrable"]),
-        )
-        for row in connection.execute(_STORAGE_OBJECT_FOREIGN_KEYS).mappings()
+def _cleanup_candidate_payload(candidates: Sequence[StorageObjectRow]) -> str:
+    return json.dumps(
+        [
+            {
+                "object_id": str(candidate.id),
+                "storage_provider": candidate.storage_provider,
+                "bucket_name": candidate.bucket_name,
+                "object_key": candidate.object_key,
+                "provider_version_id": candidate.provider_version_id,
+                "content_hash": candidate.content_hash,
+            }
+            for candidate in candidates
+        ],
+        separators=(",", ":"),
+        sort_keys=True,
     )
 
 
-def _validate_storage_object_foreign_keys(
-    references: Sequence[_StorageObjectForeignKey],
-) -> None:
-    for reference in references:
-        unsupported = (
-            len(reference.source_columns) != 1
-            or reference.target_columns != ("id",)
-            or reference.source_relkind != "r"
-            or reference.source_is_partition
-            or reference.source_has_inheritance
-            or reference.target_relkind != "r"
-            or reference.target_is_partition
-            or reference.target_has_inheritance
-        )
-        if unsupported:
-            raise PublishConflict(
-                "unsupported storage.objects foreign-key shape at "
-                f"{reference.source_label}; cleanup fails closed"
-            )
-
-
-def _quoted_relation(
-    connection: Connection,
-    schema: str,
-    table: str,
-) -> str:
-    preparer = connection.dialect.identifier_preparer
-    return f"{preparer.quote_schema(schema)}.{preparer.quote(table)}"
-
-
-def _lock_storage_object_reference_catalog(
-    connection: Connection,
-) -> tuple[_StorageObjectForeignKey, ...]:
-    """Freeze the FK set and every referring relation through compensation."""
-
-    connection.execute(
-        text("LOCK TABLE storage.objects IN SHARE UPDATE EXCLUSIVE MODE")
-    )
-    before = _storage_object_foreign_keys(connection)
-    _validate_storage_object_foreign_keys(before)
-    sources = sorted(
-        {(item.source_schema, item.source_table) for item in before}
-    )
-    if sources:
-        qualified = ",".join(
-            _quoted_relation(connection, schema, table)
-            for schema, table in sources
-        )
-        connection.execute(text(f"LOCK TABLE {qualified} IN ACCESS SHARE MODE"))
-    after = _storage_object_foreign_keys(connection)
-    _validate_storage_object_foreign_keys(after)
-    if before != after:
-        raise PublishConflict(
-            "storage.objects foreign-key catalog changed while cleanup acquired locks"
-        )
-    return after
-
-
-def _storage_object_reference_sources(
-    connection: Connection,
-    references: Sequence[_StorageObjectForeignKey],
-    object_ids: Sequence[UUID],
-) -> dict[UUID, str]:
-    found: dict[UUID, str] = {}
-    if not object_ids:
-        return found
-    preparer = connection.dialect.identifier_preparer
-    for reference in references:
-        column = preparer.quote(reference.source_columns[0])
-        relation = _quoted_relation(
-            connection,
-            reference.source_schema,
-            reference.source_table,
-        )
-        rows = connection.execute(
-            text(
-                f"SELECT DISTINCT ref.{column} AS object_id FROM {relation} AS ref "
-                f"WHERE ref.{column}=ANY(CAST(:object_ids AS uuid[]))"
-            ),
-            {"object_ids": list(object_ids)},
-        ).scalars()
-        for object_id in rows:
-            found.setdefault(object_id, reference.source_label)
-    return found
-
-
-_DELETE_STORAGE_OBJECT = text(
-    "DELETE FROM storage.objects AS o "
-    "WHERE o.id=:object_id AND o.storage_provider=:storage_provider "
-    "AND o.bucket_name=:bucket_name AND o.object_key=:object_key "
-    "AND o.provider_version_id=:provider_version_id "
-    "AND o.content_hash=:content_hash RETURNING o.id"
-)
+def _cleanup_failure_message(exc: DBAPIError) -> str:
+    diagnostic = getattr(exc.orig, "diag", None)
+    primary = getattr(diagnostic, "message_primary", None)
+    return str(primary or exc.orig).splitlines()[0]
 
 
 _ENUM_FIELDS: dict[type, dict[str, type]] = {
@@ -1522,64 +1370,25 @@ class StorageObjectRepository(StorageObjectReader):
                 current.content_hash != content_hash,
             )
         ):
-            raise PublishConflict(
-                f"refusing to unregister changed storage object {object_id}"
-            )
+            raise PublishConflict(f"refusing to unregister changed storage object {object_id}")
         locked = self.preflight_unregister_unreferenced((current,))
-        if not locked:
-            return False
-        return self._delete_preflighted(locked[0])
-
-    def _delete_preflighted(self, current: StorageObjectRow) -> bool:
-        """Delete one exact row after this transaction acquired all fences."""
-
-        removed = self._connection.execute(
-            _DELETE_STORAGE_OBJECT,
-            {
-                "object_id": current.id,
-                "storage_provider": current.storage_provider,
-                "bucket_name": current.bucket_name,
-                "object_key": current.object_key,
-                "provider_version_id": current.provider_version_id,
-                "content_hash": current.content_hash,
-            },
-        ).scalar_one_or_none()
-        if removed is not None:
-            return True
-        after = self.find(current.id)
-        if after is None:
-            return False
-        if after.provider_version_id != current.provider_version_id:
-            raise PublishConflict(
-                f"refusing to unregister storage object {current.id} with a different provider version"
-            )
-        if any(
-            getattr(after, field) != getattr(current, field)
-            for field in (
-                "storage_provider",
-                "bucket_name",
-                "object_key",
-                "content_hash",
-            )
-        ):
-            raise PublishConflict(
-                f"refusing to unregister changed storage object {current.id}"
-            )
-        raise PublishConflict(
-            f"storage object {current.id} changed during compensation"
-        )
+        return bool(locked)
 
     @contextmanager
     def cleanup_unreferenced_batch(
         self,
         candidates: Sequence[StorageObjectRow],
     ) -> Iterator[tuple[StorageObjectRow, ...]]:
-        """Own preflight, external gate, and exact deletes in one transaction."""
+        """Delete transactionally, then hold every fence through the external gate.
+
+        The SECURITY DEFINER capability performs the row DELETE before returning.
+        Nothing commits until this context exits: an external-store exception rolls
+        the row deletion back, and a database rejection cannot arrive after bytes
+        have already disappeared.
+        """
 
         locked = self.preflight_unregister_unreferenced(candidates)
         yield locked
-        for current in locked:
-            self._delete_preflighted(current)
 
     def preflight_unregister_unreferenced(
         self,
@@ -1592,23 +1401,25 @@ class StorageObjectRepository(StorageObjectReader):
         for candidate in candidates:
             previous = by_id.get(candidate.id)
             if previous is not None and previous != candidate:
-                raise PublishConflict(
-                    f"cleanup batch offers conflicting identities for storage object {candidate.id}"
-                )
+                raise PublishConflict(f"cleanup batch offers conflicting identities for storage object {candidate.id}")
             by_id[candidate.id] = candidate
         if not by_id:
             return ()
-        references = _lock_storage_object_reference_catalog(self._connection)
-        rows = self._connection.execute(
-            select(storage_objects)
-            .where(storage_objects.c.id.in_(sorted(by_id, key=str)))
-            .order_by(storage_objects.c.id)
-            .with_for_update()
-        ).mappings()
-        current_by_id = {
-            row["id"]: _hydrate(StorageObjectRow, row)
-            for row in rows
-        }
+        try:
+            rows = self._connection.execute(
+                _PREPARE_BACKTEST_OBJECT_CLEANUP,
+                {"candidates": _cleanup_candidate_payload(tuple(by_id.values()))},
+            ).mappings()
+            current_by_id = {row["id"]: _hydrate(StorageObjectRow, row) for row in rows}
+        except DBAPIError as exc:
+            raise PublishConflict(_cleanup_failure_message(exc)) from exc
+
+        unexpected = set(current_by_id).difference(by_id)
+        if unexpected:
+            raise PublishConflict(
+                "cleanup capability returned storage objects that were not offered: "
+                f"{sorted(str(value) for value in unexpected)}"
+            )
         for candidate in candidates:
             if any(item.id == candidate.id for item in ordered):
                 continue
@@ -1628,21 +1439,8 @@ class StorageObjectRepository(StorageObjectReader):
                     "content_hash",
                 )
             ):
-                raise PublishConflict(
-                    f"refusing to unregister changed storage object {candidate.id}"
-                )
+                raise PublishConflict(f"refusing to unregister changed storage object {candidate.id}")
             ordered.append(current)
-        reference_sources = _storage_object_reference_sources(
-            self._connection,
-            references,
-            tuple(item.id for item in ordered),
-        )
-        for candidate in ordered:
-            reference = reference_sources.get(candidate.id)
-            if reference is not None:
-                raise PublishConflict(
-                    f"storage object {candidate.id} is referenced by {reference}"
-                )
         return tuple(ordered)
 
     def _transition(

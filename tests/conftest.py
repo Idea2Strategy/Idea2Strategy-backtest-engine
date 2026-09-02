@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import pytest
-from sqlalchemy import Connection, Engine, create_engine
+from sqlalchemy import Connection, Engine, create_engine, event, text
 
 from backtest_engine.persistence import BacktestPersistence, create_backtest_engine
 
@@ -163,8 +163,53 @@ def _apply_canonical_migrations(url: str) -> None:
     DDL, which `test_runtime_no_ddl.py` asserts.
     """
 
-    ordered = migration_files() + contributed_migration_files()
+    ordered = sorted(
+        migration_files() + contributed_migration_files(),
+        key=lambda path: int(_VERSION.match(path.name).group("version")),  # type: ignore[union-attr]
+    )
     _execute_scripts(url, [path.read_text(encoding="utf-8") for path in ordered])
+    _apply_backtest_runtime_role(url)
+
+
+def _apply_backtest_runtime_role(url: str) -> None:
+    """Install the cleanup-relevant slice of the generated production ACL.
+
+    The central assembler generates ``R__database_runtime_grants.sql`` at build time,
+    so there is intentionally no checked-in repeatable SQL file to vendor beside the
+    versioned migrations.  These statements reproduce the canonical role name and the
+    exact ``storage.objects`` table privileges from ``DatabaseAccessPolicy``.  The
+    capability grant is conditional so a regression run against the pre-migration
+    bundle fails in the owner test, rather than in fixture setup.
+    """
+
+    _execute_scripts(
+        url,
+        [
+            """
+            DO $$ BEGIN
+              IF NOT EXISTS (
+                SELECT 1 FROM pg_roles WHERE rolname = 'idea2strategy_backtest'
+              ) THEN
+                CREATE ROLE idea2strategy_backtest NOLOGIN;
+              END IF;
+            END $$;
+            ALTER ROLE idea2strategy_backtest
+              NOLOGIN NOCREATEDB NOCREATEROLE NOINHERIT;
+            GRANT USAGE ON SCHEMA storage TO idea2strategy_backtest;
+            GRANT SELECT, INSERT, UPDATE ON TABLE storage.objects
+              TO idea2strategy_backtest;
+            DO $$ BEGIN
+              IF to_regprocedure(
+                'storage.prepare_backtest_object_cleanup(jsonb)'
+              ) IS NOT NULL THEN
+                GRANT EXECUTE ON FUNCTION
+                  storage.prepare_backtest_object_cleanup(jsonb)
+                  TO idea2strategy_backtest;
+              END IF;
+            END $$;
+            """
+        ],
+    )
 
 
 def _apply_reference_seed(url: str) -> None:
@@ -243,6 +288,40 @@ def runtime_engine(postgres_url: str) -> Iterator[Engine]:
         yield engine
     finally:
         engine.dispose()
+
+
+@pytest.fixture(scope="session")
+def backtest_role_engine(postgres_url: str) -> Iterator[Engine]:
+    """The guarded engine with every physical connection set to the runtime role."""
+
+    engine = create_backtest_engine(
+        postgres_url,
+        application_name="task5-production-backtest-role",
+    )
+
+    @event.listens_for(engine, "checkout")
+    def _set_canonical_role(
+        dbapi_connection: Any,
+        _connection_record: Any,
+        _connection_proxy: Any,
+    ) -> None:
+        # SQLAlchemy rolls an idle DBAPI connection back when it returns to the
+        # pool.  SET ROLE is therefore repeated on every checkout: no later test
+        # can silently inherit the container superuser after that rollback.
+        with dbapi_connection.cursor() as cursor:
+            cursor.execute("SET ROLE idea2strategy_backtest")
+
+    try:
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT current_user")) == "idea2strategy_backtest"
+        yield engine
+    finally:
+        engine.dispose()
+
+
+@pytest.fixture
+def backtest_role_persistence(backtest_role_engine: Engine) -> BacktestPersistence:
+    return BacktestPersistence(backtest_role_engine)
 
 
 @pytest.fixture
