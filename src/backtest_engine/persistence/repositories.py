@@ -105,9 +105,7 @@ _CLOSE_RUN_ATTEMPT = text(
     "SELECT * FROM backtest.close_run_attempt("
     ":attempt_id, :claim_token, :status, :terminal_reason_code, :failure_code, :requeue)"
 )
-_REGISTER_BACKTEST_OBJECT = text(
-    "SELECT * FROM storage.register_backtest_object(CAST(:object_document AS jsonb))"
-)
+_REGISTER_BACKTEST_OBJECT = text("SELECT * FROM storage.register_backtest_object(CAST(:object_document AS jsonb))")
 _TRANSITION_BACKTEST_OBJECT = text(
     "SELECT * FROM storage.transition_backtest_object(:object_id, :target, :transitioned_at)"
 )
@@ -532,28 +530,36 @@ class RunAttemptRepository(_Repository):
             raise ValueError("worker_id and execution_key must not be blank")
         if lease_duration <= timedelta(0):
             raise ValueError("lease_duration must be positive")
-        inserted = self._connection.execute(
-            _CLAIM_RUN_ATTEMPT,
-            {
-                "run_id": run_id,
-                "worker_id": worker_id,
-                "execution_key": execution_key,
-                "lease_milliseconds": _lease_milliseconds(lease_duration),
-            },
-        ).mappings().first()
+        inserted = (
+            self._connection.execute(
+                _CLAIM_RUN_ATTEMPT,
+                {
+                    "run_id": run_id,
+                    "worker_id": worker_id,
+                    "execution_key": execution_key,
+                    "lease_milliseconds": _lease_milliseconds(lease_duration),
+                },
+            )
+            .mappings()
+            .first()
+        )
         return None if inserted is None else _hydrate(RunAttemptRow, inserted)
 
     def heartbeat_fenced(self, attempt_id: UUID, claim_token: UUID, *, lease_duration: timedelta) -> RunAttemptRow:
         if lease_duration <= timedelta(0):
             raise ValueError("lease_duration must be positive")
-        updated = self._connection.execute(
-            _HEARTBEAT_RUN_ATTEMPT,
-            {
-                "attempt_id": attempt_id,
-                "claim_token": claim_token,
-                "lease_milliseconds": _lease_milliseconds(lease_duration),
-            },
-        ).mappings().first()
+        updated = (
+            self._connection.execute(
+                _HEARTBEAT_RUN_ATTEMPT,
+                {
+                    "attempt_id": attempt_id,
+                    "claim_token": claim_token,
+                    "lease_milliseconds": _lease_milliseconds(lease_duration),
+                },
+            )
+            .mappings()
+            .first()
+        )
         if updated is None:
             raise StaleAttemptClaim("heartbeat matched no live attempt claim")
         return _hydrate(RunAttemptRow, updated)
@@ -607,17 +613,21 @@ class RunAttemptRepository(_Repository):
     ) -> RunAttemptRow:
         if status in (WorkStatus.PENDING, WorkStatus.RUNNING):
             raise ValueError("close_fenced requires a terminal status")
-        updated = self._connection.execute(
-            _CLOSE_RUN_ATTEMPT,
-            {
-                "attempt_id": attempt_id,
-                "claim_token": claim_token,
-                "status": status.value,
-                "terminal_reason_code": terminal_reason_code,
-                "failure_code": failure_code,
-                "requeue": requeue,
-            },
-        ).mappings().first()
+        updated = (
+            self._connection.execute(
+                _CLOSE_RUN_ATTEMPT,
+                {
+                    "attempt_id": attempt_id,
+                    "claim_token": claim_token,
+                    "status": status.value,
+                    "terminal_reason_code": terminal_reason_code,
+                    "failure_code": failure_code,
+                    "requeue": requeue,
+                },
+            )
+            .mappings()
+            .first()
+        )
         if updated is None:
             raise StaleAttemptClaim("terminal mutation matched no live attempt claim")
         return _hydrate(RunAttemptRow, updated)
