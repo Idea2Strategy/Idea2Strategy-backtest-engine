@@ -51,6 +51,53 @@ def test_worker_correlation_id_is_normalized_to_the_result_event_uuid_format() -
     ) == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
 
+def test_production_worker_passes_a_monitor_factory_for_each_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    policy = SimpleNamespace(
+        attempt=object(),
+        microstructure=object(),
+        fractional=object(),
+        risk_limits=object(),
+    )
+
+    class Monitor:
+        pass
+
+    class Handler:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(production, "ProcessResourceMonitor", Monitor)
+    monkeypatch.setattr(production, "OrchestratorJobHandler", Handler)
+    monkeypatch.setattr(production, "load_runtime_policy", lambda _path: policy)
+    monkeypatch.setattr(production, "_engine", lambda _environ: object())
+    monkeypatch.setattr(production, "BacktestPersistence", lambda _engine: object())
+    monkeypatch.setattr(production, "execution_policy_catalog", lambda _environ: object())
+    monkeypatch.setattr(production, "PostgresCompiledPlanSource", lambda _engine: object())
+    monkeypatch.setattr(production, "PostgresDatasetManifestSource", lambda _engine: object())
+    monkeypatch.setattr(production, "PostgresFeatureMaterializationSource", lambda _engine: object())
+    monkeypatch.setattr(production, "_feature_object_reader", lambda _environ: object())
+    monkeypatch.setattr(production, "_market_reader", lambda _environ: object())
+    monkeypatch.setattr(production, "s3_object_store", lambda _environ: object())
+    monkeypatch.setattr(production, "PersistenceStorageObjectWritePort", lambda _persistence: object())
+    monkeypatch.setattr(production, "HttpResultSink", lambda *_args, **_kwargs: object())
+
+    handler = orchestrator_job_handler(
+        {
+            "BACKTEST_WORKER_CORRELATION_ID": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "BACKTEST_RUNTIME_POLICY_FILE": "runtime-policy.json",
+            "BACKTEST_API_BASE_URL": "http://backtest-api",
+            "BACKTEST_RESULT_INGEST_TOKEN": "test-only-token",
+        }
+    )
+
+    assert isinstance(handler, Handler)
+    assert captured["monitor"] is Monitor
+    assert captured["monitor"]() is not captured["monitor"]()  # type: ignore[operator]
+
+
 def test_worker_wall_clock_advances_from_monotonic_elapsed_time() -> None:
     ticks = iter((100.0, 102.5, 102.0, 104.0))
     anchor = datetime(2026, 8, 25, 13, 0, tzinfo=UTC)

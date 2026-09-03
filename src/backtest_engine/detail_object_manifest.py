@@ -41,7 +41,7 @@ import hashlib
 import json
 import re
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -63,8 +63,10 @@ from backtest_engine.object_store import (
     ObjectStore,
     ObjectStoreError,
     ObjectVerificationError,
+    StorageObjectProducerClaim,
     StorageObjectRecord,
     StorageObjectRegistrar,
+    StorageObjectUpload,
     StorageObjectWritePort,
     StorageWriteNotAuthorized,
 )
@@ -1027,10 +1029,22 @@ class DetailObjectPublisher:
     and `storage` ownership is still unresolved — that one fails closed.
     """
 
-    def __init__(self, store: ObjectStore, *, storage_write_port: StorageObjectWritePort) -> None:
+    def __init__(
+        self,
+        store: ObjectStore,
+        *,
+        storage_write_port: StorageObjectWritePort,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        upload_observer: Callable[[StorageObjectUpload], None] | None = None,
+    ) -> None:
         self._store = store
         self._write_port = storage_write_port
-        self._registrar = StorageObjectRegistrar(store, storage_write_port)
+        self._registrar = StorageObjectRegistrar(
+            store,
+            storage_write_port,
+            producer_claim=producer_claim,
+            upload_observer=upload_observer,
+        )
 
     @property
     def store(self) -> ObjectStore:

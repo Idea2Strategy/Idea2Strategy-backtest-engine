@@ -1040,6 +1040,17 @@ class BacktestLifecycleService:
             reason_code=reason,
             requested_at=requested_at or datetime.now(timezone.utc),
         )
+        if row.status in {
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.UNAVAILABLE,
+        }:
+            # The initial owner read is intentionally lock-free. Publication may
+            # win after that read but before the gateway acquires the run lock;
+            # do not report a cancellation request the locked row never accepted.
+            raise InvalidStatusTransition(
+                f"backtest run {run_id} is already {row.status.value}"
+            )
         return self._load(row)
 
     def request_deletion(

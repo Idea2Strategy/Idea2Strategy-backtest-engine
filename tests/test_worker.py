@@ -16,7 +16,6 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-import os
 import threading
 import time
 import uuid
@@ -27,10 +26,16 @@ from typing import Any
 
 import boto3
 import pytest
+from sqlalchemy import Engine, text
 
 from backtest_engine import worker as worker_module
+from backtest_engine.persistence import BacktestPersistence, RunLane
+from backtest_engine.recovery import QueueDispatchPolicy, StaleRunRecovery
+from backtest_engine.wiring import PersistenceExecutionKeyStore
 from backtest_engine.worker import (
     WORKER_EXECUTION_KEY_MAX_LENGTH,
+    BacktestLane,
+    BacktestLaneScheduler,
     BacktestWorker,
     ExecutionRecordStatus,
     InMemoryExecutionKeyStore,
@@ -43,11 +48,64 @@ from backtest_engine.worker import (
     _runtime_sqs_client,
     worker_execution_key_for,
 )
+from d_task5_chaos import (
+    ResourcePeakObserver,
+    canonical_digest,
+    evidence_result,
+    record_evidence,
+    task5_run_id,
+    wait_until,
+)
+from persistence.support import make_run
 
 
-SQS_ENDPOINT = os.environ.get("BACKTEST_TEST_SQS_ENDPOINT", "http://127.0.0.1:24566")
 RUN_ID = "55555555-5555-4555-8555-555555555555"
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def test_task5_receipt_rejects_an_input_hash_mirrored_as_the_result_identity() -> None:
+    digest = "a" * 64
+
+    with pytest.raises(ValueError, match="independent"):
+        evidence_result(
+            scenario="task5-evidence-mirrored-hash",
+            terminal_state="FAILED",
+            duration_seconds=1.0,
+            run_id=RUN_ID,
+            attempt_lineage=("no-attempt",),
+            observations={},
+            input_fingerprint=f"sha256:{digest}",
+            result_hash=digest,
+        )
+
+
+def test_task5_receipt_rejects_a_zero_observed_duration() -> None:
+    with pytest.raises(ValueError, match="positive"):
+        evidence_result(
+            scenario="task5-evidence-zero-duration",
+            terminal_state="FAILED",
+            duration_seconds=0,
+            run_id=RUN_ID,
+            attempt_lineage=("no-attempt",),
+            observations={},
+            input_fingerprint=f"sha256:{'a' * 64}",
+            result_hash="b" * 64,
+        )
+
+
+def test_task5_receipt_rejects_resource_peaks_not_observed_at_a_boundary() -> None:
+    with pytest.raises(TypeError, match="observed"):
+        evidence_result(
+            scenario="task5-evidence-unobserved-resource",
+            terminal_state="FAILED",
+            duration_seconds=1.0,
+            run_id=RUN_ID,
+            attempt_lineage=("no-attempt",),
+            observations={},
+            input_fingerprint=f"sha256:{'a' * 64}",
+            result_hash="b" * 64,
+            resource_peak={"memory_bytes": 4096},
+        )
 
 
 @pytest.mark.parametrize(
@@ -232,46 +290,8 @@ def test_configuration_is_validated(overrides: dict[str, Any], message: str) -> 
 
 
 # ==========================================================================
-# LocalStack SQS
+# LocalStack SQS (the shared fixture owns an isolated Testcontainers LocalStack)
 # ==========================================================================
-
-
-def _sqs_client() -> Any:
-    import boto3
-
-    return boto3.client(
-        "sqs",
-        endpoint_url=SQS_ENDPOINT,
-        region_name="us-east-1",
-        aws_access_key_id="test",
-        aws_secret_access_key="test",
-    )
-
-
-@pytest.fixture(scope="module")
-def sqs() -> Any:
-    boto3 = pytest.importorskip("boto3")
-    assert boto3 is not None
-    try:
-        client = _sqs_client()
-        client.list_queues()
-    except Exception as exc:  # pragma: no cover - depends on the developer's machine
-        pytest.skip(f"LocalStack SQS is not reachable at {SQS_ENDPOINT}: {exc}")
-    return client
-
-
-@pytest.fixture
-def queues(sqs: Any) -> tuple[str, str]:
-    suffix = uuid.uuid4().hex[:12]
-    main = sqs.create_queue(
-        QueueName=f"bt4-main-{suffix}",
-        Attributes={"VisibilityTimeout": "30", "ReceiveMessageWaitTimeSeconds": "0"},
-    )["QueueUrl"]
-    dlq = sqs.create_queue(QueueName=f"bt4-dlq-{suffix}")["QueueUrl"]
-    yield main, dlq
-    for url in (main, dlq):
-        with contextlib.suppress(Exception):  # best-effort cleanup
-            sqs.delete_queue(QueueUrl=url)
 
 
 def _visible(sqs: Any, queue_url: str) -> int:
@@ -280,6 +300,17 @@ def _visible(sqs: Any, queue_url: str) -> int:
         AttributeNames=["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible"],
     )["Attributes"]
     return int(attributes["ApproximateNumberOfMessages"])
+
+
+def _queue_counts(sqs: Any, queue_url: str) -> tuple[int, int]:
+    attributes = sqs.get_queue_attributes(
+        QueueUrl=queue_url,
+        AttributeNames=["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible"],
+    )["Attributes"]
+    return (
+        int(attributes["ApproximateNumberOfMessages"]),
+        int(attributes["ApproximateNumberOfMessagesNotVisible"]),
+    )
 
 
 class RecordingHandler:
@@ -326,9 +357,7 @@ def test_final_retry_is_failed_and_dead_lettered_without_a_sixth_delivery() -> N
     queue = RecordingQueue()
     handler = RecordingHandler(JobOutcome(JobResult.RETRY, reason_code="WORKER_TIMEOUT"))
     store = InMemoryExecutionKeyStore()
-    worker = BacktestWorker(
-        client=queue, config=_config(max_receive_count=5), handler=handler, store=store
-    )
+    worker = BacktestWorker(client=queue, config=_config(max_receive_count=5), handler=handler, store=store)
 
     handled = worker.handle_message(_delivery(5))
 
@@ -348,9 +377,7 @@ def test_addressable_over_limit_delivery_repairs_run_before_dlq_without_executio
     queue = RecordingQueue()
     handler = RecordingHandler()
     store = InMemoryExecutionKeyStore()
-    worker = BacktestWorker(
-        client=queue, config=_config(max_receive_count=5), handler=handler, store=store
-    )
+    worker = BacktestWorker(client=queue, config=_config(max_receive_count=5), handler=handler, store=store)
 
     handled = worker.handle_message(_delivery(6))
 
@@ -366,13 +393,14 @@ def test_over_limit_duplicate_never_fails_an_active_heartbeating_attempt() -> No
     store = InMemoryExecutionKeyStore()
     key = worker_execution_key_for(RUN_ID, "OFFICIAL_BACKTEST:bt4")
     active = store.claim(
-        key, run_id=RUN_ID, owner="original-worker", now=datetime.now(timezone.utc),
+        key,
+        run_id=RUN_ID,
+        owner="original-worker",
+        now=datetime.now(timezone.utc),
         lease_duration=timedelta(seconds=30),
     )
     assert active.acquired
-    worker = BacktestWorker(
-        client=queue, config=_config(max_receive_count=5), handler=handler, store=store
-    )
+    worker = BacktestWorker(client=queue, config=_config(max_receive_count=5), handler=handler, store=store)
 
     handled = worker.handle_message(_delivery(6))
 
@@ -383,6 +411,500 @@ def test_over_limit_duplicate_never_fails_an_active_heartbeating_attempt() -> No
     assert handler.jobs == []
     assert queue.sent == []
     assert queue.deleted == []
+
+
+@pytest.mark.docker
+@pytest.mark.parametrize("serialization", ["cancel-before-claim", "claim-before-cancel"])
+def test_task5_claim_cancellation_is_a_real_sqs_postgres_race_with_both_serializations(
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+    sqs: Any,
+    queues: tuple[str, str],
+    serialization: str,
+) -> None:
+    """The claim/cancel arbiter is PostgreSQL while the delivery is real SQS.
+
+    The gate sits immediately before or after the production claim transaction.
+    Both legal lock serializations must terminate, acknowledge the same delivery,
+    and remain idempotent when LocalStack redelivers the exact body.
+    """
+
+    scenario = f"cancellation-claim-{serialization}"
+    idempotency_key = f"TASK5:CANCEL-CLAIM:{serialization.upper()}"
+    run = make_run(
+        id=uuid.UUID(task5_run_id(scenario)),
+        idempotency_key=idempotency_key,
+    )
+    sentinel = make_run(
+        id=uuid.UUID(task5_run_id(f"live-sentinel:{scenario}")),
+        idempotency_key=f"TASK5:LIVE-SENTINEL:{serialization.upper()}",
+    )
+    with persistence.unit_of_work() as uow:
+        accepted, created = uow.runs.accept(run)
+        accepted_sentinel, sentinel_created = uow.runs.accept(sentinel)
+    assert created and sentinel_created
+
+    sentinel_store = PersistenceExecutionKeyStore(persistence)
+    sentinel_key = worker_execution_key_for(
+        str(accepted_sentinel.id), accepted_sentinel.idempotency_key
+    )
+    sentinel_claim = sentinel_store.claim(
+        sentinel_key,
+        run_id=str(accepted_sentinel.id),
+        owner="task5-claim-race-live-sentinel",
+        now=datetime.now(timezone.utc),
+        lease_duration=timedelta(minutes=5),
+    )
+    assert sentinel_claim.acquired
+
+    boundary_reached = threading.Event()
+    release_claim = threading.Event()
+    delegate = PersistenceExecutionKeyStore(persistence)
+
+    class GatedClaimStore:
+        def claim(self, *args: Any, **kwargs: Any) -> Any:
+            if serialization == "cancel-before-claim":
+                boundary_reached.set()
+                assert release_claim.wait(timeout=30), "pre-claim gate was never released"
+                return delegate.claim(*args, **kwargs)
+            claimed = delegate.claim(*args, **kwargs)
+            boundary_reached.set()
+            assert release_claim.wait(timeout=30), "post-claim gate was never released"
+            return claimed
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(delegate, name)
+
+    handler_calls: list[str] = []
+
+    def cancellation_aware_handler(
+        _job: Mapping[str, Any], context: JobContext
+    ) -> JobOutcome:
+        handler_calls.append(str(context.attempt_number))
+        assert context.cancellation_reason is not None
+        reason = wait_until(
+            context.cancellation_reason,
+            description="claimed worker heartbeat to observe cancellation",
+            timeout_seconds=30,
+        )
+        return JobOutcome(JobResult.CANCELLED, reason_code=str(reason))
+
+    worker = _worker(
+        sqs,
+        queues,
+        cancellation_aware_handler,
+        store=GatedClaimStore(),  # type: ignore[arg-type]
+        wait_time=timedelta(0),
+        visibility_timeout=timedelta(seconds=3),
+        heartbeat_interval=timedelta(milliseconds=100),
+    )
+    body = _body(str(accepted.id), idempotency_key)
+    race_started = time.monotonic()
+    sqs.send_message(QueueUrl=queues[0], MessageBody=body)
+    handled: list[Any] = []
+    errors: list[BaseException] = []
+
+    def execute() -> None:
+        try:
+            handled.extend(worker.poll_once())
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker_thread = threading.Thread(target=execute, name=f"task5-{serialization}")
+    worker_thread.start()
+    assert boundary_reached.wait(timeout=30), "worker never reached the claim boundary"
+    with persistence.unit_of_work() as uow:
+        cancelled = uow.runs.request_cancellation(
+            accepted.id,
+            reason_code="USER_CANCELLED",
+        )
+    assert cancelled.cancellation_requested_at is not None
+    release_claim.set()
+    worker_thread.join(timeout=30)
+
+    assert not worker_thread.is_alive(), "claim/cancel race did not terminate"
+    assert errors == []
+    assert [item.disposition for item in handled] == [MessageDisposition.DELETED]
+    expected_reason = (
+        "DUPLICATE_ALREADY_CANCELLED"
+        if serialization == "cancel-before-claim"
+        else "USER_CANCELLED"
+    )
+    assert [item.reason_code for item in handled] == [expected_reason]
+    assert len(handler_calls) == (0 if serialization == "cancel-before-claim" else 1)
+
+    with admin_engine.connect() as connection:
+        target = dict(
+            connection.execute(
+                text(
+                    "SELECT status,configuration_hash,queued_at,completed_at "
+                    "FROM backtest.runs WHERE id=:id"
+                ),
+                {"id": accepted.id},
+            ).mappings().one()
+        )
+        attempts = [
+            dict(row)
+            for row in connection.execute(
+                text(
+                    "SELECT id::text AS id,attempt_number,"
+                    "COALESCE(previous_attempt_id::text,'ROOT') AS previous_attempt_id,"
+                    "status,COALESCE(failure_code,'NONE') AS failure_code,"
+                    "terminal_reason_code FROM backtest.run_attempts "
+                    "WHERE run_id=:id ORDER BY attempt_number"
+                ),
+                {"id": accepted.id},
+            ).mappings()
+        ]
+    assert target["status"] == "CANCELLED"
+    if serialization == "cancel-before-claim":
+        assert attempts == []
+    else:
+        assert len(attempts) == 1
+        assert attempts[0]["attempt_number"] == 1
+        assert attempts[0]["previous_attempt_id"] == "ROOT"
+        assert attempts[0]["status"] == "CANCELLED"
+        assert attempts[0]["failure_code"] == "EXECUTION_CANCELLED"
+        assert attempts[0]["terminal_reason_code"] == "USER_CANCELLED"
+
+    # A real duplicate delivery is consumed without another attempt or handler call.
+    sqs.send_message(QueueUrl=queues[0], MessageBody=body)
+    duplicate = _worker(
+        sqs,
+        queues,
+        cancellation_aware_handler,
+        store=PersistenceExecutionKeyStore(persistence),  # type: ignore[arg-type]
+        wait_time=timedelta(0),
+    ).poll_once()
+    assert [item.reason_code for item in duplicate] == ["DUPLICATE_ALREADY_CANCELLED"]
+    assert len(handler_calls) == (0 if serialization == "cancel-before-claim" else 1)
+
+    recovery = StaleRunRecovery(
+        persistence,
+        max_attempts=3,
+        queue_policy=QueueDispatchPolicy.from_environment({}),
+    ).recover_once()
+    assert recovery.requeued == recovery.failed == recovery.cancelled == 0
+    with admin_engine.connect() as connection:
+        live_sentinel = dict(
+            connection.execute(
+                text(
+                    "SELECT r.status AS run_status,a.status AS attempt_status,"
+                    "a.claim_expires_at > clock_timestamp() AS lease_live "
+                    "FROM backtest.runs r JOIN backtest.run_attempts a ON a.run_id=r.id "
+                    "WHERE r.id=:id"
+                ),
+                {"id": accepted_sentinel.id},
+            ).mappings().one()
+        )
+    assert live_sentinel == {
+        "run_status": "RUNNING",
+        "attempt_status": "RUNNING",
+        "lease_live": True,
+    }
+    with persistence.unit_of_work() as uow:
+        uow.runs.request_cancellation(accepted_sentinel.id, reason_code="USER_CANCELLED")
+    sentinel_store.finish(
+        sentinel_key,
+        ExecutionRecordStatus.CANCELLED,
+        now=datetime.now(timezone.utc),
+        claim=sentinel_claim,
+        reason_code="USER_CANCELLED",
+        run_id=str(accepted_sentinel.id),
+    )
+
+    record_evidence(
+        evidence_result(
+            scenario=f"task5-cancellation-race-claim-{serialization}",
+            terminal_state="CANCELLED",
+            duration_seconds=time.monotonic() - race_started,
+            run_id=str(accepted.id),
+            attempt_lineage=tuple(
+                f"id={item['id']};number={item['attempt_number']};"
+                f"previous={item['previous_attempt_id']};status={item['status']};"
+                f"failure={item['failure_code']};reason={item['terminal_reason_code']}"
+                for item in attempts
+            )
+            or ("no-attempt",),
+            input_fingerprint=(
+                "sha256:"
+                + canonical_digest(
+                    {
+                        "configuration_hash": target["configuration_hash"],
+                        "job": json.loads(body),
+                    }
+                )
+            ),
+            result_hash=canonical_digest(
+                {
+                    "status": target["status"],
+                    "completed_at": target["completed_at"].isoformat(),
+                    "attempts": attempts,
+                }
+            ),
+            failure_reason="USER_CANCELLED",
+        )
+    )
+
+
+@pytest.mark.docker
+def test_task5_real_sqs_lane_saturation_preserves_2_1_1_fairness_and_live_leases(
+    sqs: Any,
+    persistence: BacktestPersistence,
+    admin_engine: Engine,
+) -> None:
+    """Real SQS backlog stays visible above the BASIC/CUSTOM/COMPETITION caps."""
+
+    suffix = uuid.uuid4().hex[:12]
+    queue_urls: dict[BacktestLane, tuple[str, str]] = {}
+    created_urls: list[str] = []
+    for lane in BacktestLane:
+        main = sqs.create_queue(
+            QueueName=f"task5-{lane.value}-main-{suffix}",
+            Attributes={"VisibilityTimeout": "30", "ReceiveMessageWaitTimeSeconds": "0"},
+        )["QueueUrl"]
+        dead = sqs.create_queue(QueueName=f"task5-{lane.value}-dlq-{suffix}")["QueueUrl"]
+        queue_urls[lane] = (main, dead)
+        created_urls.extend((main, dead))
+
+    release = threading.Event()
+    lock = threading.Lock()
+    active = dict.fromkeys(BacktestLane, 0)
+    peaks = dict.fromkeys(BacktestLane, 0)
+    peak_observer = ResourcePeakObserver()
+    starts: list[BacktestLane] = []
+
+    def handler_for(lane: BacktestLane) -> Any:
+        def handle(job: Mapping[str, Any], _context: JobContext) -> JobOutcome:
+            with lock:
+                active[lane] += 1
+                peaks[lane] = max(peaks[lane], active[lane])
+                peak_observer.observe(lane.value, active[lane])
+                starts.append(lane)
+            assert release.wait(timeout=30), f"{lane.value} saturation gate was never released"
+            with lock:
+                active[lane] -= 1
+            result_hash = canonical_digest(
+                {
+                    "run_id": str(job["backtestRunId"]),
+                    "lane": lane.value,
+                    "idempotency_key": str(job["idempotencyKey"]),
+                }
+            )
+            with persistence.unit_of_work() as uow:
+                uow.runs.mark_completed(
+                    uuid.UUID(str(job["backtestRunId"])),
+                    datetime.now(timezone.utc),
+                    result_hash,
+                )
+            return JobOutcome(JobResult.SUCCEEDED, result_hash=result_hash)
+
+        return handle
+
+    durable_store = PersistenceExecutionKeyStore(persistence)
+    workers = {
+        lane: _worker(
+            sqs,
+            queue_urls[lane],
+            handler_for(lane),
+            worker_id=f"task5-{lane.value}-worker",
+            wait_time=timedelta(0),
+            store=durable_store,
+        )
+        for lane in BacktestLane
+    }
+    scheduler = BacktestLaneScheduler(
+        workers=workers,
+        idle_wait_seconds=0.05,
+        receive_backoff_seconds=0.05,
+        max_receive_backoff_seconds=0.1,
+    )
+
+    sentinel = make_run(
+        id=uuid.UUID(task5_run_id("lane-saturation-live-sentinel")),
+        idempotency_key="TASK5:LANE-SATURATION:LIVE-SENTINEL",
+    )
+    with persistence.unit_of_work() as uow:
+        accepted_sentinel, created = uow.runs.accept(sentinel)
+    assert created
+    sentinel_key = worker_execution_key_for(str(accepted_sentinel.id), accepted_sentinel.idempotency_key)
+    sentinel_store = PersistenceExecutionKeyStore(persistence)
+    sentinel_claim = sentinel_store.claim(
+        sentinel_key,
+        run_id=str(accepted_sentinel.id),
+        owner="task5-live-sentinel-worker",
+        now=datetime.now(timezone.utc),
+        lease_duration=timedelta(minutes=5),
+    )
+    assert sentinel_claim.acquired
+
+    completed: list[Any] = []
+    submitted: list[dict[str, Any]] = []
+    batch_started = time.monotonic()
+    try:
+        for lane in BacktestLane:
+            for index in range(4):
+                run_id = task5_run_id(f"lane-{lane.value}-{index}")
+                idempotency_key = f"TASK5:LANE:{lane.value.upper()}:{index}"
+                body = _body(
+                    run_id,
+                    idempotency_key,
+                )
+                submitted.append(json.loads(body))
+                with persistence.unit_of_work() as uow:
+                    accepted, created = uow.runs.accept(
+                        make_run(
+                            run_id=uuid.UUID(run_id),
+                            idempotency_key=idempotency_key,
+                            lane=RunLane[lane.name],
+                        )
+                    )
+                assert created and str(accepted.id) == run_id
+                sqs.send_message(
+                    QueueUrl=queue_urls[lane][0],
+                    MessageBody=body,
+                )
+
+        scheduler.poll_once()
+        wait_until(
+            lambda: len(starts) == 4,
+            description="all four 2/1/1 lane slots to start",
+        )
+        expected_counts = {
+            BacktestLane.BASIC: (2, 2),
+            BacktestLane.CUSTOM: (3, 1),
+            BacktestLane.COMPETITION: (3, 1),
+        }
+        wait_until(
+            lambda: all(_queue_counts(sqs, queue_urls[lane][0]) == counts for lane, counts in expected_counts.items()),
+            description="excess lane work to remain visibly queued",
+        )
+        assert peaks == {
+            BacktestLane.BASIC: 2,
+            BacktestLane.CUSTOM: 1,
+            BacktestLane.COMPETITION: 1,
+        }
+        assert set(starts) == set(BacktestLane)
+
+        recovery = StaleRunRecovery(
+            persistence,
+            max_attempts=3,
+            queue_policy=QueueDispatchPolicy.from_environment({}),
+        ).recover_once()
+        live = sql = None
+        with admin_engine.connect() as connection:
+            live = (
+                connection.execute(
+                    text(
+                        "SELECT r.status,a.status AS attempt_status "
+                        "FROM backtest.runs r JOIN backtest.run_attempts a ON a.run_id=r.id "
+                        "WHERE r.id=:id"
+                    ),
+                    {"id": accepted_sentinel.id},
+                )
+                .mappings()
+                .one()
+            )
+            sql = connection.scalar(
+                text("SELECT count(*) FROM backtest.runs WHERE id=:id AND status IN ('QUEUED','RUNNING')"),
+                {"id": accepted_sentinel.id},
+            )
+        assert dict(live) == {"status": "RUNNING", "attempt_status": "RUNNING"}
+        assert sql == 1
+        assert recovery.requeued == recovery.failed == recovery.cancelled == 0
+
+        release.set()
+
+        def drain() -> bool:
+            completed.extend(scheduler.poll_once())
+            return (
+                len(completed) == 12
+                and scheduler.active_count == 0
+                and all(_queue_counts(sqs, queue_urls[lane][0]) == (0, 0) for lane in BacktestLane)
+            )
+
+        wait_until(drain, description="all saturated lane jobs to finish", timeout_seconds=60)
+        assert all(item.disposition is MessageDisposition.DELETED for item in completed)
+        assert all(_visible(sqs, queue_urls[lane][1]) == 0 for lane in BacktestLane)
+
+        submitted_run_ids = [item["backtestRunId"] for item in submitted]
+        with admin_engine.connect() as connection:
+            durable_terminals = list(
+                connection.execute(
+                    text(
+                        "SELECT r.id::text AS run_id,r.lane::text AS lane,"
+                        "r.status::text AS run_status,r.result_hash,"
+                        "a.id::text AS attempt_id,a.attempt_number,"
+                        "a.previous_attempt_id::text AS previous_attempt_id,"
+                        "a.status::text AS attempt_status,a.failure_code,"
+                        "a.terminal_reason_code "
+                        "FROM backtest.runs r "
+                        "JOIN backtest.run_attempts a ON a.run_id=r.id "
+                        "WHERE r.id::text = ANY(:run_ids) "
+                        "ORDER BY r.id,a.attempt_number"
+                    ),
+                    {"run_ids": submitted_run_ids},
+                ).mappings()
+            )
+            durable_terminal_count = connection.scalar(
+                text(
+                    "SELECT count(*) FROM backtest.runs "
+                    "WHERE id::text = ANY(:run_ids) AND status='COMPLETED'"
+                ),
+                {"run_ids": submitted_run_ids},
+            )
+        assert durable_terminal_count == 12, (
+            "lane evidence must come from 12 durable PostgreSQL terminal runs, "
+            "not in-memory execution records"
+        )
+        assert len(durable_terminals) == 12
+        assert all(item["run_status"] == "COMPLETED" for item in durable_terminals)
+        assert all(item["attempt_status"] == "SUCCEEDED" for item in durable_terminals)
+        assert all(item["attempt_number"] == 1 for item in durable_terminals)
+        assert all(item["result_hash"] for item in durable_terminals)
+        assert {item["lane"] for item in durable_terminals} == {
+            lane.name for lane in BacktestLane
+        }
+
+        durable_identities = [dict(item) for item in durable_terminals]
+
+        with persistence.unit_of_work() as uow:
+            uow.runs.request_cancellation(accepted_sentinel.id, reason_code="USER_CANCELLED")
+        sentinel_store.finish(
+            sentinel_key,
+            ExecutionRecordStatus.CANCELLED,
+            now=datetime.now(timezone.utc),
+            claim=sentinel_claim,
+            reason_code="USER_CANCELLED",
+            run_id=str(accepted_sentinel.id),
+        )
+        record_evidence(
+            evidence_result(
+                scenario="task5-lane-saturation-fairness",
+                terminal_state="COMPLETED",
+                duration_seconds=time.monotonic() - batch_started,
+                run_id=task5_run_id("lane-saturation-fairness"),
+                attempt_lineage=tuple(
+                    f"run={item['run_id']};lane={item['lane']};attempt={item['attempt_id']};"
+                    f"number={item['attempt_number']};previous={item['previous_attempt_id']};"
+                    f"run_status={item['run_status']};attempt_status={item['attempt_status']};"
+                    f"failure={item['failure_code']};reason={item['terminal_reason_code']};"
+                    f"result={item['result_hash']}"
+                    for item in durable_identities
+                ),
+                input_fingerprint=f"sha256:{canonical_digest(submitted)}",
+                result_hash=canonical_digest(durable_identities),
+                resource_peak=peak_observer.snapshot(),
+            )
+        )
+    finally:
+        release.set()
+        with contextlib.suppress(Exception):
+            scheduler.request_stop()
+            scheduler.wait_for_idle(timeout=30)
+        for url in created_urls:
+            with contextlib.suppress(Exception):
+                sqs.delete_queue(QueueUrl=url)
 
 
 def test_transient_durable_heartbeat_error_is_retried_without_abandoning_handler() -> None:
@@ -425,7 +947,7 @@ def _worker(
     sqs: Any,
     queues: tuple[str, str],
     handler: Any,
-    store: InMemoryExecutionKeyStore | None = None,
+    store: Any | None = None,
     **overrides: Any,
 ) -> BacktestWorker:
     main, dlq = queues
@@ -446,9 +968,7 @@ def _worker(
 
 
 @pytest.mark.docker
-def test_long_poll_delivers_the_job_and_deletes_it_after_success(
-    sqs: Any, queues: tuple[str, str]
-) -> None:
+def test_long_poll_delivers_the_job_and_deletes_it_after_success(sqs: Any, queues: tuple[str, str]) -> None:
     main, dlq = queues
     sqs.send_message(QueueUrl=main, MessageBody=_body())
     handler = RecordingHandler()
@@ -459,18 +979,14 @@ def test_long_poll_delivers_the_job_and_deletes_it_after_success(
     assert [item.disposition for item in handled] == [MessageDisposition.DELETED]
     assert len(handler.jobs) == 1
     assert handler.jobs[0]["backtestRunId"] == RUN_ID
-    assert handler.contexts[0].worker_execution_key == worker_execution_key_for(
-        RUN_ID, "OFFICIAL_BACKTEST:bt4"
-    )
+    assert handler.contexts[0].worker_execution_key == worker_execution_key_for(RUN_ID, "OFFICIAL_BACKTEST:bt4")
     assert handler.contexts[0].receive_count == 1
     assert _visible(sqs, main) == 0
     assert _visible(sqs, dlq) == 0
 
 
 @pytest.mark.docker
-def test_at_least_once_redelivery_executes_the_job_exactly_once(
-    sqs: Any, queues: tuple[str, str]
-) -> None:
+def test_at_least_once_redelivery_executes_the_job_exactly_once(sqs: Any, queues: tuple[str, str]) -> None:
     """A duplicate of an already-succeeded key is acknowledged, not re-run."""
     main, _ = queues
     handler = RecordingHandler()
@@ -490,9 +1006,7 @@ def test_at_least_once_redelivery_executes_the_job_exactly_once(
 
 
 @pytest.mark.docker
-def test_visibility_is_extended_while_the_job_is_still_running(
-    sqs: Any, queues: tuple[str, str]
-) -> None:
+def test_visibility_is_extended_while_the_job_is_still_running(sqs: Any, queues: tuple[str, str]) -> None:
     """Without heartbeats a 3s visibility timeout would redeliver mid-run."""
     main, _ = queues
     observed: list[int] = []
@@ -522,9 +1036,7 @@ def test_visibility_is_extended_while_the_job_is_still_running(
 
 
 @pytest.mark.docker
-def test_retryable_failure_returns_the_message_for_immediate_redelivery(
-    sqs: Any, queues: tuple[str, str]
-) -> None:
+def test_retryable_failure_returns_the_message_for_immediate_redelivery(sqs: Any, queues: tuple[str, str]) -> None:
     main, dlq = queues
     sqs.send_message(QueueUrl=main, MessageBody=_body())
     handler = RecordingHandler(JobOutcome(JobResult.RETRY, reason_code="OBJECT_STORE_TEMPORARY"))
@@ -544,9 +1056,7 @@ def test_retryable_failure_returns_the_message_for_immediate_redelivery(
 
 
 @pytest.mark.docker
-def test_final_allowed_receive_is_failed_and_routed_to_the_dead_letter_queue(
-    sqs: Any, queues: tuple[str, str]
-) -> None:
+def test_final_allowed_receive_is_failed_and_routed_to_the_dead_letter_queue(sqs: Any, queues: tuple[str, str]) -> None:
     main, dlq = queues
     sqs.send_message(QueueUrl=main, MessageBody=_body())
     handler = RecordingHandler(JobOutcome(JobResult.RETRY, reason_code="TRANSIENT"))
@@ -567,9 +1077,7 @@ def test_final_allowed_receive_is_failed_and_routed_to_the_dead_letter_queue(
 
 
 @pytest.mark.docker
-def test_unparseable_message_is_dead_lettered_without_invoking_the_handler(
-    sqs: Any, queues: tuple[str, str]
-) -> None:
+def test_unparseable_message_is_dead_lettered_without_invoking_the_handler(sqs: Any, queues: tuple[str, str]) -> None:
     main, dlq = queues
     sqs.send_message(QueueUrl=main, MessageBody="{not json")
     handler = RecordingHandler()
@@ -585,14 +1093,10 @@ def test_unparseable_message_is_dead_lettered_without_invoking_the_handler(
 
 
 @pytest.mark.docker
-def test_permanent_job_failure_is_dead_lettered_and_recorded(
-    sqs: Any, queues: tuple[str, str]
-) -> None:
+def test_permanent_job_failure_is_dead_lettered_and_recorded(sqs: Any, queues: tuple[str, str]) -> None:
     main, dlq = queues
     sqs.send_message(QueueUrl=main, MessageBody=_body())
-    handler = RecordingHandler(
-        JobOutcome(JobResult.PERMANENT_FAILURE, reason_code="REQUIRED_DATA_UNAVAILABLE")
-    )
+    handler = RecordingHandler(JobOutcome(JobResult.PERMANENT_FAILURE, reason_code="REQUIRED_DATA_UNAVAILABLE"))
     store = InMemoryExecutionKeyStore()
     worker = _worker(sqs, queues, handler, store)
 
@@ -606,14 +1110,10 @@ def test_permanent_job_failure_is_dead_lettered_and_recorded(
 
 
 @pytest.mark.docker
-def test_cancelled_job_is_acknowledged_without_dead_lettering(
-    sqs: Any, queues: tuple[str, str]
-) -> None:
+def test_cancelled_job_is_acknowledged_without_dead_lettering(sqs: Any, queues: tuple[str, str]) -> None:
     main, dlq = queues
     sqs.send_message(QueueUrl=main, MessageBody=_body())
-    handler = RecordingHandler(
-        JobOutcome(JobResult.CANCELLED, reason_code="USER_CANCELLED")
-    )
+    handler = RecordingHandler(JobOutcome(JobResult.CANCELLED, reason_code="USER_CANCELLED"))
     store = InMemoryExecutionKeyStore()
     worker = _worker(sqs, queues, handler, store)
 
@@ -628,9 +1128,7 @@ def test_cancelled_job_is_acknowledged_without_dead_lettering(
 
 
 @pytest.mark.docker
-def test_graceful_shutdown_finishes_the_in_flight_message_then_returns(
-    sqs: Any, queues: tuple[str, str]
-) -> None:
+def test_graceful_shutdown_finishes_the_in_flight_message_then_returns(sqs: Any, queues: tuple[str, str]) -> None:
     main, _ = queues
     started = threading.Event()
     finished = threading.Event()
@@ -657,9 +1155,7 @@ def test_graceful_shutdown_finishes_the_in_flight_message_then_returns(
 
 
 @pytest.mark.docker
-def test_a_second_worker_cannot_double_execute_a_message_in_flight_elsewhere(
-    sqs: Any, queues: tuple[str, str]
-) -> None:
+def test_a_second_worker_cannot_double_execute_a_message_in_flight_elsewhere(sqs: Any, queues: tuple[str, str]) -> None:
     """The CAS, not the visibility timeout, is what makes this safe."""
     main, _ = queues
     shared = InMemoryExecutionKeyStore()

@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import io
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -195,6 +196,69 @@ class _FakeS3:
         except KeyError as exc:
             raise _client_error("NoSuchKey", 404, "GetObject") from exc
         return {"Body": io.BytesIO(stored["Body"]), "ContentLength": len(stored["Body"])}
+
+
+class _VersionedFakeS3:
+    """Small versioned S3 model that records every exact-version operation."""
+
+    def __init__(self) -> None:
+        self.versions: dict[str, list[dict[str, Any]]] = {}
+        self.version_operations: list[tuple[str, str | None]] = []
+
+    def put_object(self, **kwargs: Any) -> dict[str, Any]:
+        key = str(kwargs["Key"])
+        versions = self.versions.setdefault(key, [])
+        if kwargs.get("IfNoneMatch") == "*" and versions:
+            raise _client_error("PreconditionFailed", 412)
+        version_id = f"v{sum(len(items) for items in self.versions.values()) + 1}"
+        stored = {
+            "Body": kwargs["Body"].read() if hasattr(kwargs["Body"], "read") else kwargs["Body"],
+            "Metadata": dict(kwargs.get("Metadata", {})),
+            "ContentType": kwargs.get("ContentType"),
+            "VersionId": version_id,
+        }
+        versions.append(stored)
+        return {"VersionId": version_id, "ETag": f'"{version_id}-etag"'}
+
+    def _version(self, key: str, version_id: str | None) -> dict[str, Any]:
+        versions = self.versions.get(key, [])
+        if version_id is None and versions:
+            return versions[-1]
+        for stored in versions:
+            if stored["VersionId"] == version_id:
+                return stored
+        raise _client_error("NoSuchVersion", 404, "HeadObject")
+
+    def head_object(
+        self, Bucket: str, Key: str, VersionId: str | None = None
+    ) -> dict[str, Any]:
+        self.version_operations.append(("HEAD", VersionId))
+        stored = self._version(Key, VersionId)
+        return {
+            "ContentLength": len(stored["Body"]),
+            "Metadata": stored["Metadata"],
+            "VersionId": stored["VersionId"],
+            "ETag": f'"{stored["VersionId"]}-etag"',
+            "ContentType": stored["ContentType"],
+        }
+
+    def get_object(
+        self, Bucket: str, Key: str, VersionId: str | None = None
+    ) -> dict[str, Any]:
+        self.version_operations.append(("GET", VersionId))
+        stored = self._version(Key, VersionId)
+        return {
+            "Body": io.BytesIO(stored["Body"]),
+            "ContentLength": len(stored["Body"]),
+        }
+
+    def delete_object(
+        self, Bucket: str, Key: str, VersionId: str | None = None
+    ) -> dict[str, Any]:
+        self.version_operations.append(("DELETE", VersionId))
+        versions = self.versions.get(Key, [])
+        self.versions[Key] = [item for item in versions if item["VersionId"] != VersionId]
+        return {"DeleteMarker": False, "VersionId": VersionId}
 
 
 # --------------------------------------------------------------------------------
@@ -597,6 +661,53 @@ def test_s3_deep_verify_catches_metadata_that_lies_about_the_body() -> None:
     assert deep.content_hash == OTHER_SHA256
 
 
+@pytest.mark.parametrize("newer_body", [BODY, OTHER_BODY], ids=["identical-hash", "changed"])
+def test_s3_compensation_deletes_only_the_registered_provider_version(
+    newer_body: bytes,
+) -> None:
+    fake = _VersionedFakeS3()
+    store = S3ObjectStore("bucket", client=fake, sleep=_no_sleep)
+    receipt = store.put(KEY, BODY)
+    newer_hash = hashlib.sha256(newer_body).hexdigest()
+    newer = fake.put_object(
+        Bucket="bucket",
+        Key=KEY,
+        Body=newer_body,
+        Metadata={"sha256": newer_hash},
+        ContentType=PARQUET_MEDIA_TYPE,
+    )
+
+    assert store.preflight_delete(
+        KEY,
+        BODY_SHA256,
+        receipt.provider_version_id,
+    ) is True
+    assert store.delete_if_matches(
+        KEY,
+        BODY_SHA256,
+        receipt.provider_version_id,
+    ) is True
+
+    assert fake.get_object(Bucket="bucket", Key=KEY)["Body"].read() == newer_body
+    assert fake.head_object(Bucket="bucket", Key=KEY)["VersionId"] == newer["VersionId"]
+    assert ("DELETE", receipt.provider_version_id) in fake.version_operations
+    assert all(
+        version_id in {None, receipt.provider_version_id, newer["VersionId"]}
+        for _operation, version_id in fake.version_operations
+    )
+
+
+def test_local_compensation_refuses_a_provider_version_mismatch(tmp_path: Path) -> None:
+    store = LocalObjectStore(tmp_path / "objects", bucket_name="backtest-local")
+    receipt = store.put(KEY, BODY)
+
+    with pytest.raises(ObjectStoreConflict, match="provider version"):
+        store.preflight_delete(KEY, BODY_SHA256, "different-provider-version")
+
+    assert receipt.provider_version_id == BODY_SHA256
+    assert store.open(KEY).read() == BODY
+
+
 def test_s3_prefix_is_applied_once() -> None:
     fake = _FakeS3()
     store = S3ObjectStore("bucket", prefix="tenant-a/", client=fake, sleep=_no_sleep)
@@ -965,6 +1076,77 @@ def test_registry_only_ever_inserts_a_staged_row_and_verifies_once() -> None:
         registry.mark_available(OBJECT_ID, datetime(2025, 12, 9, tzinfo=UTC))
 
 
+def test_registry_cleanup_fences_the_provider_version_and_is_idempotent() -> None:
+    registry = InMemoryStorageObjectRegistry()
+    record = _record().verified(VERIFIED_AT)
+    registry.register(_record())
+    registry.mark_available(record.object_id, VERIFIED_AT)
+
+    with pytest.raises(
+        ObjectStoreConflict, match="provider version"
+    ), registry.cleanup_batch(
+        (replace(record, provider_version_id="different-provider-version"),)
+    ):
+        pass
+    assert registry.rows() == (record,)
+
+    with registry.cleanup_batch((record,)) as locked:
+        assert locked == (record,)
+    assert registry.rows() == ()
+    with registry.cleanup_batch((record,)) as locked:
+        assert locked == ()
+
+
+def test_registry_preflights_every_candidate_before_removing_any_row() -> None:
+    registry = InMemoryStorageObjectRegistry()
+    first = replace(
+        _record(),
+        object_id=UUID("00000000-0000-4000-8000-0000000000c2"),
+        object_key=KEY.replace("part=0001", "part=0002"),
+    )
+    second = _record()
+    registry.register(first)
+    registry.register(second)
+
+    with pytest.raises(
+        ObjectStoreConflict, match="provider version"
+    ), registry.cleanup_batch(
+        (first, replace(second, provider_version_id="later-conflict"))
+    ):
+        pass
+
+    assert registry.rows() == tuple(sorted((first, second), key=lambda item: item.object_key))
+
+
+@pytest.mark.parametrize(
+    ("field", "foreign_value"),
+    [
+        ("storage_provider", "FOREIGN_PROVIDER"),
+        ("bucket_name", "foreign-bucket"),
+    ],
+)
+def test_registry_unregister_fences_provider_and_bucket_identity(
+    field: str,
+    foreign_value: str,
+) -> None:
+    registry = InMemoryStorageObjectRegistry()
+    record = _record()
+    registry.register(record)
+    identity = {
+        "storage_provider": record.storage_provider,
+        "bucket_name": record.bucket_name,
+        "object_key": record.object_key,
+        "provider_version_id": record.provider_version_id,
+        "content_hash": record.content_hash,
+    }
+    identity[field] = foreign_value
+
+    with pytest.raises(ObjectStoreConflict):
+        registry.unregister(record.object_id, **identity)
+
+    assert registry.rows() == (record,)
+
+
 def replace_receipt(*, object_key: str, content_hash: str) -> ObjectReceipt:
     return ObjectReceipt(
         storage_provider="S3_COMPATIBLE",
@@ -1048,6 +1230,54 @@ def test_real_emulator_enforces_the_if_none_match_precondition(emulated_store: S
 
     assert raised.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
     assert emulated_store.open(KEY).read() == BODY
+
+
+@pytest.mark.docker
+@pytest.mark.parametrize("newer_body", [BODY, OTHER_BODY], ids=["identical-hash", "changed"])
+def test_real_emulator_compensation_deletes_only_the_registered_provider_version(
+    emulated_store: S3ObjectStore,
+    newer_body: bytes,
+) -> None:
+    emulated_store.client.put_bucket_versioning(
+        Bucket=emulated_store.bucket,
+        VersioningConfiguration={"Status": "Enabled"},
+    )
+    registered = emulated_store.put(KEY, BODY)
+    newer_hash = hashlib.sha256(newer_body).hexdigest()
+    newer = emulated_store.client.put_object(
+        Bucket=emulated_store.bucket,
+        Key=KEY,
+        Body=newer_body,
+        Metadata={"sha256": newer_hash},
+        ContentType=PARQUET_MEDIA_TYPE,
+    )
+
+    assert registered.provider_version_id
+    assert newer["VersionId"] != registered.provider_version_id
+    assert emulated_store.preflight_delete(
+        KEY,
+        BODY_SHA256,
+        registered.provider_version_id,
+    ) is True
+    assert emulated_store.delete_if_matches(
+        KEY,
+        BODY_SHA256,
+        registered.provider_version_id,
+    ) is True
+
+    current = emulated_store.client.get_object(Bucket=emulated_store.bucket, Key=KEY)
+    assert current["VersionId"] == newer["VersionId"]
+    assert current["Body"].read() == newer_body
+    with pytest.raises(ClientError) as missing_registered_version:
+        emulated_store.client.head_object(
+            Bucket=emulated_store.bucket,
+            Key=KEY,
+            VersionId=registered.provider_version_id,
+        )
+    assert (
+        missing_registered_version.value.response["ResponseMetadata"]["HTTPStatusCode"]
+        == 404
+    )
 
 
 @pytest.mark.docker

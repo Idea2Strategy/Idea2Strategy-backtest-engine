@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -35,7 +35,11 @@ from backtest_engine.detail_object_manifest import (
 )
 from backtest_engine.execution_model import OrderStatus
 from backtest_engine.monthly_judgment import EtMonth, MonthlyJudgmentBuilder
-from backtest_engine.object_store import LocalObjectStore, StorageObjectRegistrar
+from backtest_engine.object_store import (
+    LocalObjectStore,
+    StorageObjectProducerClaim,
+    StorageObjectRegistrar,
+)
 from backtest_engine.persistence import (
     BacktestPersistence,
     InputDatasetRow,
@@ -61,7 +65,12 @@ from backtest_engine.result_snapshot import (
     ResultSnapshotBuilder,
     RunSnapshot,
 )
-from backtest_engine.wiring import PersistenceStorageObjectWritePort, build_result_query_service
+from backtest_engine.wiring import (
+    PersistenceExecutionKeyStore,
+    PersistenceStorageObjectWritePort,
+    build_result_query_service,
+)
+from backtest_engine.worker import worker_execution_key_for
 from persistence.support import (
     ACCOUNT_ID,
     BOT_ID,
@@ -181,6 +190,8 @@ class Published:
         self.details: Any = None
         self.monthly: Any = None
         self.bundle: Any = None
+        self.execution_key: str | None = None
+        self.producer_claim: StorageObjectProducerClaim | None = None
 
     def accept(self, *, queued_at: datetime | None = None) -> None:
         overrides: dict[str, Any] = {} if queued_at is None else {"queued_at": queued_at}
@@ -218,6 +229,24 @@ class Published:
         )
 
     def publish(self) -> None:
+        self.execution_key = worker_execution_key_for(str(self.run_id), f"DURABLE-QUERY:{self.run_id}")
+        claim = PersistenceExecutionKeyStore(self.persistence).claim(
+            self.execution_key,
+            run_id=str(self.run_id),
+            owner="durable-query-fixture",
+            now=datetime.now(UTC),
+            lease_duration=timedelta(minutes=5),
+        )
+        assert claim.acquired
+        assert claim.attempt_id is not None
+        assert claim.claim_token is not None
+        assert claim.cleanup_capability is not None
+        self.producer_claim = StorageObjectProducerClaim(
+            run_id=self.run_id,
+            attempt_id=uuid.UUID(claim.attempt_id),
+            claim_token=uuid.UUID(claim.claim_token),
+            cleanup_capability=claim.cleanup_capability,
+        )
         snapshot = _snapshot(self.run_id)
         self.result = ResultSnapshotBuilder().build(snapshot, _records(self.run_id), COMPLETED_AT)
         self.details = DetailObjectBuilder().build(self.result, [], [], COMPLETED_AT)
@@ -228,7 +257,9 @@ class Published:
         port = PersistenceStorageObjectWritePort(self.persistence)
         manifest = self.result.manifest
         instants = [record.occurred_at for record in self.result.records]
-        StorageObjectRegistrar(self.store, port).publish(
+        assert self.producer_claim is not None
+        assert self.execution_key is not None
+        StorageObjectRegistrar(self.store, port, producer_claim=self.producer_claim).publish(
             object_id=uuid.uuid5(RESULT_OBJECT_NAMESPACE, f"{manifest.run_snapshot_id}|{manifest.content_hash}"),
             object_key=manifest.object_key,
             data=self.result.object_bytes,
@@ -242,9 +273,11 @@ class Published:
             media_type=manifest.media_type,
             file_format="JSON",
         )
-        published = DetailObjectPublisher(self.store, storage_write_port=port).publish(
-            self.details, verified_at=COMPLETED_AT
-        )
+        published = DetailObjectPublisher(
+            self.store,
+            storage_write_port=port,
+            producer_claim=self.producer_claim,
+        ).publish(self.details, verified_at=COMPLETED_AT)
 
         performance = self.result.performance_row()
         bundle = self.bundle
@@ -296,6 +329,9 @@ class Published:
                         for summary in self.monthly
                     ),
                     detail_manifests=tuple(published.manifest_rows()),
+                    worker_execution_key=self.execution_key,
+                    attempt_id=self.producer_claim.attempt_id,
+                    claim_token=self.producer_claim.claim_token,
                 ),
             )
 

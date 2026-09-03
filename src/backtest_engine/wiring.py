@@ -53,6 +53,7 @@ remove.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -95,6 +96,7 @@ from .detail_object_manifest import (
     DetailObjectBundle,
     DetailObjectPublisher,
     PerformancePoint,
+    PublishedDetails,
     ReplayLedgerDetail,
 )
 from .elements import PinnedFeatureSeries
@@ -135,8 +137,11 @@ from .monthly_judgment import (
 from .object_store import (
     ObjectStore,
     ObjectStoreConflict,
+    StorageObjectProducerClaim,
     StorageObjectRecord,
     StorageObjectRegistrar,
+    StorageObjectRegistration,
+    StorageObjectUpload,
 )
 from .orchestrator import (
     BacktestJob,
@@ -148,6 +153,7 @@ from .orchestrator import (
     PublishRequest,
     ReplayOutcome,
     ReplayStatus,
+    ResultPublicationCancelled,
     ResultPublicationError,
     SessionCalendar,
 )
@@ -161,7 +167,6 @@ from .performance.equity_curve import (
 )
 from .persistence import (
     BacktestPersistence,
-    DetailManifestRow,
     FailureConditionCountRow,
     InputBundleRow,
     InputDatasetRow,
@@ -276,7 +281,7 @@ class JobNotSatisfiable(WiringError):
 
 def _utc_text(value: datetime) -> str:
     """The ``utcTimestamp`` form every `backtest.v1` field is validated against."""
-    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _prefixed(digest: str) -> str:
@@ -725,6 +730,50 @@ def _trading_sessions_between(session_index_by_date: Mapping[date, int], start: 
 # ==========================================================================
 
 
+def _cleanup_token_hash(cleanup_token: str | None) -> str:
+    if (
+        not isinstance(cleanup_token, str)
+        or len(cleanup_token) != 64
+        or any(character not in "0123456789abcdef" for character in cleanup_token)
+    ):
+        raise ObjectStoreConflict("durable cleanup requires a 256-bit object capability")
+    return hashlib.sha256(cleanup_token.encode("ascii")).hexdigest()
+
+
+def _set_storage_producer_context(
+    connection: Any,
+    producer_claim: StorageObjectProducerClaim | None,
+    *,
+    cleanup_token_hash: str | None = None,
+) -> StorageObjectProducerClaim:
+    if producer_claim is None:
+        raise ObjectStoreConflict("durable storage publication requires its producing attempt capability")
+    connection.execute(
+        text(
+            "SELECT "
+            "set_config('idea2strategy.backtest_run_id', :run_id, true), "
+            "set_config('idea2strategy.backtest_attempt_id', :attempt_id, true), "
+            "set_config('idea2strategy.backtest_claim_token', :claim_token, true), "
+            "set_config('idea2strategy.backtest_attempt_cleanup_capability', :capability, true)"
+        ),
+        {
+            "run_id": str(producer_claim.run_id),
+            "attempt_id": str(producer_claim.attempt_id),
+            "claim_token": str(producer_claim.claim_token),
+            "capability": producer_claim.cleanup_capability,
+        },
+    )
+    if cleanup_token_hash is not None:
+        connection.execute(
+            text(
+                "SELECT set_config("
+                "'idea2strategy.backtest_cleanup_token_hash', :token_hash, true)"
+            ),
+            {"token_hash": cleanup_token_hash},
+        )
+    return producer_claim
+
+
 class PersistenceStorageObjectWritePort:
     """The durable `storage.objects` writer the object store package left open.
 
@@ -746,23 +795,114 @@ class PersistenceStorageObjectWritePort:
     def __init__(self, persistence: BacktestPersistence) -> None:
         self._persistence = persistence
 
-    def register(self, record: StorageObjectRecord) -> uuid.UUID:
+    def register(
+        self,
+        record: StorageObjectRecord,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_token: str | None = None,
+        created_by_attempt: bool = False,
+    ) -> StorageObjectRegistration:
+        token_hash = _cleanup_token_hash(cleanup_token)
         with _as_object_store_conflict(), self._persistence.unit_of_work() as uow:
-            row, _ = uow.objects.register(record.to_row())
-            return row.id
+            _set_storage_producer_context(
+                uow.connection,
+                producer_claim,
+                cleanup_token_hash=token_hash if created_by_attempt else None,
+            )
+            row, inserted = uow.objects.register(
+                record.to_row(),
+                via_capability=True,
+            )
+            cleanup_owned = inserted and created_by_attempt
+            if not inserted:
+                cleanup_owned = uow.objects.reissue_cleanup_capability(row, token_hash)
+            return StorageObjectRegistration(
+                object_id=row.id,
+                cleanup_owned=cleanup_owned,
+            )
 
-    def mark_available(self, object_id: uuid.UUID, verified_at: datetime) -> StorageObjectRecord:
+    def mark_available(
+        self,
+        object_id: uuid.UUID,
+        verified_at: datetime,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+    ) -> StorageObjectRecord:
         with _as_object_store_conflict(), self._persistence.unit_of_work() as uow:
-            return _record_of(uow.objects.mark_available(object_id, verified_at))
+            _set_storage_producer_context(uow.connection, producer_claim)
+            return _record_of(
+                uow.objects.mark_available(
+                    object_id,
+                    verified_at,
+                    via_capability=True,
+                )
+            )
 
-    def quarantine(self, object_id: uuid.UUID, quarantined_at: datetime) -> StorageObjectRecord:
+    def quarantine(
+        self,
+        object_id: uuid.UUID,
+        quarantined_at: datetime,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+    ) -> StorageObjectRecord:
         with _as_object_store_conflict(), self._persistence.unit_of_work() as uow:
-            return _record_of(uow.objects.quarantine(object_id, quarantined_at))
+            _set_storage_producer_context(uow.connection, producer_claim)
+            return _record_of(
+                uow.objects.quarantine(
+                    object_id,
+                    quarantined_at,
+                    via_capability=True,
+                )
+            )
 
     def find(self, object_id: uuid.UUID) -> StorageObjectRecord | None:
         with self._persistence.read_only() as uow:
             row = uow.objects.find(object_id)
         return None if row is None else _record_of(row)
+
+    @contextmanager
+    def cleanup_batch(
+        self,
+        records: Sequence[StorageObjectRecord],
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_tokens: Mapping[uuid.UUID, str] | None = None,
+    ) -> Iterator[tuple[StorageObjectRecord, ...]]:
+        """Hold exact row/reference locks through object-store compensation."""
+
+        with _as_object_store_conflict(), self._persistence.unit_of_work() as uow:
+            _set_storage_producer_context(uow.connection, producer_claim)
+            candidates = tuple(record.to_row() for record in records)
+            tokens = dict(cleanup_tokens or {})
+            for candidate in candidates:
+                _cleanup_token_hash(tokens.get(candidate.id))
+            with uow.objects.cleanup_unreferenced_batch(candidates, tokens) as locked_rows:
+                yield tuple(_record_of(row) for row in locked_rows)
+
+    def unregister(
+        self,
+        object_id: uuid.UUID,
+        *,
+        storage_provider: str,
+        bucket_name: str,
+        object_key: str,
+        provider_version_id: str,
+        content_hash: str,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_token: str | None = None,
+    ) -> bool:
+        with _as_object_store_conflict(), self._persistence.unit_of_work() as uow:
+            _set_storage_producer_context(uow.connection, producer_claim)
+            return uow.objects.unregister_unreferenced(
+                object_id,
+                storage_provider=storage_provider,
+                bucket_name=bucket_name,
+                object_key=object_key,
+                provider_version_id=provider_version_id,
+                content_hash=content_hash,
+                cleanup_token=cleanup_token or "",
+            )
 
 
 @contextmanager
@@ -850,17 +990,39 @@ class PersistenceExecutionKeyStore:
                 lease_duration=lease_duration,
             )
             if attempt is not None:
+                cleanup_capability = uow.connection.scalar(
+                    text(
+                        "SELECT current_setting("
+                        "'idea2strategy.backtest_attempt_cleanup_capability', true)"
+                    )
+                )
+                if not isinstance(cleanup_capability, str) or len(cleanup_capability) != 64:
+                    raise PublishConflict(
+                        "new run attempt did not receive its protected cleanup capability"
+                    )
                 return ExecutionClaim(
                     acquired=True,
                     attempt_number=attempt.attempt_number,
                     attempt_id=str(attempt.id),
                     claim_token=str(attempt.claim_token),
+                    cleanup_capability=cleanup_capability,
                 )
             existing = uow.attempts.latest_for_run(run_uuid)
+            existing_status = None
+            if existing is not None:
+                existing_status = _execution_status(existing.status)
+            else:
+                run = uow.runs.get(run_uuid)
+                existing_status = {
+                    RunStatus.COMPLETED: ExecutionRecordStatus.SUCCEEDED,
+                    RunStatus.CANCELLED: ExecutionRecordStatus.CANCELLED,
+                    RunStatus.FAILED: ExecutionRecordStatus.FAILED,
+                    RunStatus.UNAVAILABLE: ExecutionRecordStatus.FAILED,
+                }.get(run.status)
             return ExecutionClaim(
                 acquired=False,
                 attempt_number=0 if existing is None else existing.attempt_number,
-                existing_status=None if existing is None else _execution_status(existing.status),
+                existing_status=existing_status,
             )
 
     @staticmethod
@@ -984,15 +1146,12 @@ class PersistenceExecutionKeyStore:
                 if latest is not None and latest["status"] == WorkStatus.RUNNING.value:
                     if latest["claim_expires_at"] is not None and latest["claim_expires_at"] > database_now:
                         return ExecutionRecordStatus.IN_PROGRESS
-                    uow.connection.execute(
-                        text("""
-                        UPDATE backtest.run_attempts
-                           SET status='CANCELLED', completed_at=:now,
-                               failure_code=NULL, terminal_reason_code='CANCELLED_BY_REQUEST'
-                         WHERE id=:attempt_id AND status='RUNNING'
-                           AND (claim_expires_at IS NULL OR claim_expires_at <= :now)
-                    """),
-                        {"attempt_id": latest["id"], "now": database_now},
+                    uow.connection.scalar(
+                        text(
+                            "SELECT backtest.recover_expired_run_attempt("
+                            ":attempt_id, 'CANCELLED', 'CANCELLED_BY_REQUEST')"
+                        ),
+                        {"attempt_id": latest["id"]},
                     )
                 uow.runs.mark_cancelled(
                     run_uuid,
@@ -1003,30 +1162,26 @@ class PersistenceExecutionKeyStore:
             if latest is not None and latest["status"] == WorkStatus.RUNNING.value:
                 if latest["claim_expires_at"] is not None and latest["claim_expires_at"] > database_now:
                     return ExecutionRecordStatus.IN_PROGRESS
-                uow.connection.execute(
-                    text("""
-                    UPDATE backtest.run_attempts
-                       SET status='FAILED', completed_at=:now,
-                           failure_code=:reason, terminal_reason_code=:reason
-                     WHERE id=:attempt_id AND status='RUNNING'
-                       AND (claim_expires_at IS NULL OR claim_expires_at <= :now)
-                """),
+                uow.connection.scalar(
+                    text(
+                        "SELECT backtest.recover_expired_run_attempt("
+                        ":attempt_id, 'FAILED', :reason)"
+                    ),
                     {
                         "attempt_id": latest["id"],
-                        "now": database_now,
                         "reason": failure_code,
                     },
                 )
             uow.runs.mark_failed(run_uuid, database_now, failure_code, retryable=False)
             return ExecutionRecordStatus.FAILED
 
-    def recover_stale(self, *, max_attempts: int, queued_timeout: timedelta) -> Any:
+    def recover_stale(self, *, max_attempts: int, queue_policy: Any) -> Any:
         from .recovery import StaleRunRecovery
 
         return StaleRunRecovery(
             self._persistence,
             max_attempts=max_attempts,
-            queued_timeout=queued_timeout,
+            queue_policy=queue_policy,
         ).recover_once()
 
     def status(self, key: str) -> ExecutionRecordStatus | None:
@@ -1208,6 +1363,7 @@ class JobBinding:
     worker_execution_key: str
     attempt_id: uuid.UUID | None
     claim_token: uuid.UUID | None
+    cleanup_capability: str | None
     manifest: Mapping[str, Any]
     policy: ExecutionPolicy
     plan: BasicCompiledPlan
@@ -1231,22 +1387,65 @@ class JobBinding:
         return self.envelope.dataset_manifest_id
 
 
+@dataclass(frozen=True, slots=True)
+class _PublicationArtifact:
+    """Expected durable identity for one object produced by a publication."""
+
+    object_id: uuid.UUID
+    storage_provider: str
+    bucket_name: str
+    object_key: str
+    content_hash: str
+
+    def matches(self, record: StorageObjectRecord) -> bool:
+        return all(
+            (
+                record.object_id == self.object_id,
+                record.storage_provider == self.storage_provider,
+                record.bucket_name == self.bucket_name,
+                record.object_key == self.object_key,
+                record.content_hash == self.content_hash,
+            )
+        )
+
+
+def _same_stored_version(
+    left: StorageObjectRecord,
+    right: StorageObjectRecord,
+) -> bool:
+    """Whether two records name the same exact provider version of the bytes."""
+
+    return all(
+        getattr(left, field) == getattr(right, field)
+        for field in (
+            "object_id",
+            "storage_provider",
+            "bucket_name",
+            "object_key",
+            "provider_version_id",
+            "content_hash",
+        )
+    )
+
+
 class DurableResultPublisher:
     """Writes one completed run's evidence to the object store and PostgreSQL.
 
     The order is the one spec 2.5 mandates and is not an implementation detail:
 
-    1. the immutable result-snapshot object and every ET-week detail Parquet part
+    1. the run row is locked, serializing cancellation with publication;
+    2. the immutable result-snapshot object and every ET-week detail Parquet part
        are written to the object store and registered in ``storage.objects``,
        reaching ``AVAILABLE`` only after their bytes were re-hashed;
-    2. **then**, in a single transaction, ``publish_completed_run`` locks the
+    3. **then**, in that same run transaction, ``publish_completed_run`` locks the
        input bundle, inserts the performance summary, the monthly judgment
        summaries with all six canonical counters, the ``detail_manifests`` rows
        and completes the attempt -- refusing to proceed unless every object it
        points at is already ``AVAILABLE``.
 
-    A crash between the two leaves orphan objects, which are inert; a crash
-    inside the second leaves nothing at all.
+    Cancellation that committed before the lock is observed before any success
+    artifact is promoted. Cancellation that arrives after the lock waits for the
+    completed result, so exactly one terminal serialization can win.
     """
 
     def __init__(
@@ -1263,6 +1462,20 @@ class DurableResultPublisher:
         self._persistence = persistence
         self._store = object_store
         self._port = storage_write_port
+        if (
+            binding.attempt_id is None
+            or binding.claim_token is None
+            or binding.cleanup_capability is None
+        ):
+            raise WiringError(
+                "durable result publication requires its protected producing attempt capability"
+            )
+        self._producer_claim = StorageObjectProducerClaim(
+            run_id=binding.run_id,
+            attempt_id=binding.attempt_id,
+            claim_token=binding.claim_token,
+            cleanup_capability=binding.cleanup_capability,
+        )
         self._published: ResultSnapshot | None = None
         self._bundle: DetailObjectBundle | None = None
 
@@ -1336,18 +1549,13 @@ class DurableResultPublisher:
         )
         bundle = DetailObjectBuilder().build(result, ledger, points, request.completed_at)
 
-        self._publish_result_object(result, request.completed_at)
-        published = DetailObjectPublisher(self._store, storage_write_port=self._port).publish(
-            bundle, verified_at=request.completed_at
-        )
-
         monthly = MonthlyJudgmentBuilder().build(
             snapshot.snapshot_id,
             result.manifest.result_manifest_id,
             _judgment_evaluations(snapshot.snapshot_id, request.evaluations),
             result.records,
         )
-        self._write(result, published.manifest_rows(), monthly, request.completed_at)
+        self._write(result, bundle, monthly, request.completed_at)
 
         self._published = result
         self._bundle = bundle
@@ -1359,13 +1567,23 @@ class DurableResultPublisher:
 
     # -- steps -------------------------------------------------------------
 
-    def _publish_result_object(self, result: ResultSnapshot, verified_at: datetime) -> None:
+    def _publish_result_object(
+        self,
+        result: ResultSnapshot,
+        verified_at: datetime,
+        upload_observer: Callable[[StorageObjectUpload], None],
+    ) -> StorageObjectRecord:
         """The result snapshot is an object too, and spec 2.5 wants a row for it."""
         manifest = result.manifest
         instants = [record.occurred_at for record in result.records]
         period_start = min(instants) if instants else manifest.completed_at
         period_end = max(instants) if instants else manifest.completed_at
-        StorageObjectRegistrar(self._store, self._port).publish(
+        return StorageObjectRegistrar(
+            self._store,
+            self._port,
+            producer_claim=self._producer_claim,
+            upload_observer=upload_observer,
+        ).publish(
             object_id=uuid.uuid5(
                 _RESULT_OBJECT_NAMESPACE,
                 f"{manifest.run_snapshot_id}|{manifest.content_hash}",
@@ -1381,68 +1599,354 @@ class DurableResultPublisher:
             expected_content_hash=manifest.content_hash,
             media_type=manifest.media_type,
             file_format=RESULT_OBJECT_FILE_FORMAT,
+        ).record
+
+    def _artifact_identities(
+        self,
+        result: ResultSnapshot,
+        bundle: DetailObjectBundle,
+    ) -> tuple[_PublicationArtifact, ...]:
+        manifest = result.manifest
+        result_object = _PublicationArtifact(
+            object_id=uuid.uuid5(
+                _RESULT_OBJECT_NAMESPACE,
+                f"{manifest.run_snapshot_id}|{manifest.content_hash}",
+            ),
+            storage_provider=self._store.storage_provider,
+            bucket_name=self._store.bucket_name,
+            object_key=manifest.object_key,
+            content_hash=manifest.content_hash,
         )
+        detail_objects = tuple(
+            _PublicationArtifact(
+                object_id=uuid.UUID(item.descriptor.storage_object_id),
+                storage_provider=self._store.storage_provider,
+                bucket_name=self._store.bucket_name,
+                object_key=item.descriptor.object_key,
+                content_hash=item.descriptor.content_hash,
+            )
+            for item in bundle.objects
+        )
+        return (result_object, *detail_objects)
+
+    def _cleanup_artifacts(
+        self,
+        artifacts: Sequence[_PublicationArtifact],
+        captured: Sequence[StorageObjectUpload] = (),
+    ) -> None:
+        """Preflight the whole exact-version batch, then compensate with retries."""
+
+        captured_by_id: dict[uuid.UUID, StorageObjectUpload] = {}
+        for observed_upload in captured:
+            previous = captured_by_id.get(observed_upload.record.object_id)
+            if previous is not None and not _same_stored_version(
+                previous.record,
+                observed_upload.record,
+            ):
+                raise ResultPublicationError(
+                    "publication cleanup observed conflicting uploaded versions",
+                    retryable=False,
+                    reason_code="RESULT_PUBLICATION_CLEANUP_CONFLICT",
+                )
+            captured_by_id[observed_upload.record.object_id] = observed_upload
+        last_failure: BaseException | None = None
+        for _attempt in range(3):
+            try:
+                registered: list[StorageObjectRecord] = []
+                direct: list[StorageObjectRecord] = []
+                preserved: list[StorageObjectRecord] = []
+                foreign_registration = False
+                for artifact in artifacts:
+                    upload = captured_by_id.get(artifact.object_id)
+                    current = self._port.find(artifact.object_id)
+                    if upload is None:
+                        if current is None:
+                            if self._store.exists(artifact.object_key):
+                                raise ObjectStoreConflict(
+                                    f"object {artifact.object_key} has no durable "
+                                    "provider-version identity"
+                                )
+                            continue
+                        if not artifact.matches(current):
+                            raise ObjectStoreConflict(
+                                f"storage object {artifact.object_id} no longer matches "
+                                "publication provider, bucket, key, or hash"
+                            )
+                        # A row from an earlier process has no object capability in
+                        # this publication journal.  It is never a cleanup candidate;
+                        # a successor can acquire it only by re-registering the exact
+                        # bytes, which executes the protected lineage reissue path.
+                        preserved.append(current)
+                        continue
+
+                    uploaded = upload.record
+                    if not artifact.matches(uploaded):
+                        raise ObjectStoreConflict(
+                            f"uploaded object {artifact.object_id} does not match the "
+                            "publication provider, bucket, key, or hash"
+                        )
+                    if (
+                        uploaded.storage_provider != self._store.storage_provider
+                        or uploaded.bucket_name != self._store.bucket_name
+                    ):
+                        raise ObjectStoreConflict(
+                            f"uploaded object {artifact.object_id} is outside the active store"
+                        )
+                    if current is not None and _same_stored_version(current, uploaded):
+                        if upload.cleanup_token is None:
+                            # Registration explicitly reconciled immutable bytes
+                            # without acquiring their ownership.  They may be used by
+                            # this publication, but never enter its compensation set.
+                            preserved.append(current)
+                        else:
+                            registered.append(current)
+                        continue
+
+                    # The upload was observed before registration. A conflicting row
+                    # cannot be unregistered, even when id/key/hash happen to agree.
+                    # Only bytes this call actually created can be removed directly.
+                    if not upload.newly_created:
+                        # The active-store version predates this publication. Keep it,
+                        # but include it in whole-batch preflight before compensating
+                        # any earlier objects this call did create and register.
+                        preserved.append(uploaded)
+                        if current is not None:
+                            # A different durable identity claimed the object id after
+                            # upload. Preserve the pre-existing bytes, but retain the
+                            # typed cleanup-conflict signal for the caller.
+                            foreign_registration = True
+                        continue
+                    direct.append(uploaded)
+                    if current is not None:
+                        foreign_registration = True
+
+                cleanup_tokens = {
+                    observed.record.object_id: observed.cleanup_token
+                    for observed in captured
+                    if observed.cleanup_token is not None
+                }
+                with self._port.cleanup_batch(
+                    tuple(registered),
+                    producer_claim=self._producer_claim,
+                    cleanup_tokens=cleanup_tokens,
+                ) as locked:
+                    locked_by_id = {record.object_id: record for record in locked}
+                    if set(locked_by_id) != {record.object_id for record in registered}:
+                        raise ObjectStoreConflict(
+                            "a registered publication artifact vanished before cleanup"
+                        )
+                    delete_candidates = tuple(locked) + tuple(direct)
+                    preflight_candidates = delete_candidates + tuple(preserved)
+                    present = tuple(
+                        self._store.preflight_delete(
+                            record.object_key,
+                            record.content_hash,
+                            record.provider_version_id,
+                        )
+                        for record in preflight_candidates
+                    )
+                    preserved_present = present[len(delete_candidates) :]
+                    if not all(preserved_present):
+                        raise ObjectStoreConflict(
+                            "a reconciled pre-existing publication artifact changed "
+                            "before cleanup"
+                        )
+                    for record, exists_exactly in zip(
+                        delete_candidates,
+                        present[: len(delete_candidates)],
+                        strict=True,
+                    ):
+                        if exists_exactly:
+                            self._store.delete_if_matches(
+                                record.object_key,
+                                record.content_hash,
+                                record.provider_version_id,
+                            )
+                if foreign_registration:
+                    raise ObjectStoreConflict(
+                        "a foreign provider or bucket registration owns a publication object id"
+                    )
+                return
+            except ObjectStoreConflict as exc:
+                raise ResultPublicationError(
+                    "publication cleanup refused an ambiguous, changed, or referenced artifact",
+                    retryable=False,
+                    reason_code="RESULT_PUBLICATION_CLEANUP_CONFLICT",
+                ) from exc
+            except Exception as exc:
+                last_failure = exc
+        kind = type(last_failure).__name__ if last_failure is not None else "UnknownError"
+        raise ResultPublicationError(
+            f"publication cleanup failed after 3 attempts: {kind}",
+            retryable=True,
+            reason_code="RESULT_PUBLICATION_CLEANUP_FAILED",
+        )
+
+    def _already_completed_publication(
+        self,
+        result: ResultSnapshot,
+        bundle: DetailObjectBundle,
+    ) -> bool:
+        """Reconcile a commit whose acknowledgement was lost before compensating."""
+
+        with self._persistence.read_only() as uow:
+            run = uow.runs.get(self._binding.run_id)
+            if (
+                run.status is not RunStatus.COMPLETED
+                or run.result_hash != result.summary.result_hash
+                or (
+                    run.result_manifest_id is not None
+                    and run.result_manifest_id
+                    != uuid.UUID(result.manifest.result_manifest_id)
+                )
+            ):
+                return False
+            durable_details = {
+                (row.object_id, row.detail_hash)
+                for row in uow.manifests.list_for_run(self._binding.run_id)
+            }
+        expected_details = {
+            (
+                uuid.UUID(item.descriptor.storage_object_id),
+                item.descriptor.detail_hash,
+            )
+            for item in bundle.objects
+        }
+        return durable_details == expected_details
 
     def _write(
         self,
         result: ResultSnapshot,
-        manifest_rows: Sequence[DetailManifestRow],
+        bundle: DetailObjectBundle,
         monthly: Sequence[MonthlyJudgmentSummary],
         completed_at: datetime,
-    ) -> None:
+    ) -> PublishedDetails:
         binding = self._binding
         performance = result.performance_row()
         bundle_id = binding.envelope.input_bundle_id
-        with self._persistence.unit_of_work() as uow:
-            uow.inputs.lock(
-                InputBundleRow(
-                    id=bundle_id,
-                    run_id=binding.run_id,
-                    bundle_hash=binding.input_bundle_fingerprint,
-                    as_of_at=binding.policy.period_end,
-                    locked_at=completed_at,
-                ),
-                datasets=tuple(
-                    InputDatasetRow(
-                        input_bundle_id=bundle_id,
-                        dataset_manifest_id=pin.manifest_id,
-                        purpose_code=pin.purpose_code,
-                        locked_dataset_hash=str(manifest["dataset_hash"]),
+        artifacts = self._artifact_identities(result, bundle)
+        captured: list[StorageObjectUpload] = []
+        cancellation_reason: str | None = None
+        published: PublishedDetails | None = None
+        try:
+            with self._persistence.unit_of_work() as uow:
+                locked_run = uow.runs.lock_for_terminal_publication(binding.run_id)
+                if locked_run.cancellation_requested_at is not None:
+                    self._cleanup_artifacts(artifacts, captured)
+                    if binding.attempt_id is not None and binding.claim_token is not None:
+                        closed = uow.attempts.close_fenced(
+                            binding.attempt_id,
+                            binding.claim_token,
+                            status=WorkStatus.SUCCEEDED,
+                            terminal_reason_code=WorkStatus.SUCCEEDED.value,
+                        )
+                        if closed.status is not WorkStatus.CANCELLED:
+                            raise PublishConflict(
+                                "cancellation-requested publication did not cancel its attempt"
+                            )
+                        cancelled_run = uow.runs.get(binding.run_id)
+                    else:
+                        cancelled_run = uow.runs.mark_cancelled(
+                            binding.run_id,
+                            completed_at,
+                            locked_run.cancellation_reason_code or "USER_CANCELLED",
+                        )
+                    cancellation_reason = (
+                        cancelled_run.cancellation_reason_code or "USER_CANCELLED"
                     )
-                    for pin, manifest in binding.manifests
-                ),
-                features=tuple(
-                    InputFeatureMaterializationRow(
-                        input_bundle_id=bundle_id,
-                        feature_materialization_id=pin.materialization_id,
-                        locked_result_hash=pin.locked_result_hash,
+                else:
+                    self._publish_result_object(
+                        result,
+                        completed_at,
+                        captured.append,
                     )
-                    for pin in binding.envelope.feature_materializations
-                ),
-            )
-            publish_completed_run(
-                uow,
-                RunPublication(
-                    run_id=binding.run_id,
-                    completed_at=completed_at,
-                    result_hash=result.summary.result_hash,
-                    performance=PerformanceSummaryRow(
-                        run_id=binding.run_id,
-                        metric_catalog_version=performance.metric_catalog_version,
-                        metrics_document=dict(performance.metrics_document),
-                        calculation_rules_version=performance.calculation_rules_version,
-                        source_set_hash=performance.source_set_hash,
-                        input_hash=performance.input_hash,
-                        result_hash=performance.result_hash,
-                        calculated_at=performance.calculated_at,
-                    ),
-                    monthly=tuple(_monthly_judgment(binding.run_id, summary) for summary in monthly),
-                    detail_manifests=tuple(manifest_rows),
-                    worker_execution_key=binding.worker_execution_key,
-                    attempt_id=binding.attempt_id,
-                    claim_token=binding.claim_token,
-                ),
-            )
+                    published = DetailObjectPublisher(
+                        self._store,
+                        storage_write_port=self._port,
+                        producer_claim=self._producer_claim,
+                        upload_observer=captured.append,
+                    ).publish(bundle, verified_at=completed_at)
+                    uow.inputs.lock(
+                        InputBundleRow(
+                            id=bundle_id,
+                            run_id=binding.run_id,
+                            bundle_hash=binding.input_bundle_fingerprint,
+                            as_of_at=binding.policy.period_end,
+                            locked_at=completed_at,
+                        ),
+                        datasets=tuple(
+                            InputDatasetRow(
+                                input_bundle_id=bundle_id,
+                                dataset_manifest_id=pin.manifest_id,
+                                purpose_code=pin.purpose_code,
+                                locked_dataset_hash=str(manifest["dataset_hash"]),
+                            )
+                            for pin, manifest in binding.manifests
+                        ),
+                        features=tuple(
+                            InputFeatureMaterializationRow(
+                                input_bundle_id=bundle_id,
+                                feature_materialization_id=pin.materialization_id,
+                                locked_result_hash=pin.locked_result_hash,
+                            )
+                            for pin in binding.envelope.feature_materializations
+                        ),
+                    )
+                    published_run = publish_completed_run(
+                        uow,
+                        RunPublication(
+                            run_id=binding.run_id,
+                            completed_at=completed_at,
+                            result_hash=result.summary.result_hash,
+                            performance=PerformanceSummaryRow(
+                                run_id=binding.run_id,
+                                metric_catalog_version=performance.metric_catalog_version,
+                                metrics_document=dict(performance.metrics_document),
+                                calculation_rules_version=performance.calculation_rules_version,
+                                source_set_hash=performance.source_set_hash,
+                                input_hash=performance.input_hash,
+                                result_hash=performance.result_hash,
+                                calculated_at=performance.calculated_at,
+                            ),
+                            monthly=tuple(
+                                _monthly_judgment(binding.run_id, summary)
+                                for summary in monthly
+                            ),
+                            detail_manifests=published.manifest_rows(),
+                            worker_execution_key=binding.worker_execution_key,
+                            attempt_id=binding.attempt_id,
+                            claim_token=binding.claim_token,
+                        ),
+                    )
+                    if published_run.status is RunStatus.CANCELLED:
+                        raise PublishConflict(
+                            "publication held the run lock but completed as cancellation"
+                        )
+        except Exception as exc:
+            if published is not None:
+                try:
+                    if self._already_completed_publication(result, bundle):
+                        return published
+                except Exception as fence_error:
+                    raise ResultPublicationError(
+                        "could not fence an ambiguous terminal publication before cleanup",
+                        retryable=True,
+                        reason_code="RESULT_PUBLICATION_CLEANUP_FAILED",
+                    ) from fence_error
+            if isinstance(exc, ResultPublicationError) and exc.reason_code.startswith(
+                "RESULT_PUBLICATION_CLEANUP_"
+            ):
+                raise
+            try:
+                self._cleanup_artifacts(artifacts, captured)
+            except ResultPublicationError as cleanup_error:
+                raise cleanup_error from exc
+            raise
+        if cancellation_reason is not None:
+            raise ResultPublicationCancelled(cancellation_reason)
+        if published is None:  # pragma: no cover - both terminal branches assign
+            raise AssertionError("publication produced neither cancellation nor detail objects")
+        return published
 
 
 def _monthly_judgment(run_id: uuid.UUID, summary: MonthlyJudgmentSummary) -> MonthlyJudgment:
@@ -1870,7 +2374,7 @@ class OrchestratorJobHandler:
         storage_write_port: Any,
         sink: ResultSink,
         attempt_policy: AttemptPolicy,
-        monitor: ResourceMonitor,
+        monitor: ResourceMonitor | Callable[[], ResourceMonitor],
         microstructure: ExecutionMicrostructurePolicy,
         fractional_policy: InstrumentFractionalPolicy,
         risk_limits: RiskLimits,
@@ -1897,7 +2401,11 @@ class OrchestratorJobHandler:
         self._port = storage_write_port
         self._sink = sink
         self._attempt_policy = attempt_policy
-        self._monitor = monitor
+        self._monitor_factory: Callable[[], ResourceMonitor]
+        if callable(monitor):
+            self._monitor_factory = monitor
+        else:
+            self._monitor_factory = lambda: monitor
         self._microstructure = microstructure
         self._fractional = fractional_policy
         self._risk_limits = risk_limits
@@ -1907,6 +2415,10 @@ class OrchestratorJobHandler:
         self._publication_lag = publication_lag
 
     # -- JobHandler --------------------------------------------------------
+
+    def _new_attempt_monitor(self) -> ResourceMonitor:
+        """Return a monitor whose CPU origin belongs to this job attempt."""
+        return self._monitor_factory()
 
     def __call__(self, job: Mapping[str, Any], context: JobContext) -> JobOutcome:
         try:
@@ -1926,16 +2438,27 @@ class OrchestratorJobHandler:
                 exc,
             )
             try:
-                self._publish(
-                    envelope,
-                    self._correlation_id,
-                    status="FAILED",
-                    delivery_attempt=context.receive_count,
-                    failedAt=_utc_text(self._wall_clock()),
-                    attempt=context.attempt_number,
-                    failureCode=exc.reason_code,
-                    retryable=False,
-                )
+                if exc.reason_code in {"REQUIRED_INPUT_UNAVAILABLE", "REQUIRED_DATA_UNAVAILABLE"}:
+                    self._publish(
+                        envelope,
+                        self._correlation_id,
+                        status="UNAVAILABLE",
+                        delivery_attempt=context.receive_count,
+                        decidedAt=_utc_text(self._wall_clock()),
+                        reasonCode=exc.reason_code,
+                        missingRequirements=[exc.reason_code],
+                    )
+                else:
+                    self._publish(
+                        envelope,
+                        self._correlation_id,
+                        status="FAILED",
+                        delivery_attempt=context.receive_count,
+                        failedAt=_utc_text(self._wall_clock()),
+                        attempt=context.attempt_number,
+                        failureCode=exc.reason_code,
+                        retryable=False,
+                    )
             except Exception:
                 _LOGGER.exception(
                     "terminal backtest result publish failed run_id=%s attempt=%s reason_code=%s; "
@@ -1994,7 +2517,7 @@ class OrchestratorJobHandler:
             wall_clock=self._wall_clock,
             publication_lag=self._publication_lag,
         )
-        monitor: ResourceMonitor = self._monitor
+        monitor = self._new_attempt_monitor()
         if context.cancellation_reason is not None:
             monitor = _CancellationAwareMonitor(monitor, coordinator, context.cancellation_reason, self._wall_clock)
         outcome = orchestrator.run(binding.job, coordinator=coordinator, lease=lease, monitor=monitor)
@@ -2219,6 +2742,7 @@ class OrchestratorJobHandler:
             worker_execution_key=context.worker_execution_key,
             attempt_id=(uuid.UUID(context.attempt_id) if context.attempt_id is not None else None),
             claim_token=(uuid.UUID(context.claim_token) if context.claim_token is not None else None),
+            cleanup_capability=context.cleanup_capability,
             manifest=manifest,
             policy=policy,
             plan=plan,

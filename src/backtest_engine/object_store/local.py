@@ -98,6 +98,47 @@ class LocalObjectStore:
     def exists(self, object_key: str) -> bool:
         return self.path_for(object_key).is_file()
 
+    def preflight_delete(
+        self,
+        object_key: str,
+        expected_sha256: str,
+        provider_version_id: str,
+    ) -> bool:
+        """Verify the exact content-addressed local version without mutating it."""
+        path = self.path_for(object_key)
+        if not path.is_file():
+            return False
+        actual = _sha256_file(path)
+        if provider_version_id != actual:
+            raise ObjectStoreConflict(
+                f"refusing to delete object {object_key} with a different provider version: "
+                f"stored {actual}, expected {provider_version_id}"
+            )
+        if actual != expected_sha256:
+            raise ObjectStoreConflict(
+                f"refusing to delete changed immutable object {object_key}: "
+                f"stored {actual}, expected {expected_sha256}"
+            )
+        return True
+
+    def delete_if_matches(
+        self,
+        object_key: str,
+        expected_sha256: str,
+        provider_version_id: str,
+    ) -> bool:
+        """Compensate only the exact unpublished content-addressed version."""
+
+        if not self.preflight_delete(object_key, expected_sha256, provider_version_id):
+            return False
+        path = self.path_for(object_key)
+        # Re-read immediately before unlink so a changed file cannot pass a stale
+        # preflight performed by a batch coordinator.
+        if not self.preflight_delete(object_key, expected_sha256, provider_version_id):
+            return False
+        path.unlink()
+        return True
+
     def open(self, object_key: str) -> BinaryIO:
         return self.path_for(object_key).open("rb")
 

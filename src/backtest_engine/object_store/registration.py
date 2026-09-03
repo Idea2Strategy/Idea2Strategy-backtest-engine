@@ -51,7 +51,10 @@ persistence package and one binding changes; no call site does. Nothing here aut
 
 from __future__ import annotations
 
+import secrets
 import threading
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Protocol
@@ -70,8 +73,11 @@ __all__ = [
     "InMemoryStorageObjectRegistry",
     "ObjectStatus",
     "RegisteredObject",
+    "StorageObjectProducerClaim",
     "StorageObjectRecord",
     "StorageObjectRegistrar",
+    "StorageObjectRegistration",
+    "StorageObjectUpload",
     "StorageObjectWritePort",
     "UnauthorizedStorageObjectWritePort",
 ]
@@ -270,10 +276,31 @@ class StorageObjectRecord:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class StorageObjectProducerClaim:
+    """Non-forgeable cleanup identity for the exact fenced producing attempt."""
+
+    run_id: UUID
+    attempt_id: UUID
+    claim_token: UUID
+    cleanup_capability: str
+
+    def __post_init__(self) -> None:
+        for label in ("run_id", "attempt_id", "claim_token"):
+            if not isinstance(getattr(self, label), UUID):
+                raise ValueError(f"{label} must be a UUID")
+        if (
+            not isinstance(self.cleanup_capability, str)
+            or len(self.cleanup_capability) != 64
+            or any(character not in "0123456789abcdef" for character in self.cleanup_capability)
+        ):
+            raise ValueError("cleanup_capability must be a 256-bit lowercase hex token")
+
+
 class StorageObjectWritePort(Protocol):
     """The narrow seam an authorised `storage.objects` writer plugs into.
 
-    Four operations, matching the canonical lifecycle exactly:
+    Six operations, matching the canonical lifecycle exactly:
 
     * `register` inserts the `STAGED` row and is idempotent on `object_id`. Offering a
       *different* object under an `object_id` that already exists is a conflict, never
@@ -282,18 +309,61 @@ class StorageObjectWritePort(Protocol):
       the verification time it is being granted for.
     * `quarantine` records a verification failure against the row that already exists.
     * `find` reads one row back, so a caller can prove the row is there.
+    * `cleanup_batch` locks and preflights every exact unreferenced artifact before
+      yielding control to object-store deletion, then unregisters the whole batch on
+      clean exit. Provider version, key, hash and id are mandatory fences.
 
     Implementing this against Postgres is a schema-ownership decision (see the module
     docstring), not a code change at any call site.
     """
 
-    def register(self, record: StorageObjectRecord) -> UUID: ...
+    def register(
+        self,
+        record: StorageObjectRecord,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_token: str | None = None,
+        created_by_attempt: bool = False,
+    ) -> UUID | StorageObjectRegistration: ...
 
-    def mark_available(self, object_id: UUID, verified_at: datetime) -> StorageObjectRecord: ...
+    def mark_available(
+        self,
+        object_id: UUID,
+        verified_at: datetime,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+    ) -> StorageObjectRecord: ...
 
-    def quarantine(self, object_id: UUID, quarantined_at: datetime) -> StorageObjectRecord: ...
+    def quarantine(
+        self,
+        object_id: UUID,
+        quarantined_at: datetime,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+    ) -> StorageObjectRecord: ...
 
     def find(self, object_id: UUID) -> StorageObjectRecord | None: ...
+
+    def cleanup_batch(
+        self,
+        records: Sequence[StorageObjectRecord],
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_tokens: Mapping[UUID, str] | None = None,
+    ) -> AbstractContextManager[tuple[StorageObjectRecord, ...]]: ...
+
+    def unregister(
+        self,
+        object_id: UUID,
+        *,
+        storage_provider: str,
+        bucket_name: str,
+        object_key: str,
+        provider_version_id: str,
+        content_hash: str,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_token: str | None = None,
+    ) -> bool: ...
 
 
 class UnauthorizedStorageObjectWritePort:
@@ -314,16 +384,66 @@ class UnauthorizedStorageObjectWritePort:
         "Resolve the ownership contradiction, then bind an authorised StorageObjectWritePort."
     )
 
-    def register(self, record: StorageObjectRecord) -> UUID:
+    def register(
+        self,
+        record: StorageObjectRecord,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_token: str | None = None,
+        created_by_attempt: bool = False,
+    ) -> UUID:
+        del producer_claim, cleanup_token, created_by_attempt
         raise StorageWriteNotAuthorized(f"{self.reason} (offered object_key={record.object_key})")
 
-    def mark_available(self, object_id: UUID, verified_at: datetime) -> StorageObjectRecord:
+    def mark_available(
+        self,
+        object_id: UUID,
+        verified_at: datetime,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+    ) -> StorageObjectRecord:
+        del producer_claim
         raise StorageWriteNotAuthorized(f"{self.reason} (offered object_id={object_id})")
 
-    def quarantine(self, object_id: UUID, quarantined_at: datetime) -> StorageObjectRecord:
+    def quarantine(
+        self,
+        object_id: UUID,
+        quarantined_at: datetime,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+    ) -> StorageObjectRecord:
+        del producer_claim
         raise StorageWriteNotAuthorized(f"{self.reason} (offered object_id={object_id})")
 
     def find(self, object_id: UUID) -> StorageObjectRecord | None:
+        raise StorageWriteNotAuthorized(f"{self.reason} (offered object_id={object_id})")
+
+    @contextmanager
+    def cleanup_batch(
+        self,
+        records: Sequence[StorageObjectRecord],
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_tokens: Mapping[UUID, str] | None = None,
+    ) -> Iterator[tuple[StorageObjectRecord, ...]]:
+        del producer_claim, cleanup_tokens
+        offered = records[0].object_id if records else "empty-batch"
+        raise StorageWriteNotAuthorized(f"{self.reason} (offered object_id={offered})")
+        yield ()  # pragma: no cover - contextmanager typing requires a generator
+
+    def unregister(
+        self,
+        object_id: UUID,
+        *,
+        storage_provider: str,
+        bucket_name: str,
+        object_key: str,
+        provider_version_id: str,
+        content_hash: str,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_token: str | None = None,
+    ) -> bool:
+        del producer_claim, cleanup_token
         raise StorageWriteNotAuthorized(f"{self.reason} (offered object_id={object_id})")
 
 
@@ -369,7 +489,15 @@ class InMemoryStorageObjectRegistry:
     def _same_object(left: StorageObjectRecord, right: StorageObjectRecord) -> bool:
         return all(getattr(left, column) == getattr(right, column) for column in _IDENTITY_COLUMNS)
 
-    def register(self, record: StorageObjectRecord) -> UUID:
+    def register(
+        self,
+        record: StorageObjectRecord,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_token: str | None = None,
+        created_by_attempt: bool = False,
+    ) -> UUID:
+        del producer_claim, cleanup_token, created_by_attempt
         if not isinstance(record, StorageObjectRecord):
             raise TypeError(f"record must be a StorageObjectRecord, got {type(record).__name__}")
         if record.status is not ObjectStatus.STAGED:
@@ -397,7 +525,14 @@ class InMemoryStorageObjectRegistry:
             self._object_id_by_key[key] = record.object_id
             return record.object_id
 
-    def mark_available(self, object_id: UUID, verified_at: datetime) -> StorageObjectRecord:
+    def mark_available(
+        self,
+        object_id: UUID,
+        verified_at: datetime,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+    ) -> StorageObjectRecord:
+        del producer_claim
         with self._lock:
             current = self._require(object_id)
             if current.status is ObjectStatus.AVAILABLE:
@@ -410,7 +545,14 @@ class InMemoryStorageObjectRegistry:
             self._rows[object_id] = promoted
             return promoted
 
-    def quarantine(self, object_id: UUID, quarantined_at: datetime) -> StorageObjectRecord:
+    def quarantine(
+        self,
+        object_id: UUID,
+        quarantined_at: datetime,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+    ) -> StorageObjectRecord:
+        del producer_claim
         with self._lock:
             quarantined = self._require(object_id).quarantined(quarantined_at)
             self._rows[object_id] = quarantined
@@ -419,6 +561,94 @@ class InMemoryStorageObjectRegistry:
     def find(self, object_id: UUID) -> StorageObjectRecord | None:
         with self._lock:
             return self._rows.get(object_id)
+
+    @staticmethod
+    def _require_cleanup_identity(
+        current: StorageObjectRecord,
+        offered: StorageObjectRecord,
+    ) -> None:
+        if current.provider_version_id != offered.provider_version_id:
+            raise ObjectStoreConflict(
+                f"refusing to unregister storage object {current.object_id} with a "
+                "different provider version"
+            )
+        if any(
+            getattr(current, field) != getattr(offered, field)
+            for field in (
+                "storage_provider",
+                "bucket_name",
+                "object_key",
+                "content_hash",
+            )
+        ):
+            raise ObjectStoreConflict(
+                f"refusing to unregister changed storage object {current.object_id}"
+            )
+
+    @contextmanager
+    def cleanup_batch(
+        self,
+        records: Sequence[StorageObjectRecord],
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_tokens: Mapping[UUID, str] | None = None,
+    ) -> Iterator[tuple[StorageObjectRecord, ...]]:
+        """Hold the registry lock across all preflight and external deletion."""
+
+        del producer_claim, cleanup_tokens
+        with self._lock:
+            locked: list[StorageObjectRecord] = []
+            seen: set[UUID] = set()
+            for offered in records:
+                if offered.object_id in seen:
+                    continue
+                seen.add(offered.object_id)
+                current = self._rows.get(offered.object_id)
+                if current is None:
+                    continue
+                self._require_cleanup_identity(current, offered)
+                locked.append(current)
+            yield tuple(locked)
+            for current in locked:
+                del self._rows[current.object_id]
+                self._object_id_by_key.pop(self._key(current), None)
+
+    def unregister(
+        self,
+        object_id: UUID,
+        *,
+        storage_provider: str,
+        bucket_name: str,
+        object_key: str,
+        provider_version_id: str,
+        content_hash: str,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        cleanup_token: str | None = None,
+    ) -> bool:
+        del producer_claim, cleanup_token
+        with self._lock:
+            current = self._rows.get(object_id)
+            if current is None:
+                return False
+            if current.provider_version_id != provider_version_id:
+                raise ObjectStoreConflict(
+                    f"refusing to unregister storage object {object_id} with a "
+                    "different provider version"
+                )
+            if any(
+                (
+                    current.storage_provider != storage_provider,
+                    current.bucket_name != bucket_name,
+                    current.object_key != object_key,
+                    current.content_hash != content_hash,
+                )
+            ):
+                raise ObjectStoreConflict(
+                    f"refusing to unregister changed storage object {object_id}"
+                )
+            del self._rows[object_id]
+            self._object_id_by_key.pop(self._key(current), None)
+            return True
 
     def rows(self) -> tuple[StorageObjectRecord, ...]:
         """Every row, ordered by object key so assertions are stable."""
@@ -439,14 +669,53 @@ class RegisteredObject:
 
     receipt: ObjectReceipt
     record: StorageObjectRecord
+    producer_claim: StorageObjectProducerClaim | None = None
+    cleanup_token: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StorageObjectRegistration:
+    """Registration result, including whether this caller owns compensation.
+
+    A durable content-addressed object may already exist because another run
+    published the same immutable bytes.  Reconciliation may use that object, but
+    it must not hand the new caller a deletion capability.  Durable ports return
+    this richer result; UUID-only legacy/in-memory ports retain their contract.
+    """
+
+    object_id: UUID
+    cleanup_owned: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StorageObjectUpload:
+    """Exact candidate identity observed after upload and before registration."""
+
+    receipt: ObjectReceipt
+    record: StorageObjectRecord
+    producer_claim: StorageObjectProducerClaim | None = None
+    cleanup_token: str | None = None
+
+    @property
+    def newly_created(self) -> bool:
+        return not self.receipt.reconciled
 
 
 class StorageObjectRegistrar:
     """Publish bytes and register the single `storage.objects` row for them."""
 
-    def __init__(self, store: ObjectStore, port: StorageObjectWritePort) -> None:
+    def __init__(
+        self,
+        store: ObjectStore,
+        port: StorageObjectWritePort,
+        *,
+        producer_claim: StorageObjectProducerClaim | None = None,
+        upload_observer: Callable[[StorageObjectUpload], None] | None = None,
+    ) -> None:
         self._store = store
         self._port = port
+        self._producer_claim = producer_claim
+        self._upload_observer = upload_observer
 
     @property
     def store(self) -> ObjectStore:
@@ -502,14 +771,70 @@ class StorageObjectRegistrar:
             retention_until=retention_until,
             legal_hold=legal_hold,
         )
-        registered_id = self._port.register(staged)
+        cleanup_token = secrets.token_hex(32) if self._producer_claim is not None else None
+        try:
+            if self._producer_claim is None:
+                # Preserve the claim-free in-memory/unauthorized port contract.  The
+                # extra capability arguments are load-bearing only for durable
+                # backtest publication and need not widen unrelated port adapters.
+                registration = self._port.register(staged)
+            else:
+                registration = self._port.register(
+                    staged,
+                    producer_claim=self._producer_claim,
+                    cleanup_token=cleanup_token,
+                    created_by_attempt=not receipt.reconciled,
+                )
+        except BaseException:
+            # The bytes exist even when row registration fails (or its commit
+            # acknowledgement is lost).  Record their exact provider version, but
+            # never claim a cleanup token whose durable ownership is unproven.
+            if self._upload_observer is not None:
+                self._upload_observer(
+                    StorageObjectUpload(
+                        receipt=receipt,
+                        record=staged,
+                        producer_claim=self._producer_claim,
+                        cleanup_token=None,
+                    )
+                )
+            raise
+
+        if isinstance(registration, StorageObjectRegistration):
+            registered_id = registration.object_id
+            if not registration.cleanup_owned:
+                cleanup_token = None
+        else:
+            registered_id = registration
+        if self._upload_observer is not None:
+            self._upload_observer(
+                StorageObjectUpload(
+                    receipt=receipt,
+                    record=staged,
+                    producer_claim=self._producer_claim,
+                    cleanup_token=cleanup_token,
+                )
+            )
 
         check = self._store.verify(object_key, receipt.content_hash, deep=True)
         if not check.ok:
             # The row is not deleted: a quarantined object is auditable evidence, and a
             # missing row would make the failure invisible.
-            self._port.quarantine(registered_id, verified_at)
+            self._port.quarantine(
+                registered_id,
+                verified_at,
+                producer_claim=self._producer_claim,
+            )
             raise ObjectVerificationError(
                 f"stored object failed verification and was quarantined: {object_key} ({check.message})"
             )
-        return RegisteredObject(receipt=receipt, record=self._port.mark_available(registered_id, verified_at))
+        return RegisteredObject(
+            receipt=receipt,
+            record=self._port.mark_available(
+                registered_id,
+                verified_at,
+                producer_claim=self._producer_claim,
+            ),
+            producer_claim=self._producer_claim,
+            cleanup_token=cleanup_token,
+        )

@@ -91,6 +91,7 @@ __all__ = [
     "ReplayOutcome",
     "ReplayStatus",
     "ReplayStep",
+    "ResultPublicationCancelled",
     "ResultPublicationError",
     "ResultPublisher",
     "SessionCalendar",
@@ -189,6 +190,17 @@ class ResultPublicationError(RuntimeError):
         super().__init__(message)
         self.retryable = retryable
         self.reason_code = reason_code
+
+
+class ResultPublicationCancelled(ResultPublicationError):
+    """Atomic result publication observed a committed cancellation request."""
+
+    def __init__(self, reason_code: str) -> None:
+        super().__init__(
+            "result publication cancelled by the durable run",
+            retryable=False,
+            reason_code=reason_code,
+        )
 
 
 class ReplayStatus(StrEnum):
@@ -1006,6 +1018,16 @@ class BacktestOrchestrator:
         )
         try:
             published = self._publisher.publish(request)
+        except ResultPublicationCancelled as cancellation:
+            return ReplayOutcome(
+                run_id=job.run_id,
+                status=ReplayStatus.CANCELLED,
+                availability_status=assessment.status,
+                steps=steps,
+                replay_digest=digest,
+                reason_code=cancellation.reason_code,
+                retryable=False,
+            )
         except Exception as exc:
             # The replay itself succeeded; only the write-out failed. Which reason code
             # and which retryability are the publisher's to state (`ResultPublicationError`);

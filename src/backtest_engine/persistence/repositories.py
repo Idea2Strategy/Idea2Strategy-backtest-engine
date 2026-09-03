@@ -20,13 +20,16 @@ controls they are:
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import json
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
-from sqlalchemy import Connection, Row, Select, case, func, select, update
+from sqlalchemy import Connection, Row, Select, case, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import DBAPIError
 
 from .errors import (
     AttemptNumberConflict,
@@ -84,6 +87,81 @@ __all__ = [
     "StorageObjectReader",
     "StorageObjectRepository",
 ]
+
+
+_PREPARE_BACKTEST_OBJECT_CLEANUP = text(
+    "SELECT * FROM storage.prepare_backtest_object_cleanup(CAST(:candidates AS jsonb))"
+)
+_REISSUE_BACKTEST_OBJECT_CLEANUP = text(
+    "SELECT storage.reissue_backtest_object_cleanup(CAST(:candidate AS jsonb), :new_cleanup_token_hash)"
+)
+_CLAIM_RUN_ATTEMPT = text(
+    "SELECT * FROM backtest.claim_run_attempt(:run_id, :worker_id, :execution_key, :lease_milliseconds)"
+)
+_HEARTBEAT_RUN_ATTEMPT = text(
+    "SELECT * FROM backtest.heartbeat_run_attempt(:attempt_id, :claim_token, :lease_milliseconds)"
+)
+_CLOSE_RUN_ATTEMPT = text(
+    "SELECT * FROM backtest.close_run_attempt("
+    ":attempt_id, :claim_token, :status, :terminal_reason_code, :failure_code, :requeue)"
+)
+_REGISTER_BACKTEST_OBJECT = text("SELECT * FROM storage.register_backtest_object(CAST(:object_document AS jsonb))")
+_TRANSITION_BACKTEST_OBJECT = text(
+    "SELECT * FROM storage.transition_backtest_object(:object_id, :target, :transitioned_at)"
+)
+
+
+def _json_default(value: Any) -> str:
+    if isinstance(value, (UUID, date, datetime)):
+        return str(value) if isinstance(value, UUID) else value.isoformat()
+    raise TypeError(f"unsupported JSON value: {type(value).__name__}")
+
+
+def _storage_object_document(row: StorageObjectRow) -> str:
+    return json.dumps(
+        row_to_params(row),
+        default=_json_default,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _lease_milliseconds(value: timedelta) -> int:
+    milliseconds = int(value.total_seconds() * 1000)
+    if milliseconds <= 0:
+        raise ValueError("lease_duration must be at least one millisecond")
+    return milliseconds
+
+
+def _object_identity_payload(candidate: StorageObjectRow) -> dict[str, str]:
+    return {
+        "object_id": str(candidate.id),
+        "storage_provider": candidate.storage_provider,
+        "bucket_name": candidate.bucket_name,
+        "object_key": candidate.object_key,
+        "provider_version_id": candidate.provider_version_id,
+        "content_hash": candidate.content_hash,
+    }
+
+
+def _cleanup_candidate_payload(
+    candidates: Sequence[StorageObjectRow],
+    cleanup_tokens: Mapping[UUID, str],
+) -> str:
+    return json.dumps(
+        [
+            {**_object_identity_payload(candidate), "cleanup_token": cleanup_tokens[candidate.id]}
+            for candidate in candidates
+        ],
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _cleanup_failure_message(exc: DBAPIError) -> str:
+    diagnostic = getattr(exc.orig, "diag", None)
+    primary = getattr(diagnostic, "message_primary", None)
+    return str(primary or exc.orig).splitlines()[0]
 
 
 _ENUM_FIELDS: dict[type, dict[str, type]] = {
@@ -186,6 +264,17 @@ class RunRepository(_Repository):
 
     def get(self, run_id: UUID) -> RunRow:
         found = self._fetch_one(select(runs).where(runs.c.id == run_id), RunRow)
+        if found is None:
+            raise RowNotFound(f"backtest run not found: {run_id}")
+        return found
+
+    def lock_for_terminal_publication(self, run_id: UUID) -> RunRow:
+        """Serialize result promotion with cancellation on the run row."""
+
+        found = self._fetch_one(
+            select(runs).where(runs.c.id == run_id).with_for_update(),
+            RunRow,
+        )
         if found is None:
             raise RowNotFound(f"backtest run not found: {run_id}")
         return found
@@ -441,133 +530,32 @@ class RunAttemptRepository(_Repository):
             raise ValueError("worker_id and execution_key must not be blank")
         if lease_duration <= timedelta(0):
             raise ValueError("lease_duration must be positive")
-        run = (
-            self._connection.execute(
-                select(runs.c.status, runs.c.cancellation_requested_at).where(runs.c.id == run_id).with_for_update()
-            )
-            .mappings()
-            .first()
-        )
-        if run is None:
-            raise RowNotFound(f"backtest run not found: {run_id}")
-        if (
-            run["status"]
-            in {
-                RunStatus.COMPLETED.value,
-                RunStatus.FAILED.value,
-                RunStatus.CANCELLED.value,
-                RunStatus.UNAVAILABLE.value,
-            }
-            or run["cancellation_requested_at"] is not None
-        ):
-            return None
-
-        now = self._connection.scalar(select(func.clock_timestamp()))
-        assert isinstance(now, datetime)
-        latest = (
-            self._connection.execute(
-                select(run_attempts)
-                .where(run_attempts.c.run_id == run_id)
-                .order_by(run_attempts.c.attempt_number.desc())
-                .limit(1)
-                .with_for_update()
-            )
-            .mappings()
-            .first()
-        )
-        previous_attempt_id: UUID | None = None
-        next_number = 1
-        if latest is not None:
-            next_number = int(latest["attempt_number"]) + 1
-            if latest["status"] in {
-                WorkStatus.SUCCEEDED.value,
-                WorkStatus.CANCELLED.value,
-                WorkStatus.SKIPPED.value,
-            }:
-                return None
-            if latest["status"] == WorkStatus.FAILED.value and latest["terminal_reason_code"] not in {
-                "LEASE_EXPIRED",
-                "RETRY_RELEASED",
-            }:
-                return None
-            if latest["status"] == WorkStatus.RUNNING.value:
-                expires_at = latest["claim_expires_at"]
-                if expires_at is not None and expires_at > now:
-                    return None
-                closed = self._connection.execute(
-                    update(run_attempts)
-                    .where(
-                        run_attempts.c.id == latest["id"],
-                        run_attempts.c.claim_token == latest["claim_token"],
-                        run_attempts.c.status == WorkStatus.RUNNING.value,
-                        run_attempts.c.claim_expires_at <= now,
-                    )
-                    .values(
-                        status=WorkStatus.FAILED.value,
-                        completed_at=now,
-                        failure_code="LEASE_EXPIRED",
-                        terminal_reason_code="LEASE_EXPIRED",
-                    )
-                )
-                if closed.rowcount != 1:
-                    raise StaleAttemptClaim("expired attempt was reclaimed concurrently")
-                previous_attempt_id = latest["id"]
-
-        attempt_id = uuid4()
-        claim_token = uuid4()
-        attempt_key = f"{execution_key}:{next_number}"
-        if len(attempt_key) > 160:
-            raise ValueError("versioned worker execution key exceeds varchar(160)")
         inserted = (
             self._connection.execute(
-                pg_insert(run_attempts)
-                .values(
-                    id=attempt_id,
-                    run_id=run_id,
-                    attempt_number=next_number,
-                    worker_execution_key=attempt_key,
-                    status=WorkStatus.RUNNING.value,
-                    claim_token=claim_token,
-                    worker_id=worker_id,
-                    claimed_at=now,
-                    claim_expires_at=now + lease_duration,
-                    last_heartbeat_at=now,
-                    previous_attempt_id=previous_attempt_id,
-                    started_at=now,
-                )
-                .on_conflict_do_nothing()
-                .returning(*run_attempts.c)
+                _CLAIM_RUN_ATTEMPT,
+                {
+                    "run_id": run_id,
+                    "worker_id": worker_id,
+                    "execution_key": execution_key,
+                    "lease_milliseconds": _lease_milliseconds(lease_duration),
+                },
             )
             .mappings()
             .first()
         )
-        if inserted is None:
-            raise StaleAttemptClaim("attempt slot or execution key was claimed concurrently")
-        changed = self._connection.execute(
-            update(runs)
-            .where(runs.c.id == run_id, runs.c.status == RunStatus.QUEUED.value)
-            .values(status=RunStatus.RUNNING.value, started_at=func.coalesce(runs.c.started_at, now))
-        )
-        if changed.rowcount not in (0, 1):
-            raise StaleAttemptClaim("run claim affected an unexpected row count")
-        return _hydrate(RunAttemptRow, inserted)
+        return None if inserted is None else _hydrate(RunAttemptRow, inserted)
 
     def heartbeat_fenced(self, attempt_id: UUID, claim_token: UUID, *, lease_duration: timedelta) -> RunAttemptRow:
         if lease_duration <= timedelta(0):
             raise ValueError("lease_duration must be positive")
-        now = self._connection.scalar(select(func.clock_timestamp()))
-        assert isinstance(now, datetime)
         updated = (
             self._connection.execute(
-                update(run_attempts)
-                .where(
-                    run_attempts.c.id == attempt_id,
-                    run_attempts.c.claim_token == claim_token,
-                    run_attempts.c.status == WorkStatus.RUNNING.value,
-                    run_attempts.c.claim_expires_at > now,
-                )
-                .values(last_heartbeat_at=now, claim_expires_at=now + lease_duration)
-                .returning(*run_attempts.c)
+                _HEARTBEAT_RUN_ATTEMPT,
+                {
+                    "attempt_id": attempt_id,
+                    "claim_token": claim_token,
+                    "lease_milliseconds": _lease_milliseconds(lease_duration),
+                },
             )
             .mappings()
             .first()
@@ -609,15 +597,7 @@ class RunAttemptRepository(_Repository):
             status=WorkStatus.FAILED,
             terminal_reason_code=terminal_reason_code,
             failure_code=failure_code,
-        )
-        self._connection.execute(
-            update(runs)
-            .where(
-                runs.c.id == run_id,
-                runs.c.status == RunStatus.RUNNING.value,
-                runs.c.cancellation_requested_at.is_(None),
-            )
-            .values(status=RunStatus.QUEUED.value)
+            requeue=True,
         )
         return closed
 
@@ -629,70 +609,26 @@ class RunAttemptRepository(_Repository):
         status: WorkStatus,
         terminal_reason_code: str,
         failure_code: str | None = None,
+        requeue: bool = False,
     ) -> RunAttemptRow:
         if status in (WorkStatus.PENDING, WorkStatus.RUNNING):
             raise ValueError("close_fenced requires a terminal status")
-        attempt = (
-            self._connection.execute(select(run_attempts.c.run_id).where(run_attempts.c.id == attempt_id))
-            .mappings()
-            .first()
-        )
-        if attempt is None:
-            raise StaleAttemptClaim("terminal mutation matched no attempt")
-        run = (
-            self._connection.execute(
-                select(runs.c.status, runs.c.cancellation_requested_at)
-                .where(runs.c.id == attempt["run_id"])
-                .with_for_update()
-            )
-            .mappings()
-            .first()
-        )
-        if run is None:
-            raise RowNotFound(f"backtest run not found: {attempt['run_id']}")
-        locked_attempt = self._connection.execute(
-            select(run_attempts.c.id).where(run_attempts.c.id == attempt_id).with_for_update()
-        ).first()
-        if locked_attempt is None:
-            raise StaleAttemptClaim("terminal mutation matched no attempt")
-        now = self._connection.scalar(select(func.clock_timestamp()))
-        assert isinstance(now, datetime)
-        if run["cancellation_requested_at"] is not None and status is WorkStatus.SUCCEEDED:
-            status = WorkStatus.CANCELLED
-            terminal_reason_code = "CANCELLED_BY_REQUEST"
-            failure_code = None
-            self._connection.execute(
-                update(runs)
-                .where(runs.c.id == attempt["run_id"], runs.c.status == RunStatus.RUNNING.value)
-                .values(status=RunStatus.CANCELLED.value, cancelled_at=now, completed_at=now)
-            )
         updated = (
             self._connection.execute(
-                update(run_attempts)
-                .where(
-                    run_attempts.c.id == attempt_id,
-                    run_attempts.c.claim_token == claim_token,
-                    run_attempts.c.status == WorkStatus.RUNNING.value,
-                    run_attempts.c.claim_expires_at > now,
-                )
-                .values(
-                    status=status.value,
-                    completed_at=now,
-                    terminal_reason_code=terminal_reason_code,
-                    failure_code=failure_code,
-                )
-                .returning(*run_attempts.c)
+                _CLOSE_RUN_ATTEMPT,
+                {
+                    "attempt_id": attempt_id,
+                    "claim_token": claim_token,
+                    "status": status.value,
+                    "terminal_reason_code": terminal_reason_code,
+                    "failure_code": failure_code,
+                    "requeue": requeue,
+                },
             )
             .mappings()
             .first()
         )
         if updated is None:
-            existing = self._fetch_one(
-                select(run_attempts).where(run_attempts.c.id == attempt_id),
-                RunAttemptRow,
-            )
-            if existing is not None and existing.claim_token == claim_token and existing.status is status:
-                return existing
             raise StaleAttemptClaim("terminal mutation matched no live attempt claim")
         return _hydrate(RunAttemptRow, updated)
 
@@ -1222,7 +1158,12 @@ class StorageObjectRepository(StorageObjectReader):
     ordinary application traffic; creating tables in one is not.
     """
 
-    def register(self, row: StorageObjectRow) -> tuple[StorageObjectRow, bool]:
+    def register(
+        self,
+        row: StorageObjectRow,
+        *,
+        via_capability: bool = False,
+    ) -> tuple[StorageObjectRow, bool]:
         """Register a staged object. Returns `(row, inserted)`.
 
         Idempotent on `id`: re-registering an identical object is the at-least-once
@@ -1242,13 +1183,21 @@ class StorageObjectRepository(StorageObjectReader):
         # (storage_provider, bucket_name, object_key, provider_version_id). Naming only
         # the primary key would let a re-registration raise IntegrityError from the
         # natural key instead of being recognised as the duplicate it is.
-        statement = (
-            pg_insert(storage_objects)
-            .values(**row_to_params(row))
-            .on_conflict_do_nothing()
-            .returning(*storage_objects.c)
-        )
-        inserted = _first(self._connection.execute(statement).all())
+        if via_capability:
+            inserted = _first(
+                self._connection.execute(
+                    _REGISTER_BACKTEST_OBJECT,
+                    {"object_document": _storage_object_document(row)},
+                ).all()
+            )
+        else:
+            statement = (
+                pg_insert(storage_objects)
+                .values(**row_to_params(row))
+                .on_conflict_do_nothing()
+                .returning(*storage_objects.c)
+            )
+            inserted = _first(self._connection.execute(statement).all())
         if inserted is not None:
             return _hydrate(StorageObjectRow, inserted), True
 
@@ -1272,16 +1221,56 @@ class StorageObjectRepository(StorageObjectReader):
             )
         return existing, False
 
-    def mark_available(self, object_id: UUID, verified_at: datetime) -> StorageObjectRow:
+    def reissue_cleanup_capability(
+        self,
+        row: StorageObjectRow,
+        new_cleanup_token_hash: str,
+    ) -> bool:
+        """Transfer an eligible predecessor object; preserve other exact objects."""
+
+        try:
+            reissued = self._connection.scalar(
+                _REISSUE_BACKTEST_OBJECT_CLEANUP,
+                {
+                    "candidate": json.dumps(
+                        _object_identity_payload(row),
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    "new_cleanup_token_hash": new_cleanup_token_hash,
+                },
+            )
+        except DBAPIError as exc:
+            raise PublishConflict(_cleanup_failure_message(exc)) from exc
+        if reissued is None:
+            return False
+        if reissued != row.id:
+            raise PublishConflict("cleanup capability reissue returned the wrong object id")
+        return True
+
+    def mark_available(
+        self,
+        object_id: UUID,
+        verified_at: datetime,
+        *,
+        via_capability: bool = False,
+    ) -> StorageObjectRow:
         """Publish a verified object. Only `STAGED` may become `AVAILABLE`."""
         return self._transition(
             object_id,
             ObjectStatus.AVAILABLE,
             allowed_from=(ObjectStatus.STAGED,),
+            via_capability=via_capability,
             verified_at=verified_at,
         )
 
-    def quarantine(self, object_id: UUID, quarantined_at: datetime) -> StorageObjectRow:
+    def quarantine(
+        self,
+        object_id: UUID,
+        quarantined_at: datetime,
+        *,
+        via_capability: bool = False,
+    ) -> StorageObjectRow:
         """Quarantine an object whose bytes failed verification.
 
         Reachable from `AVAILABLE` as well as `STAGED`: corruption can be discovered
@@ -1291,8 +1280,120 @@ class StorageObjectRepository(StorageObjectReader):
             object_id,
             ObjectStatus.QUARANTINED,
             allowed_from=(ObjectStatus.STAGED, ObjectStatus.AVAILABLE),
+            via_capability=via_capability,
             quarantined_at=quarantined_at,
         )
+
+    def unregister_unreferenced(
+        self,
+        object_id: UUID,
+        *,
+        storage_provider: str,
+        bucket_name: str,
+        object_key: str,
+        provider_version_id: str,
+        content_hash: str,
+        cleanup_token: str,
+    ) -> bool:
+        """Remove an uncommitted publication artifact by exact immutable identity."""
+
+        current = self.find(object_id)
+        if current is None:
+            return False
+        if current.provider_version_id != provider_version_id:
+            raise PublishConflict(
+                f"refusing to unregister storage object {object_id} with a different provider version"
+            )
+        if any(
+            (
+                current.storage_provider != storage_provider,
+                current.bucket_name != bucket_name,
+                current.object_key != object_key,
+                current.content_hash != content_hash,
+            )
+        ):
+            raise PublishConflict(f"refusing to unregister changed storage object {object_id}")
+        locked = self.preflight_unregister_unreferenced(
+            (current,),
+            {current.id: cleanup_token},
+        )
+        return bool(locked)
+
+    @contextmanager
+    def cleanup_unreferenced_batch(
+        self,
+        candidates: Sequence[StorageObjectRow],
+        cleanup_tokens: Mapping[UUID, str],
+    ) -> Iterator[tuple[StorageObjectRow, ...]]:
+        """Delete transactionally, then hold every fence through the external gate.
+
+        The SECURITY DEFINER capability performs the row DELETE before returning.
+        Nothing commits until this context exits: an external-store exception rolls
+        the row deletion back, and a database rejection cannot arrive after bytes
+        have already disappeared.
+        """
+
+        locked = self.preflight_unregister_unreferenced(candidates, cleanup_tokens)
+        yield locked
+
+    def preflight_unregister_unreferenced(
+        self,
+        candidates: Sequence[StorageObjectRow],
+        cleanup_tokens: Mapping[UUID, str],
+    ) -> tuple[StorageObjectRow, ...]:
+        """Lock and validate every cleanup row before any external object delete."""
+
+        ordered: list[StorageObjectRow] = []
+        by_id: dict[UUID, StorageObjectRow] = {}
+        for candidate in candidates:
+            previous = by_id.get(candidate.id)
+            if previous is not None and previous != candidate:
+                raise PublishConflict(f"cleanup batch offers conflicting identities for storage object {candidate.id}")
+            by_id[candidate.id] = candidate
+        if not by_id:
+            return ()
+        try:
+            rows = self._connection.execute(
+                _PREPARE_BACKTEST_OBJECT_CLEANUP,
+                {
+                    "candidates": _cleanup_candidate_payload(
+                        tuple(by_id.values()),
+                        cleanup_tokens,
+                    )
+                },
+            ).mappings()
+            current_by_id = {row["id"]: _hydrate(StorageObjectRow, row) for row in rows}
+        except DBAPIError as exc:
+            raise PublishConflict(_cleanup_failure_message(exc)) from exc
+
+        unexpected = set(current_by_id).difference(by_id)
+        if unexpected:
+            raise PublishConflict(
+                "cleanup capability returned storage objects that were not offered: "
+                f"{sorted(str(value) for value in unexpected)}"
+            )
+        for candidate in candidates:
+            if any(item.id == candidate.id for item in ordered):
+                continue
+            current = current_by_id.get(candidate.id)
+            if current is None:
+                continue
+            if current.provider_version_id != candidate.provider_version_id:
+                raise PublishConflict(
+                    f"refusing to unregister storage object {candidate.id} with a different provider version"
+                )
+            if any(
+                getattr(current, field) != getattr(candidate, field)
+                for field in (
+                    "storage_provider",
+                    "bucket_name",
+                    "object_key",
+                    "content_hash",
+                )
+            ):
+                raise PublishConflict(f"refusing to unregister changed storage object {candidate.id}")
+            ordered.append(current)
+        return tuple(ordered)
 
     def _transition(
         self,
@@ -1300,18 +1401,32 @@ class StorageObjectRepository(StorageObjectReader):
         target: ObjectStatus,
         *,
         allowed_from: Sequence[ObjectStatus],
+        via_capability: bool = False,
         **values: Any,
     ) -> StorageObjectRow:
-        statement = (
-            update(storage_objects)
-            .where(
-                storage_objects.c.id == object_id,
-                storage_objects.c.status.in_([source.value for source in allowed_from]),
+        if via_capability:
+            transitioned_at = values.get("verified_at") or values.get("quarantined_at")
+            updated = _first(
+                self._connection.execute(
+                    _TRANSITION_BACKTEST_OBJECT,
+                    {
+                        "object_id": object_id,
+                        "target": target.value,
+                        "transitioned_at": transitioned_at,
+                    },
+                ).all()
             )
-            .values(status=target.value, **values)
-            .returning(*storage_objects.c)
-        )
-        updated = _first(self._connection.execute(statement).all())
+        else:
+            statement = (
+                update(storage_objects)
+                .where(
+                    storage_objects.c.id == object_id,
+                    storage_objects.c.status.in_([source.value for source in allowed_from]),
+                )
+                .values(status=target.value, **values)
+                .returning(*storage_objects.c)
+            )
+            updated = _first(self._connection.execute(statement).all())
         if updated is not None:
             return _hydrate(StorageObjectRow, updated)
 
