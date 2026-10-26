@@ -167,6 +167,6 @@ def test_ddl_really_did_not_happen(persistence: BacktestPersistence, admin_engin
         uow.connection.execute(text("CREATE TABLE backtest.sneaky (id uuid PRIMARY KEY)"))
 
     with admin_engine.connect() as connection:
-        exists = connection.execute(text("SELECT to_regclass('backtest.sneaky') IS NOT NULL")).scalar_one()
+        exists: bool = connection.execute(text("SELECT to_regclass('backtest.sneaky') IS NOT NULL")).scalar_one()
 
     assert exists is False
