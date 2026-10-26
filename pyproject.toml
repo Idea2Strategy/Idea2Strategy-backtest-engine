@@ -23,7 +23,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# `httpx` (not the non-existent `httpx2`) is what starlette.testclient imports.
+# starlette.testclient prefers `httpx2` and falls back to this `httpx` with a
+# StarletteDeprecationWarning. Moving to `httpx2` is a separate, deliberate bump.
 test = [
   "freezegun==1.5.5",
   "hypothesis==6.138.15",
