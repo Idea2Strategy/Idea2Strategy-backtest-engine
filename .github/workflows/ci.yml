@@ -19,8 +19,8 @@ name: CI
 #   gate5  app boot smoke              API and worker import without a database
 #   gate6  migration contribution      COM07 contribution-root contract
 #   gate7  dependency + secret scan    pip-audit + TruffleHog
-#   gate8  DB integration              Testcontainers PostgreSQL 16
-#   gate9  object-store integration    LocalStack S3
+#   gate8  DB integration              Testcontainers PostgreSQL 16 + LocalStack
+#   gate9  object-store integration    Testcontainers LocalStack S3
 
 on:
   pull_request:
@@ -291,27 +291,14 @@ jobs:
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # LocalStack as well as PostgreSQL, because `-m docker` is a single set that
-    # spans both: the worker's SQS tests and the end-to-end test need a queue and
-    # an object store, not just a database. Without this the queue tests skipped
-    # here - and their default endpoint is a developer's local container port, so
-    # they passed on that machine and covered nothing in CI.
-    services:
-      localstack:
-        image: localstack/localstack:4.7.0
-        env:
-          SERVICES: s3,sqs
-          EAGER_SERVICE_LOADING: "1"
-          AWS_DEFAULT_REGION: us-east-1
-        ports:
-          - 4566:4566
-        options: >-
-          --health-cmd "curl -sf http://localhost:4566/_localstack/health || exit 1"
-          --health-interval 10s --health-timeout 5s --health-retries 12
-    # `tests/conftest.py` starts its own PostgreSQL 16 container through
-    # Testcontainers and applies the CENTRAL Flyway bundle to it, so there is no
-    # `services:` block here: a second, differently-migrated server would only
-    # invite tests to point at the wrong one.
+    # `-m docker` is a single set that spans a database, a queue and an object
+    # store: the worker's SQS tests and the end-to-end tests need all three.
+    # `tests/conftest.py` starts every one of them itself through Testcontainers:
+    # a PostgreSQL 16 container migrated with the CENTRAL Flyway bundle, and one
+    # LocalStack (SQS + S3) for the session. There is deliberately no `services:`
+    # block here: nothing in the suite reads a fixed endpoint, so a service
+    # container would run unused, and a second, differently-migrated database
+    # would only invite tests to point at the wrong one.
     #
     # That harness *skips* when Docker is unavailable, and a skip is a silent
     # pass. The last step therefore asserts, from the JUnit report, that the
@@ -336,13 +323,11 @@ jobs:
       # The container is migrated with the vendored byte-for-byte copy of the
       # applied central Flyway bundle, so this proves the persistence layer
       # against the canonical schema and not against a restatement of it.
-      - name: Integration tests (PostgreSQL 16 via Testcontainers, queue via LocalStack)
+      - name: Integration tests (PostgreSQL 16 and LocalStack via Testcontainers)
         env:
-          # tests/test_worker.py defaults to a developer's local LocalStack port
-          # and skips when it is absent. Point it at the service container so the
-          # real SQS coverage actually executes here.
-          BACKTEST_TEST_SQS_ENDPOINT: http://localhost:4566
-          LOCALSTACK_ENDPOINT_URL: http://localhost:4566
+          # Dummy credentials. Every boto3 client in the suite carries its own
+          # endpoint and credentials and passes without these; they only make
+          # sure a stray default-chain client can never pick up real ones.
           AWS_ACCESS_KEY_ID: test
           AWS_SECRET_ACCESS_KEY: test
           AWS_DEFAULT_REGION: us-east-1
@@ -387,16 +372,9 @@ jobs:
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    services:
-      localstack:
-        image: localstack/localstack:4.7.0
-        env:
-          SERVICES: s3,sqs
-        ports:
-          - 4566:4566
-        options: >-
-          --health-cmd "curl -sf http://localhost:4566/_localstack/health || exit 1"
-          --health-interval 10s --health-timeout 5s --health-retries 12
+    # No `services:` block: the S3 leg starts its own LocalStack through
+    # Testcontainers (`tests/conftest.py` and `tests/test_object_store.py`) and
+    # reads no fixed endpoint, so a service container here would run unused.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -410,7 +388,7 @@ jobs:
       # runs against both backends, and the S3 leg must not skip here.
       - name: Object-store contract against LocalStack S3
         env:
-          LOCALSTACK_ENDPOINT_URL: http://localhost:4566
+          # Dummy credentials, for the same reason as in gate8.
           AWS_ACCESS_KEY_ID: test
           AWS_SECRET_ACCESS_KEY: test
           AWS_DEFAULT_REGION: us-east-1
