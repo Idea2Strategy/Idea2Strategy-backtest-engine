@@ -417,6 +417,10 @@ def _apply_hard_limits_in_child() -> tuple[str, ...]:
     return applied
 
 
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="macOS rejects setrlimit(RLIMIT_AS); the Linux worker image is what enforces it",
+)
 def test_monitor_names_the_enforcement_mechanism_actually_in_force() -> None:
     if sys.platform == "win32":
         # Windows has no POSIX rlimit, so the call is a no-op on this process
