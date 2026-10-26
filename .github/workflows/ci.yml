@@ -14,7 +14,7 @@ name: CI
 #
 #   gate1  lint                        ruff
 #   gate2  types                       mypy
-#   gate3  unit tests + coverage       pytest (Docker-free suite)
+#   gate3  unit tests + coverage       pytest (Docker-free suite), floor 77%
 #   gate4  contract validation         JSON Schema round-trip over the fixtures
 #   gate5  app boot smoke              API and worker import without a database
 #   gate6  migration contribution      COM07 contribution-root contract
@@ -99,6 +99,11 @@ jobs:
       # stdout is a pipe, so the kill discarded every line and the log named no
       # test.  The same command finishes locally in ~16s.  Unbuffered output plus
       # a per-test timeout turn a hang into a named test with a stack trace.
+      #
+      # The coverage floor is the measured total (statements plus branches),
+      # rounded down: 77.6% on develop at a568df0. data-pipeline holds 88; this
+      # repository is not there yet, so the floor only ratchets upward. Raise it
+      # when coverage grows and never lower it to make a change pass.
       - name: pytest (Docker-free suite)
         env:
           PYTHONUNBUFFERED: "1"
@@ -106,6 +111,7 @@ jobs:
           python -m pytest -p no:cacheprovider -m "not docker"
           --timeout=120 --timeout-method=thread
           --cov=backtest_engine --cov-report=term-missing --cov-report=xml
+          --cov-fail-under=77
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
