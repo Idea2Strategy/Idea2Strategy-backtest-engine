@@ -16,14 +16,30 @@ def test_dockerfile_uses_the_reproducible_bookworm_base_image() -> None:
     assert dockerfile_lines[0] == f"FROM {APPROVED_BASE_IMAGE}"
 
 
+def _instructions() -> list[str]:
+    """Dockerfile instructions with continuations joined and whitespace collapsed."""
+    dockerfile = (REPOSITORY_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    lines = dockerfile.replace("\\\n", " ").splitlines()
+    return [" ".join(line.split()) for line in lines if line.strip() and not line.lstrip().startswith("#")]
+
+
 def test_dockerfile_purges_runtime_unused_perl_and_package_metadata_after_installation() -> None:
     dockerfile = (REPOSITORY_ROOT / "Dockerfile").read_text(encoding="utf-8")
 
-    install_position = dockerfile.index("RUN pip install --no-cache-dir .")
+    last_install_position = dockerfile.rindex("RUN pip install")
     purge_position = dockerfile.index("RUN dpkg --purge --force-remove-essential perl-base")
 
-    assert purge_position > install_position
+    assert purge_position > last_install_position
     assert "rm -f /var/lib/dpkg/status-old" in dockerfile
+
+
+def test_dockerfile_installs_third_party_packages_only_from_the_hash_lock() -> None:
+    pip_installs = [line for line in _instructions() if line.startswith("RUN pip install")]
+
+    assert pip_installs == [
+        "RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r requirements/runtime.txt",
+        "RUN pip install --no-cache-dir --no-deps . && pip check",
+    ]
 
 
 def test_dockerfile_carries_the_migration_contract_runtime_verification_needs() -> None:
