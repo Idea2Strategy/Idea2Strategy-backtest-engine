@@ -75,7 +75,7 @@ def test_numeric_24_8_round_trips_without_precision_loss(persistence: BacktestPe
     with persistence.unit_of_work() as uow:
         stored = uow.runs.get(row.id).initial_cash_amount
         # `==` on Decimal ignores trailing zeros, so read the stored digits as text too.
-        stored_text = uow.connection.execute(
+        stored_text: str = uow.connection.execute(
             text("SELECT initial_cash_amount::text FROM backtest.runs WHERE id = :id"),
             {"id": str(row.id)},
         ).scalar_one()

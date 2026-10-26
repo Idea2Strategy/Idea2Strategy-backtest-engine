@@ -408,7 +408,7 @@ class PostgresRequestReceiptStore:
                 )
                 return RequestClaim(RequestClaimDisposition.CLAIMED)
 
-            latest = connection.execute(
+            latest: int = connection.execute(
                 text(
                     """
                     SELECT COALESCE(MAX(o.aggregate_sequence), 0)
