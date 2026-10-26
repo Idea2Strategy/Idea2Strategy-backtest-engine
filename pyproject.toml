@@ -17,7 +17,9 @@ dependencies = [
   "psutil==7.2.2",
   "psycopg[binary]>=3.2,<4.0",
   "pyarrow==25.0.0",
-  "sqlalchemy>=2.0,<3.0",
+  # Capped below the next minor, not the next major: SQLAlchemy 2.1 retyped `Result`,
+  # which failed the type gate, so moving past 2.1 is a deliberate bump.
+  "sqlalchemy>=2.0,<2.2",
   "tzdata==2026.3",
   "uvicorn==0.52.1",
 ]
@@ -38,6 +40,7 @@ test = [
 ]
 dev = [
   "idea2strategy-backtest-engine[test]",
+  # The same release data-pipeline pins, so the two type gates agree. Bump both together.
   "mypy==2.3.0",
   "mutmut==3.3.1",
   "ruff==0.16.1",
