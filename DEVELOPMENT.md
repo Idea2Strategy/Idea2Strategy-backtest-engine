@@ -140,6 +140,42 @@ python -m mypy
   테스트 전용 데이터이며 시드도 마이그레이션도 아닙니다.
 - 테스트 먼저 씁니다. 카드마다 실패하는 테스트를 먼저 커밋합니다.
 
+## 의존성 잠금
+
+`pyproject.toml` 은 허용 범위를, `requirements/` 는 그 범위 안에서 실제로 설치하는 정확한
+버전과 해시를 기록합니다.
+
+| 파일 | 내용 | 사용하는 곳 |
+|---|---|---|
+| `requirements/runtime.txt` | 런타임 의존성 | `Dockerfile`, CI gate5·gate7 |
+| `requirements/dev.txt` | 런타임 + `test`·`dev` extra | 나머지 CI gate, 로컬 개발 |
+
+설치는 항상 두 단계입니다. 잠금 파일을 해시 검증으로 설치한 뒤 프로젝트 자체는 의존성 없이
+설치합니다.
+
+```text
+python -m pip install --require-hashes -r requirements/dev.txt
+python -m pip install --no-deps -e .
+```
+
+재생성은 저장소 루트에서 uv(0.13.1에서 확인)로 합니다.
+
+```text
+uv pip compile pyproject.toml --python-version 3.12 --universal --generate-hashes -o requirements/runtime.txt
+uv pip compile pyproject.toml --python-version 3.12 --universal --generate-hashes --extra dev -o requirements/dev.txt
+```
+
+- `pyproject.toml` 의 의존성을 바꾸면 같은 커밋에서 두 파일을 다시 생성합니다. 출력 파일이
+  이미 있으면 uv는 기존 버전을 유지하고 바뀐 요구만 다시 풉니다.
+- 버전을 올릴 때만 `--upgrade-package <이름>` (전체는 `--upgrade`) 을 붙이고, 두 명령에 같은
+  옵션을 줍니다. 두 파일에 함께 있는 패키지는 버전이 같아야 합니다.
+- `--universal` 이므로 어느 OS에서 생성해도 결과가 같고, 플랫폼 전용 패키지는 환경 마커로
+  남습니다. Linux amd64·arm64 이미지와 macOS·Windows 개발 환경이 같은 파일을 씁니다.
+- 잠금이 어긋나면 CI가 실패합니다. gate5와 이미지 빌드는 `pip check` 로 런타임 의존성을,
+  gate2는 `test`·`dev` extra와 두 파일 사이의 버전 일치까지 검사합니다.
+- 빌드 백엔드 `hatchling==1.27.0` 은 `pyproject.toml` 에서 버전만 고정되어 있고 해시
+  검증 대상이 아닙니다. pip가 격리된 빌드 환경에 따로 설치하며 이미지에는 남지 않습니다.
+
 ## 고정 정책
 
 - 슬리피지 0.05%, 수수료 0.2%. `backtest.runs` 는 `fee_policy_id`,

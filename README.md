@@ -85,13 +85,17 @@ Python 3.12 (`>=3.12,<3.13`) 전용입니다.
 
 ```text
 python -m venv .venv
-.venv\Scripts\python -m pip install -e ".[dev]"
+.venv\Scripts\python -m pip install --require-hashes -r requirements\dev.txt
+.venv\Scripts\python -m pip install --no-deps -e .
 .venv\Scripts\python -m pytest                       # Docker 없는 빠른 단위 스위트
 .venv\Scripts\python -m pytest -m docker             # Testcontainers PostgreSQL 16 통합
 .venv\Scripts\python -m ruff check src tests
 .venv\Scripts\python -m mypy
 .venv\Scripts\backtest-api                           # 환경변수 필요, 아래 참조
 ```
+
+의존성은 해시로 잠긴 `requirements/` 에서만 설치합니다. 재생성 방법은 `DEVELOPMENT.md` 의
+"의존성 잠금"을 보십시오.
 
 기본 `pytest` 실행은 `-m 'not docker'` 로 설정되어 있어 Docker를 건드리지 않습니다.
 `-m docker` 를 주면 그 설정을 덮어써 통합 스위트만 실행합니다.

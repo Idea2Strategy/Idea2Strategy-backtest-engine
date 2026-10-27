@@ -6,11 +6,21 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# Third-party packages come only from the hash-locked runtime set, as wheels, so
+# a rebuild installs the same bytes and a tampered or substituted file fails.
+# See DEVELOPMENT.md for how the lock is regenerated.
+COPY requirements/runtime.txt ./requirements/runtime.txt
+RUN pip install --no-cache-dir --require-hashes --only-binary=:all: \
+        -r requirements/runtime.txt
+
 COPY pyproject.toml README.md ./
 COPY src ./src
 COPY db ./db
 
-RUN pip install --no-cache-dir .
+# `--no-deps`: the project itself adds nothing that is not already locked, and
+# `pip check` fails the build if pyproject.toml declares something the lock lacks.
+RUN pip install --no-cache-dir --no-deps . \
+    && pip check
 
 # The runtime does not invoke Perl. Debian marks perl-base Essential, but this
 # slim image has no installed reverse dependency on it. Purge it after the
