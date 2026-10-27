@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import uuid
+from bisect import bisect_left
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from types import MappingProxyType
 from typing import Any
@@ -146,6 +147,38 @@ class OfficialSessionSchedule:
             (session for session in self.sessions if session.opens_at > assessed_at),
             None,
         )
+
+    def bar_start_n_bars_before(
+        self, period: timedelta, instant: datetime, bars: int
+    ) -> datetime | None:
+        """Start of the ``bars``-th latest session-aligned bar completed by ``instant``.
+
+        Bars of ``period`` are anchored at each official open, and the last bar
+        of a session ends at its close, so a 1h or 4h session ends with a short
+        bar and a 1d bar is the whole session. Each counts as one bar, as does an
+        early-close day. Nights, weekends and holidays hold no bars, so walking
+        back crosses them without counting them.
+
+        ``None`` means the schedule holds fewer completed bars than that before
+        ``instant``; it is never answered with a guess.
+        """
+        if period <= timedelta(0):
+            raise EventClockValidationError("period must be positive")
+        if not isinstance(bars, int) or isinstance(bars, bool) or bars < 1:
+            raise EventClockValidationError("bars must be a positive integer")
+        assessed_at = _utc(instant, "instant")
+        remaining = bars
+        opened = bisect_left(self.sessions, assessed_at, key=lambda item: item.opens_at)
+        for session in reversed(self.sessions[:opened]):
+            starts: list[datetime] = []
+            start = session.opens_at
+            while start < session.closes_at and min(start + period, session.closes_at) <= assessed_at:
+                starts.append(start)
+                start += period
+            if len(starts) >= remaining:
+                return starts[-remaining]
+            remaining -= len(starts)
+        return None
 
     def status_at(
         self, instant: datetime
